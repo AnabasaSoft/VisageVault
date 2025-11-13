@@ -1,10 +1,4 @@
-Aquí tienes el archivo `README.md` actualizado para incluir las nuevas funciones de reconocimiento facial y las nuevas dependencias que hemos añadido.
 
-He modificado 3 secciones:
-
-1.  **Características Principales:** Añadidas las funciones de reconocimiento facial.
-2.  **Pila Tecnológica:** Añadida la biblioteca `face_recognition`.
-3.  **Instalación y Ejecución:** Actualizado el comando `pip install` con las nuevas dependencias.
 
 -----
 
