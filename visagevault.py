@@ -588,74 +588,6 @@ class PhotoDetailDialog(QDialog):
         self._load_photo()
         self._load_metadata()
 
-    def _setup_ui(self):
-        # 1. Crear el QTabWidget
-        self.tab_widget = QTabWidget()
-
-        # 2. Crear la Pestaña "Fotos" (Contendrá el splitter actual)
-        fotos_tab_widget = QWidget()
-        fotos_layout = QVBoxLayout(fotos_tab_widget)
-        fotos_layout.setContentsMargins(0, 0, 0, 0) # Sin márgenes
-
-        # 3. Crear el Splitter (como antes, pero lo añadiremos al fotos_layout)
-        self.main_splitter = QSplitter(Qt.Horizontal)
-
-        # --- (Inicio: Código del Splitter - Lado Izquierdo: Fotos) ---
-        photo_area_widget = QWidget()
-        self.photo_container_layout = QVBoxLayout(photo_area_widget)
-        self.photo_container_layout.setSpacing(20)
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setWidget(photo_area_widget)
-        self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_thumbnails)
-        self.main_splitter.addWidget(self.scroll_area)
-        # --- (Fin: Lado Izquierdo: Fotos) ---
-
-        # --- (Inicio: Código del Splitter - Lado Derecho: Navegación) ---
-        right_panel_widget = QWidget()
-        right_panel_layout = QVBoxLayout(right_panel_widget)
-        top_controls = QVBoxLayout()
-        self.select_dir_button = QPushButton("Cambiar Directorio")
-        self.select_dir_button.clicked.connect(self._open_directory_dialog)
-        top_controls.addWidget(self.select_dir_button)
-        self.path_label = QLabel("Ruta: No configurada")
-        self.path_label.setWordWrap(True)
-        top_controls.addWidget(self.path_label)
-        right_panel_layout.addLayout(top_controls)
-
-        year_label = QLabel("Navegación por Fecha:")
-        right_panel_layout.addWidget(year_label)
-        self.date_tree_widget = QTreeWidget()
-        self.date_tree_widget.setHeaderHidden(True)
-        self.date_tree_widget.currentItemChanged.connect(self._scroll_to_item)
-        right_panel_layout.addWidget(self.date_tree_widget)
-
-        self.status_label = QLabel("Estado: Inicializando...")
-        right_panel_layout.addWidget(self.status_label)
-        self.main_splitter.addWidget(right_panel_widget)
-        # --- (Fin: Lado Derecho: Navegación) ---
-
-        # 4. Añadir el splitter al layout de la Pestaña "Fotos"
-        fotos_layout.addWidget(self.main_splitter)
-
-        # 5. Crear la Pestaña "Personas" (Placeholder)
-        self.personas_tab_widget = QWidget()
-        personas_layout = QVBoxLayout(self.personas_tab_widget)
-        # (Aquí es donde irá la futura cuadrícula de caras)
-        personas_layout.addWidget(QLabel("Próximamente: Gestión de Caras y Personas"))
-
-        # 6. Añadir las pestañas al TabWidget
-        self.tab_widget.addTab(fotos_tab_widget, "Fotos")
-        self.tab_widget.addTab(self.personas_tab_widget, "Personas")
-
-        # 7. Establecer el TabWidget como el Widget Central
-        self.setCentralWidget(self.tab_widget)
-
-        # 8. Cargar el estado del splitter (como antes)
-        right_panel_widget.setMinimumWidth(180)
-        self.main_splitter.splitterMoved.connect(self._save_splitter_state)
-        self._load_splitter_state()
-
     def _load_photo(self):
         """Carga la foto completa y la pasa al label de zoom."""
         try:
@@ -802,7 +734,18 @@ class VisageVaultApp(QMainWindow):
 
 
     def _setup_ui(self):
+        # 1. Crear el QTabWidget
+        self.tab_widget = QTabWidget()
+
+        # 2. Crear la Pestaña "Fotos" (Contendrá el splitter actual)
+        fotos_tab_widget = QWidget()
+        fotos_layout = QVBoxLayout(fotos_tab_widget)
+        fotos_layout.setContentsMargins(0, 0, 0, 0) # Sin márgenes
+
+        # 3. Crear el Splitter (como antes, pero lo añadiremos al fotos_layout)
         self.main_splitter = QSplitter(Qt.Horizontal)
+
+        # --- (Inicio: Código del Splitter - Lado Izquierdo: Fotos) ---
         photo_area_widget = QWidget()
         self.photo_container_layout = QVBoxLayout(photo_area_widget)
         self.photo_container_layout.setSpacing(20)
@@ -811,7 +754,9 @@ class VisageVaultApp(QMainWindow):
         self.scroll_area.setWidget(photo_area_widget)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_thumbnails)
         self.main_splitter.addWidget(self.scroll_area)
+        # --- (Fin: Lado Izquierdo: Fotos) ---
 
+        # --- (Inicio: Código del Splitter - Lado Derecho: Navegación) ---
         right_panel_widget = QWidget()
         right_panel_layout = QVBoxLayout(right_panel_widget)
         top_controls = QVBoxLayout()
@@ -822,8 +767,7 @@ class VisageVaultApp(QMainWindow):
         self.path_label.setWordWrap(True)
         top_controls.addWidget(self.path_label)
         right_panel_layout.addLayout(top_controls)
-        
-        # --- Reemplazar QListWidget por QTreeWidget ---
+
         year_label = QLabel("Navegación por Fecha:")
         right_panel_layout.addWidget(year_label)
         self.date_tree_widget = QTreeWidget()
@@ -834,8 +778,25 @@ class VisageVaultApp(QMainWindow):
         self.status_label = QLabel("Estado: Inicializando...")
         right_panel_layout.addWidget(self.status_label)
         self.main_splitter.addWidget(right_panel_widget)
-        self.setCentralWidget(self.main_splitter)
-        self._set_status("Aplicación iniciada.")
+        # --- (Fin: Lado Derecho: Navegación) ---
+
+        # 4. Añadir el splitter al layout de la Pestaña "Fotos"
+        fotos_layout.addWidget(self.main_splitter)
+
+        # 5. Crear la Pestaña "Personas" (Placeholder)
+        self.personas_tab_widget = QWidget()
+        personas_layout = QVBoxLayout(self.personas_tab_widget)
+        # (Aquí es donde irá la futura cuadrícula de caras)
+        personas_layout.addWidget(QLabel("Próximamente: Gestión de Caras y Personas"))
+
+        # 6. Añadir las pestañas al TabWidget
+        self.tab_widget.addTab(fotos_tab_widget, "Fotos")
+        self.tab_widget.addTab(self.personas_tab_widget, "Personas")
+
+        # 7. Establecer el TabWidget como el Widget Central
+        self.setCentralWidget(self.tab_widget)
+
+        # 8. Cargar el estado del splitter (como antes)
         right_panel_widget.setMinimumWidth(180)
         self.main_splitter.splitterMoved.connect(self._save_splitter_state)
         self._load_splitter_state()
