@@ -147,7 +147,7 @@ class ImagePreviewDialog(QDialog):
         self.animation = QPropertyAnimation(self, b"geometry")
 
     def show_with_animation(self):
-        """Muestra la ventana centrada (temporalmente sin animación para debug)."""
+
         screen = QApplication.screenAt(QCursor.pos())
         if not screen:
             screen = QApplication.primaryScreen()
@@ -174,7 +174,6 @@ class ImagePreviewDialog(QDialog):
         # Mover la ventana a la posición centrada
         self.move(center_x, center_y)
 
-
         self.show()
 
     def close_with_animation(self):
@@ -190,115 +189,6 @@ class ImagePreviewDialog(QDialog):
 
         self.animation.finished.connect(self._handle_close_animation_finished)
         self.animation.start()
-
-    def _handle_close_animation_finished(self):
-        """Resetea el flag y cierra el diálogo."""
-        ImagePreviewDialog.is_showing = False
-        self.accept()
-
-    def resizeEvent(self, event):
-        """Reescala el pixmap para que se ajuste si no estamos zoomeados."""
-        if self.label._current_scale == 1.0:
-            self.label.fitToWindow()
-        super().resizeEvent(event)
-
-
-# =================================================================
-# MÉTODO fitToWindow CORREGIDO para ZoomableClickableLabel
-# =================================================================
-# Este método debe reemplazar el existente en la clase ZoomableClickableLabel
-
-def fitToWindow(self):
-    """Ajusta la imagen para que quepa en el label (resetea el zoom)."""
-    if self._original_pixmap.isNull():
-        self.setPixmap(QPixmap())
-        return
-
-    # Calcular la escala que cabe en la ventana
-    scale_x = self.width() / self._original_pixmap.width() if self._original_pixmap.width() > 0 else 1.0
-    scale_y = self.height() / self._original_pixmap.height() if self._original_pixmap.height() > 0 else 1.0
-
-    # Usar la escala más pequeña para mantener el aspect ratio
-    self._current_scale = min(scale_x, scale_y)
-
-    # Calcular offset para centrar la imagen
-    scaled_width = self._original_pixmap.width() * self._current_scale
-    scaled_height = self._original_pixmap.height() * self._current_scale
-
-    # Si la imagen escalada es más pequeña que la ventana, calcular offset para centrarla
-    offset_x = 0.0
-    offset_y = 0.0
-
-    if scaled_width < self.width():
-        # Centrar horizontalmente (offset negativo en coordenadas de imagen)
-        offset_x = -(self.width() - scaled_width) / (2.0 * self._current_scale)
-
-    if scaled_height < self.height():
-        # Centrar verticalmente (offset negativo en coordenadas de imagen)
-        offset_y = -(self.height() - scaled_height) / (2.0 * self._current_scale)
-
-    self._view_offset = QPointF(offset_x, offset_y)
-
-    self.update() # Repintar
-
-def show_with_animation(self):
-    """
-    Muestra la ventana con una animación de zoom desde el cursor.
-    """
-    start_pos = QCursor.pos()
-    screen = QApplication.screenAt(start_pos)
-    if not screen:
-        screen = QApplication.primaryScreen()
-
-    screen_geom = screen.availableGeometry()
-    img_size = self._pixmap.size()
-
-    # Calcular el tamaño final (asegurando que sean enteros)
-    max_width = int(screen_geom.width() * 0.9)
-    max_height = int(screen_geom.height() * 0.9)
-
-    target_size = img_size
-    if img_size.width() > max_width or img_size.height() > max_height:
-        target_size = img_size.scaled(max_width, max_height, Qt.KeepAspectRatio)
-
-    # Pasar el pixmap original al label de zoom
-    self.label.setOriginalPixmap(self._pixmap)
-
-    # Calcular posición centrada manualmente
-    center_x = screen_geom.x() + (screen_geom.width() - target_size.width()) // 2
-    center_y = screen_geom.y() + (screen_geom.height() - target_size.height()) // 2
-
-    end_geom = QRect(center_x, center_y, target_size.width(), target_size.height())
-    start_geom = QRect(start_pos.x(), start_pos.y(), 1, 1)
-
-    # Configurar animación de geometría
-    self.animation.setDuration(300)
-    self.animation.setStartValue(start_geom)
-    self.animation.setEndValue(end_geom)
-    self.animation.setEasingCurve(QEasingCurve.OutQuad)
-
-    # Mostrar la ventana y animar
-    self.show()
-    self.animation.start()
-
-    def close_with_animation(self):
-        """Cierra la ventana con una animación de zoom hacia el cursor."""
-        end_pos = QCursor.pos()
-        end_geom = QRect(end_pos.x(), end_pos.y(), 1, 1)
-        start_geom = self.geometry()
-
-        self.animation.setDuration(200)
-        self.animation.setStartValue(start_geom)
-        self.animation.setEndValue(end_geom)
-        self.animation.setEasingCurve(QEasingCurve.InQuad)
-
-        self.animation_opacity.setDuration(150)
-        self.animation_opacity.setStartValue(1.0)
-        self.animation_opacity.setEndValue(0.0)
-
-        self.animation.finished.connect(self._handle_close_animation_finished)
-        self.animation.start()
-        self.animation_opacity.start()
 
     def _handle_close_animation_finished(self):
         """Resetea el flag y cierra el diálogo."""
@@ -387,8 +277,7 @@ class ZoomableClickableLabel(QLabel):
                     super().wheelEvent(event)
             else:
                 # Si NO es miniatura (es vista previa o detalle),
-                # Ctrl+Rueda Abajo CIERRA
-                # --- !! LÍNEA MODIFICADA !! ---
+                # Ctrl+Rueda Arriba CIERRA
                 if event.angleDelta().y() > 0:
                     parent_dialog = self.window()
                     if isinstance(parent_dialog, ImagePreviewDialog):
@@ -480,14 +369,14 @@ class ZoomableClickableLabel(QLabel):
         else:
             # Limitar bordes (no ir más allá de 0 o el máximo)
             max_x_offset = self._original_pixmap.width() - (self.width() / self._current_scale)
-            self._view_offset.setX(max(0.0, min(self._view_offset.x(), max(0.0, max_x_offset))))
+            self._view_offset.setX(max(0.0, min(self._view_offset.x(), max_x_offset)))
 
         if scaled_img_height < self.height():
             self._view_offset.setY(0)
         else:
             # Limitar bordes
             max_y_offset = self._original_pixmap.height() - (self.height() / self._current_scale)
-            self._view_offset.setY(max(0.0, min(self._view_offset.y(), max(0.0, max_y_offset))))
+            self._view_offset.setY(max(0.0, min(self._view_offset.y(), max_y_offset)))
 
     def paintEvent(self, event: QPaintEvent):
         """Dibuja la porción visible de la imagen."""
@@ -527,16 +416,19 @@ class ZoomableClickableLabel(QLabel):
         src_x = self._view_offset.x()
         src_y = self._view_offset.y()
 
-        # El ancho/alto de la fuente es el ancho/alto de la imagen escalada / escala
-        # (Esto es lo que _clamp_view_offset ya validó que no se sale de los bordes)
-        src_width = scaled_width / self._current_scale
-        src_height = scaled_height / self._current_scale
+        # El ancho/alto de la fuente es el ancho/alto de la VISTA (self) / escala
+        src_width = self.width() / self._current_scale
+        src_height = self.height() / self._current_scale
 
-        # Si la imagen es más pequeña, dibujamos todo (offset es 0)
+        # Si la imagen es más pequeña que la vista (zoom out),
+        # usamos la imagen completa como fuente y ajustamos el offset.
         if scaled_width < self.width():
             src_width = self._original_pixmap.width()
+            # (src_x ya es 0.0 gracias a _clamp_view_offset)
+
         if scaled_height < self.height():
             src_height = self._original_pixmap.height()
+            # (src_y ya es 0.0 gracias a _clamp_view_offset)
 
         source_rect = QRectF(src_x, src_y, src_width, src_height)
 
@@ -572,7 +464,81 @@ class PhotoDetailDialog(QDialog):
     Ventana de detalle con splitter vertical, zoom y edición de metadatos.
     """
     # Señal para notificar a la ventana principal que los datos cambiaron
-    metadata_changed = Signal() # Simplificada: solo notifica que algo cambió
+    metadata_changed = Signal(str, str, str)
+
+    def _setup_ui(self):
+        # --- Diseño principal ---
+        main_layout = QVBoxLayout(self)
+        self.main_splitter = QSplitter(Qt.Horizontal) # Splitter horizontal
+        main_layout.addWidget(self.main_splitter)
+
+        # --- 1. Panel Izquierdo (Imagen con Zoom) ---
+        # Usamos el ZoomableClickableLabel que ya está definido
+        self.image_label = ZoomableClickableLabel(self.original_path, self)
+        self.image_label.is_thumbnail_view = False # IMPORTANTE: Habilitar zoom/pan
+        self.main_splitter.addWidget(self.image_label)
+
+        # --- 2. Panel Derecho (Metadatos y Edición) ---
+        right_panel_widget = QWidget()
+        right_panel_layout = QVBoxLayout(right_panel_widget)
+        right_panel_widget.setMinimumWidth(300) # Darle un ancho mínimo
+        right_panel_widget.setMaximumWidth(450) # Y un máximo
+
+        # Grupo de Edición de Fecha
+        date_group = QGroupBox("Fecha (Base de Datos)")
+        date_layout = QGridLayout(date_group)
+
+        date_layout.addWidget(QLabel("Año:"), 0, 0)
+        self.year_edit = QLineEdit()
+        self.year_edit.setPlaceholderText("Ej: 2024 o 'Sin Fecha'")
+        date_layout.addWidget(self.year_edit, 0, 1)
+
+        date_layout.addWidget(QLabel("Mes:"), 1, 0)
+        self.month_combo = QComboBox()
+        # Llenar el combo de meses
+        self.month_combo.addItem("Mes Desconocido", "00")
+        for i in range(1, 13):
+            month_str = str(i).zfill(2)
+            try:
+                month_name = datetime.datetime.strptime(month_str, "%m").strftime("%B").capitalize()
+            except ValueError:
+                month_name = datetime.date(2000, i, 1).strftime("%B").capitalize()
+            self.month_combo.addItem(month_name, month_str)
+        date_layout.addWidget(self.month_combo, 1, 1)
+
+        # Grupo de Metadatos EXIF (Tabla)
+        exif_group = QGroupBox("Datos EXIF (Solo Lectura)")
+        exif_layout = QVBoxLayout(exif_group)
+
+        self.metadata_table = QTableWidget()
+        self.metadata_table.setColumnCount(2)
+        self.metadata_table.setHorizontalHeaderLabels(["Campo", "Valor"])
+        self.metadata_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.metadata_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.metadata_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers) # Solo lectura
+
+        exif_layout.addWidget(self.metadata_table)
+
+        # Añadimos el grupo de fecha (stretch 0 = tamaño fijo)
+        right_panel_layout.addWidget(date_group)
+
+        # Añadimos el grupo EXIF con un factor de estiramiento de 1
+        # para que ocupe todo el espacio vertical restante.
+        right_panel_layout.addWidget(exif_group, 1)
+
+        # (Línea eliminada) right_panel_layout.addStretch(1)
+
+        self.main_splitter.addWidget(right_panel_widget)
+
+        # --- Botones (Aceptar/Cancelar) ---
+        self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        self.button_box.accepted.connect(self._save_metadata)
+        self.button_box.rejected.connect(self.reject)
+        main_layout.addWidget(self.button_box)
+
+        # --- Configuración del Splitter ---
+        # Establecemos un tamaño por defecto (70% imagen, 30% datos)
+        self.main_splitter.setSizes([int(self.width() * 0.7), int(self.width() * 0.3)])
 
     def __init__(self, original_path, db_manager: VisageVaultDB, parent=None):
         super().__init__(parent)
@@ -602,9 +568,18 @@ class PhotoDetailDialog(QDialog):
         self.metadata_table.setRowCount(0)
 
         # --- Carga de fecha (año y mes) ---
+        # 1. Cargar la fecha guardada en la Base de Datos
         current_year, current_month = self.db.get_photo_date(self.original_path)
-        if not current_year or not current_month:
-            current_year, current_month = metadata_reader.get_photo_date(self.original_path)
+
+        # 2. Si falta algún dato (es None), intentar rellenarlo desde EXIF
+        if current_year is None or current_month is None:
+            exif_year, exif_month = metadata_reader.get_photo_date(self.original_path)
+
+            # Rellenar solo los huecos, priorizando la BD
+            if current_year is None:
+                current_year = exif_year
+            if current_month is None:
+                current_month = exif_month
 
         self.year_edit.setText(current_year or "Sin Fecha")
         month_index = self.month_combo.findData(current_month or "00")
@@ -623,7 +598,7 @@ class PhotoDetailDialog(QDialog):
             for tag_id, value in tags.items():
                 self.metadata_table.insertRow(row)
                 tag_name = piexif.TAGS[ifd_name].get(tag_id, {"name": f"UnknownTag_{tag_id}"})["name"]
-                
+
                 if isinstance(value, bytes):
                     try: value_str = piexif.helper.decode_bytes(value)
                     except: value_str = str(value)
@@ -643,27 +618,23 @@ class PhotoDetailDialog(QDialog):
             new_month_str = self.month_combo.currentData()
 
             if not (new_year_str == "Sin Fecha" or (len(new_year_str) == 4 and new_year_str.isdigit())):
-                print("Error: El Año debe ser 'Sin Fecha' o un número de 4 dígitos.")
-                # Opcional: Mostrar un QMessageBox de error
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self,
+                                    "Datos Inválidos",
+                                    "El Año debe ser 'Sin Fecha' o un número de 4 dígitos (ej: 2024).")
                 return
 
             old_year, old_month = self.db.get_photo_date(self.original_path)
 
             if old_year != new_year_str or old_month != new_month_str:
                 self.db.update_photo_date(self.original_path, new_year_str, new_month_str)
-                self.metadata_changed.emit()
+                # Emite los datos nuevos
+                self.metadata_changed.emit(self.original_path, new_year_str, new_month_str)
 
             self.accept()
 
         except Exception as e:
             print(f"Error al guardar la fecha en la BD: {e}")
-
-    def resizeEvent(self, event):
-        """Se llama cuando la ventana cambia de tamaño, para re-ajustar la foto."""
-        # Solo reajustamos si el zoom está en el nivel base
-        if self.image_label._current_scale == 1.0:
-            self.image_label.fitToWindow()
-        super().resizeEvent(event)
 
 # =================================================================
 # CLASE TRABAJADORA DEL ESCANEO (MODIFICADA)
@@ -681,10 +652,14 @@ class PhotoFinderWorker(QObject):
     def run(self):
         self.progress.emit("Cargando fechas conocidas desde la BD...")
         db_dates = self.db.load_all_photo_dates()
-        
+
         self.progress.emit("Escaneando archivos en el directorio...")
+        # 1. Llama a find_photos UNA SOLA VEZ
         photo_paths_on_disk = find_photos(self.directory_path)
-        
+
+        # 2. Crea el set a partir de la lista (rápido, en memoria)
+        photo_paths_on_disk_set = set(photo_paths_on_disk)
+
         photos_by_year_month = {}
         photos_to_upsert_in_db = []
 
@@ -701,6 +676,14 @@ class PhotoFinderWorker(QObject):
             if month not in photos_by_year_month[year]:
                 photos_by_year_month[year][month] = []
             photos_by_year_month[year][month].append(path)
+
+        self.progress.emit("Buscando fotos eliminadas...")
+        db_paths_set = set(db_dates.keys())
+        paths_to_delete = list(db_paths_set - photo_paths_on_disk_set)
+
+        if paths_to_delete:
+            self.progress.emit(f"Eliminando {len(paths_to_delete)} fotos de la BD...")
+            self.db.bulk_delete_photos(paths_to_delete) # (Necesitarías crear este método en db_manager)
 
         if photos_to_upsert_in_db:
             self.progress.emit(f"Guardando {len(photos_to_upsert_in_db)} fotos nuevas en la BD...")
@@ -857,17 +840,6 @@ class VisageVaultApp(QMainWindow):
         self.select_dir_button.setEnabled(False)
         self.thread.start()
 
-    @Slot(dict)
-    def _handle_search_finished(self, photos_by_year):
-        """Recibe las fotos agrupadas y actualiza la GUI."""
-        self.photos_by_year = photos_by_year
-        self.select_dir_button.setEnabled(True)
-
-        num_fotos = sum(len(p) for p in photos_by_year.values())
-        self._set_status(f"Escaneo y metadatos finalizados. {num_fotos} fotos encontradas.")
-
-        self._display_photos()
-
     # ----------------------------------------------------
     # Lógica de Visualización y Miniaturas
     # ----------------------------------------------------
@@ -1018,7 +990,7 @@ class VisageVaultApp(QMainWindow):
         sizes = config_data.get('splitter_sizes')
 
         # Definir el ancho mínimo (DEBE SER EL MISMO que en _setup_ui)
-        min_right_width = 150
+        min_right_width = 180
 
         if sizes and len(sizes) == 2:
             # Asegurarse de que el tamaño cargado respeta el mínimo
@@ -1062,13 +1034,39 @@ class VisageVaultApp(QMainWindow):
         self._set_status("Detalle cerrado.")
 
     @Slot()
-    def _handle_photo_date_changed(self):
+    def _handle_photo_date_changed(self, photo_path: str, new_year: str, new_month: str):
         """
-        Actualiza la vista reconstruyendo todo cuando una fecha cambia.
+        Actualiza la vista moviendo la foto en la estructura de datos
+        en memoria y reconstruyendo la UI.
         """
         self._set_status("Metadatos cambiados. Reconstruyendo vista...")
-        if self.current_directory:
-            self._start_photo_search(self.current_directory)
+
+        # 1. Encontrar y eliminar la foto de su antigua ubicación en memoria
+        path_found_and_removed = False
+        for year, months in self.photos_by_year_month.items():
+            for month, photos in months.items():
+                if photo_path in photos:
+                    photos.remove(photo_path)
+                    path_found_and_removed = True
+                    # Opcional: limpiar claves vacías
+                    if not photos:
+                        del self.photos_by_year_month[year][month]
+                    if not self.photos_by_year_month[year]:
+                        del self.photos_by_year_month[year]
+                    break
+            if path_found_and_removed:
+                break
+
+        # 2. Añadir la foto a su nueva ubicación en memoria
+        if new_year not in self.photos_by_year_month:
+            self.photos_by_year_month[new_year] = {}
+        if new_month not in self.photos_by_year_month[new_year]:
+            self.photos_by_year_month[new_year][new_month] = []
+
+        self.photos_by_year_month[new_year][new_month].append(photo_path)
+
+        # 3. Reconstruir la UI (esto es rápido, es solo UI)
+        self._display_photos()
 
 
 def run_visagevault():
