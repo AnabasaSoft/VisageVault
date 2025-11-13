@@ -5,10 +5,11 @@ from PIL.ExifTags import TAGS
 from datetime import datetime
 from pathlib import Path
 
-def get_photo_date(filepath: str) -> str | None:
+def get_photo_date(filepath: str) -> tuple[str, str] | None:
     """
     Lee la fecha de creación de una foto a partir de los metadatos EXIF.
-    Devuelve el año o None.
+    Devuelve una tupla (año, mes) o None.
+    El mes es un string de dos dígitos (ej: "08").
     """
     try:
         img = Image.open(filepath)
@@ -21,18 +22,18 @@ def get_photo_date(filepath: str) -> str | None:
                     # El formato EXIF es 'YYYY:MM:DD HH:MM:SS'
                     try:
                         dt = datetime.strptime(value, '%Y:%m:%d %H:%M:%S')
-                        return str(dt.year)
+                        return str(dt.year), f"{dt.month:02d}"
                     except ValueError:
                         pass # Si el formato es incorrecto, seguimos buscando
 
         # Si no hay EXIF o no encontramos la fecha, usamos la fecha de modificación del archivo
         stat = Path(filepath).stat()
         dt_mod = datetime.fromtimestamp(stat.st_mtime)
-        return str(dt_mod.year)
+        return str(dt_mod.year), f"{dt_mod.month:02d}"
 
     except Exception:
         # Puede fallar si no es un formato de imagen válido o el archivo está corrupto
-        return None
+        return "Sin Fecha", "00"
 
 def get_exif_dict(filepath: str) -> dict:
     """

@@ -25,6 +25,7 @@ visagevault.db
 *.db
 *.sqlite3
 actualiza.sh
+VisageVault.7z
 
 # Archivo de configuración (local del usuario)
 visagevault_config.json

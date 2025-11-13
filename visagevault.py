@@ -32,23 +32,26 @@
 import sys
 import os
 from pathlib import Path
+import datetime
+import locale
 
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
-    QAbstractItemView, QHeaderView, QDialogButtonBox
+    QAbstractItemView, QHeaderView, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
+    QComboBox
 )
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLineEdit, QListWidget, QStyle, QFileDialog,
+    QPushButton, QLineEdit, QStyle, QFileDialog,
     QScrollArea, QGridLayout, QLabel, QGroupBox, QSpacerItem, QSizePolicy,
     QSplitter
 )
 from PySide6.QtCore import (
     Qt, QSize, QObject, Signal, QThread, Slot, QTimer,
-    QRunnable, QThreadPool
+    QRunnable, QThreadPool, QPropertyAnimation, QEasingCurve, QRect, QPoint
 )
-from PySide6.QtGui import QPixmap, QIcon
+from PySide6.QtGui import QPixmap, QIcon, QCursor
 
 # --- Importamos módulos auxiliares (ASUMIDOS EXISTENTES) ---
 from photo_finder import find_photos
@@ -60,6 +63,13 @@ import piexif.helper
 import re
 import db_manager
 from db_manager import VisageVaultDB
+
+# --- Configuración regional para nombres de meses ---
+try:
+    locale.setlocale(locale.LC_TIME, '')
+except locale.Error:
+    print("Warning: Could not set system locale, month names may be in English.")
+
 
 # Constante para el margen de precarga (en píxeles)
 PRELOAD_MARGIN_PX = 500
@@ -97,13 +107,116 @@ class ThumbnailLoader(QRunnable):
         else:
             self.signals.load_failed.emit(self.original_filepath)
 
+# =================================================================
+# CLASE PARA VISTA PREVIA CON ZOOM (QDialog)
+# =================================================================
+class ImagePreviewDialog(QDialog):
+    """
+    Un QDialog sin marco que muestra una imagen a pantalla completa con una
+    animación de escalado al abrir y cerrar.
+    """
+    # Flag estático para evitar que se abra más de una instancia a la vez
+    is_showing = False
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        
+        ImagePreviewDialog.is_showing = True # Marcamos que una instancia está activa
+
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        self._pixmap = pixmap # Guardamos el pixmap original
+        self.label = QLabel(self)
+        # self.label.setScaledContents(True) # ➤️ QUITAMOS ESTO
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.label)
+
+        self.animation = QPropertyAnimation(self, b"geometry")
+
+    def wheelEvent(self, event):
+        """Si el usuario gira la rueda hacia arriba y pulsa CTRL, cierra la ventana."""
+        if event.modifiers() == Qt.ControlModifier and event.angleDelta().y() > 0:
+            self.close_with_animation()
+
+    def show_with_animation(self):
+        """
+        Muestra la ventana con una animación de zoom desde el cursor.
+        La imagen se pre-escala para asegurar que quepa en pantalla.
+        """
+        start_pos = QCursor.pos()
+
+        # 1. Determinar la pantalla correcta
+        screen = QApplication.screenAt(start_pos)
+        if not screen:
+            screen = QApplication.primaryScreen()
+        
+        screen_geom = screen.availableGeometry()
+        img_size = self._pixmap.size()
+
+        # 2. Calcular el tamaño final
+        target_size = img_size
+        if (img_size.width() > screen_geom.width() * 0.9 or
+            img_size.height() > screen_geom.height() * 0.9):
+            target_size = img_size.scaled(
+                screen_geom.size() * 0.9, Qt.KeepAspectRatio
+            )
+
+        # 3. Pre-escalar el pixmap y asignarlo al label
+        scaled_pixmap = self._pixmap.scaled(
+            target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.label.setPixmap(scaled_pixmap);
+
+        # 4. Calcular la geometría final
+        end_geom = QRect(QPoint(0, 0), target_size)
+        end_geom.moveCenter(screen_geom.center())
+
+        # 5. Configurar y ejecutar la animación
+        start_geom = QRect(start_pos.x(), start_pos.y(), 1, 1)
+        self.setGeometry(start_geom)
+        
+        self.animation.setDuration(200)
+        self.animation.setStartValue(start_geom)
+        self.animation.setEndValue(end_geom)
+        self.animation.setEasingCurve(QEasingCurve.OutQuad)
+        
+        self.show()
+        self.animation.start()
+
+    def close_with_animation(self):
+        """Cierra la ventana con una animación de zoom hacia el cursor."""
+        end_pos = QCursor.pos()
+        end_geom = QRect(end_pos.x(), end_pos.y(), 1, 1)
+        start_geom = self.geometry()
+
+        self.animation.setDuration(200)
+        self.animation.setStartValue(start_geom)
+        self.animation.setEndValue(end_geom)
+        self.animation.setEasingCurve(QEasingCurve.InQuad)
+        
+        self.animation.finished.connect(self._handle_close_animation_finished)
+        self.animation.start()
+
+    def _handle_close_animation_finished(self):
+        """
+        Este slot se ejecuta cuando la animación de cierre ha terminado.
+        Resetea el flag y cierra el diálogo.
+        """
+        ImagePreviewDialog.is_showing = False
+        self.accept()
+
+
 # -----------------------------------------------------------------
 # NUEVA CLASE: ZoomableClickableLabel (Combina Zoom y Doble Clic)
 # -----------------------------------------------------------------
 class ZoomableClickableLabel(QLabel):
     """
     Un QLabel que emite una señal de doble clic y maneja el zoom
-    con la rueda del ratón.
+    con la rueda del ratón o una vista previa especial.
     """
     # Señal para el doble clic (para la vista de miniaturas)
     doubleClickedPath = Signal(str)
@@ -117,6 +230,9 @@ class ZoomableClickableLabel(QLabel):
         self._original_pixmap = QPixmap()
         self._current_scale = 1.0
         self.setMinimumSize(1, 1) # Importante para el zoom
+
+        # NUEVO: Atributo para diferenciar el modo de vista
+        self.is_thumbnail_view = False
 
     def setOriginalPixmap(self, pixmap: QPixmap):
         """Establece la imagen base (alta resolución) para el zoom."""
@@ -135,21 +251,59 @@ class ZoomableClickableLabel(QLabel):
         ))
 
     def wheelEvent(self, event):
-        """Maneja el evento de la rueda del ratón para el zoom."""
+        """
+        Maneja el evento de la rueda del ratón.
+        - En la vista de miniaturas:
+            - Con CTRL + Rueda Abajo: Abre la vista previa.
+            - Sin CTRL: Permite el scroll normal.
+        - En la vista de detalle: Hace zoom en la imagen.
+        """
+        # Si es una miniatura...
+        if self.is_thumbnail_view:
+            # Si se pulsa CTRL y la rueda es hacia abajo, abrimos el preview.
+            if event.modifiers() == Qt.ControlModifier and event.angleDelta().y() < 0:
+                self._open_preview()
+            else:
+                # Si no, pasamos el evento al padre (el QScrollArea) para que haga scroll.
+                super().wheelEvent(event)
+            return  # Importante: no continuar al código de zoom de abajo.
+
+        # Si no, es la vista de detalle, y se aplica el zoom (sin CTRL)
         if self._original_pixmap.isNull():
-            return # No hacer zoom si no hay imagen
+            return
 
         angle = event.angleDelta().y()
         if angle > 0:
-            self._current_scale *= 1.15 # Zoom In
+            self._current_scale *= 1.15  # Zoom In
         else:
-            self._current_scale /= 1.15 # Zoom Out
+            self._current_scale /= 1.15  # Zoom Out
 
         # Limitar el zoom para que no sea demasiado pequeño
         if self._original_pixmap.size().width() * self._current_scale < 10:
-             self._current_scale = 10 / self._original_pixmap.size().width()
+            self._current_scale = 10 / self._original_pixmap.size().width()
 
         self._updateScaledPixmap()
+
+    def _open_preview(self):
+        """
+        Abre el diálogo de vista previa a pantalla completa, solo si no hay
+        otro ya abierto.
+        """
+        # Prevenir que se abran múltiples vistas previas a la vez
+        if ImagePreviewDialog.is_showing:
+            return
+
+        if not self.original_path:
+            return
+        
+        # Cargamos la imagen completa para la vista previa
+        full_pixmap = QPixmap(self.original_path)
+        if full_pixmap.isNull():
+            return
+
+        # Creamos y mostramos el diálogo con animación
+        preview_dialog = ImagePreviewDialog(full_pixmap, self)
+        preview_dialog.show_with_animation()
 
     def _updateScaledPixmap(self):
         """Aplica el zoom actual al pixmap original."""
@@ -170,21 +324,20 @@ class ZoomableClickableLabel(QLabel):
         super().mouseDoubleClickEvent(event)
 
 # -----------------------------------------------------------------
-# CLASE MODIFICADA: PhotoDetailDialog (con Splitter y guardado de año)
+# CLASE MODIFICADA: PhotoDetailDialog (con Splitter y guardado de año/mes)
 # -----------------------------------------------------------------
 class PhotoDetailDialog(QDialog):
     """
     Ventana de detalle con splitter vertical, zoom y edición de metadatos.
     """
     # Señal para notificar a la ventana principal que los datos cambiaron
-    metadata_changed = Signal(str, str, str) # (photo_path, old_year, new_year)
+    metadata_changed = Signal() # Simplificada: solo notifica que algo cambió
 
     def __init__(self, original_path, db_manager: VisageVaultDB, parent=None):
         super().__init__(parent)
         self.original_path = original_path
-        self.db = db_manager  # ⬅️ Debes guardar la referencia a la BD
+        self.db = db_manager
         self.exif_dict = {}
-        # Guardará la info de la etiqueta de fecha: (ifd_name, tag_id, row_index)
         self.date_time_tag_info = None
 
         self.setWindowTitle(Path(original_path).name)
@@ -195,31 +348,35 @@ class PhotoDetailDialog(QDialog):
         self._load_metadata()
 
     def _setup_ui(self):
-        # 1. Layout Principal (Vertical)
         layout = QVBoxLayout(self)
-
-        # 2. SPLITTER VERTICAL (Imagen / Metadatos)
         self.splitter = QSplitter(Qt.Vertical)
-
-        # 3. Área de la Imagen (Usando el nuevo Label)
-        self.image_label = ZoomableClickableLabel() # Sin 'original_path'
+        self.image_label = ZoomableClickableLabel()
         self.splitter.addWidget(self.image_label)
 
-        # 4. Contenedor para Metadatos y Botones
         metadata_container = QWidget()
         metadata_layout = QVBoxLayout(metadata_container)
 
-        year_edit_layout = QHBoxLayout()
-        year_label = QLabel("Año (Edición rápida):")
+        # --- Layout para edición de fecha ---
+        edit_layout = QHBoxLayout()
+        year_label = QLabel("Año:")
         self.year_edit = QLineEdit()
-        self.year_edit.setMaximumWidth(80) # Ancho fijo para 4 dígitos
+        self.year_edit.setMaximumWidth(80)
 
-        year_edit_layout.addWidget(year_label)
-        year_edit_layout.addWidget(self.year_edit)
-        year_edit_layout.addStretch() # Empuja los widgets a la izquierda
+        month_label = QLabel("Mes:")
+        self.month_combo = QComboBox()
+        # Poblar con nombres de meses localizados
+        self.month_combo.addItem("Mes Desconocido", "00")
+        for i in range(1, 13):
+            # Usamos strftime para obtener el nombre del mes de forma segura
+            month_name = datetime.date(1900, i, 1).strftime('%B').capitalize()
+            self.month_combo.addItem(month_name, f"{i:02d}")
 
-        # Añadimos el layout del año ANTES de la tabla
-        metadata_layout.addLayout(year_edit_layout)
+        edit_layout.addWidget(year_label)
+        edit_layout.addWidget(self.year_edit)
+        edit_layout.addWidget(month_label)
+        edit_layout.addWidget(self.month_combo)
+        edit_layout.addStretch()
+        metadata_layout.addLayout(edit_layout)
 
         self.metadata_table = QTableWidget()
         self.metadata_table.setColumnCount(2)
@@ -233,12 +390,8 @@ class PhotoDetailDialog(QDialog):
         button_box.rejected.connect(self.reject)
         metadata_layout.addWidget(button_box)
 
-        self.splitter.addWidget(metadata_container) # Añadir contenedor al splitter
-
-        # 5. Ajustar tamaños iniciales del splitter (70% foto, 30% metadatos)
+        self.splitter.addWidget(metadata_container)
         self.splitter.setSizes([700, 300])
-
-        # 6. Añadir splitter al layout principal
         layout.addWidget(self.splitter)
 
     def _load_photo(self):
@@ -250,74 +403,66 @@ class PhotoDetailDialog(QDialog):
             self.image_label.setText(f"Error al cargar imagen: {e}")
 
     def _load_metadata(self):
-        """Lee los EXIF y los carga en la tabla."""
+        """Lee los metadatos y los carga en los widgets correspondientes."""
         self.exif_dict = metadata_reader.get_exif_dict(self.original_path)
         self.metadata_table.setRowCount(0)
-        self.date_time_tag_info = None # Resetear
 
+        # --- Carga de fecha (año y mes) ---
+        current_year, current_month = self.db.get_photo_date(self.original_path)
+        if not current_year or not current_month:
+            current_year, current_month = metadata_reader.get_photo_date(self.original_path)
+
+        self.year_edit.setText(current_year or "Sin Fecha")
+        month_index = self.month_combo.findData(current_month or "00")
+        self.month_combo.setCurrentIndex(month_index if month_index != -1 else 0)
+
+        # --- Carga de tabla de metadatos EXIF ---
         if not self.exif_dict:
-            # ... (código para "No se encontraron metadatos") ...
-            self.year_edit.setPlaceholderText("N/A")
-            self.year_edit.setEnabled(True)
+            self.metadata_table.insertRow(0)
+            self.metadata_table.setItem(0, 0, QTableWidgetItem("Info"))
+            self.metadata_table.setItem(0, 1, QTableWidgetItem("No se encontraron metadatos EXIF."))
+            return
 
         row = 0
-        found_year = False # ⬅️ AÑADIR ESTA BANDERA
         for ifd_name, tags in self.exif_dict.items():
             if not isinstance(tags, dict): continue
-
             for tag_id, value in tags.items():
                 self.metadata_table.insertRow(row)
                 tag_name = piexif.TAGS[ifd_name].get(tag_id, {"name": f"UnknownTag_{tag_id}"})["name"]
-
-                # ... (decodificación de value_str como antes) ...
+                
                 if isinstance(value, bytes):
                     try: value_str = piexif.helper.decode_bytes(value)
                     except: value_str = str(value)
                 else:
                     value_str = str(value)
 
-                # --- !! LÓGICA MODIFICADA !! ---
-                if tag_name in ['DateTimeOriginal', 'DateTime'] and not found_year:
-                    self.date_time_tag_info = (ifd_name, tag_id, row)
-
-                    # Extraer el año (YYYY) de "YYYY:MM:DD..."
-                    current_year = self.db.get_photo_year(self.original_path)
-
-                    if current_year:
-                        self.year_edit.setText(current_year)
-                    else:
-                        # Si por alguna razón no está en la BD (raro), lo calculamos
-                        year_from_meta = metadata_reader.get_photo_date(self.original_path)
-                        self.year_edit.setText(year_from_meta)
+                self.metadata_table.setItem(row, 0, QTableWidgetItem(tag_name))
+                self.metadata_table.setItem(row, 1, QTableWidgetItem(value_str))
+                row += 1
 
     def _save_metadata(self):
         """
-        Guarda el año modificado EN LA BASE DE DATOS.
-        (Ya no modifica el EXIF, solo la BD)
+        Guarda el año y mes modificados en la base de datos.
         """
         try:
-            # 1. Obtener el AÑO NUEVO del QLineEdit
             new_year_str = self.year_edit.text()
+            new_month_str = self.month_combo.currentData()
 
-            # 2. Validar (simple)
             if not (new_year_str == "Sin Fecha" or (len(new_year_str) == 4 and new_year_str.isdigit())):
-                print(f"Error: El Año debe ser 'Sin Fecha' o un número de 4 dígitos.")
+                print("Error: El Año debe ser 'Sin Fecha' o un número de 4 dígitos.")
+                # Opcional: Mostrar un QMessageBox de error
                 return
 
-            # 3. Obtener el AÑO ANTIGUO (desde la BD)
-            old_year = self.db.get_photo_year(self.original_path)
+            old_year, old_month = self.db.get_photo_date(self.original_path)
 
-            # 4. Guardar el AÑO NUEVO en la BD
-            self.db.update_photo_year(self.original_path, new_year_str)
-
-            # 5. Emitir señal si el año cambió
-            if old_year != new_year_str:
-                self.metadata_changed.emit(self.original_path, old_year, new_year_str)
+            if old_year != new_year_str or old_month != new_month_str:
+                self.db.update_photo_date(self.original_path, new_year_str, new_month_str)
+                self.metadata_changed.emit()
 
             self.accept()
 
         except Exception as e:
-            print(f"Error al guardar el año en la BD: {e}")
+            print(f"Error al guardar la fecha en la BD: {e}")
 
     def resizeEvent(self, event):
         """Se llama cuando la ventana cambia de tamaño, para re-ajustar la foto."""
@@ -327,14 +472,11 @@ class PhotoDetailDialog(QDialog):
         super().resizeEvent(event)
 
 # =================================================================
-# CLASE TRABAJADORA DEL ESCANEO (QObject, Corre en QThread)
+# CLASE TRABAJADORA DEL ESCANEO (MODIFICADA)
 # =================================================================
 class PhotoFinderWorker(QObject):
-    """
-    Clase que ejecuta el escaneo de archivos y la lectura de metadatos.
-    """
-    finished = Signal(dict) # Emite las fotos agrupadas por año: { '2023': [path1, ...], ... }
-    progress = Signal(str)   # Emite mensajes de estado
+    finished = Signal(dict)
+    progress = Signal(str)
 
     def __init__(self, directory_path: str, db_manager: VisageVaultDB):
         super().__init__()
@@ -343,57 +485,35 @@ class PhotoFinderWorker(QObject):
 
     @Slot()
     def run(self):
-        # Inicializa variables en un ámbito seguro
-        photo_paths_on_disk = []
-        """
-        Lógica de escaneo MODIFICADA. Ahora usa la BD como fuente de verdad.
-        """
-        self.progress.emit("Cargando años conocidos desde la BD...")
+        self.progress.emit("Cargando fechas conocidas desde la BD...")
+        db_dates = self.db.load_all_photo_dates()
+        
+        self.progress.emit("Escaneando archivos en el directorio...")
+        photo_paths_on_disk = find_photos(self.directory_path)
+        
+        photos_by_year_month = {}
+        photos_to_upsert_in_db = []
 
-        # 1. Cargar todos los años conocidos desde la BD
-        db_years = self.db.load_all_photo_years()
+        for path in photo_paths_on_disk:
+            if path in db_dates:
+                year, month = db_dates[path]
+            else:
+                self.progress.emit(f"Procesando nueva foto: {Path(path).name}")
+                year, month = get_photo_date(path)
+                photos_to_upsert_in_db.append((path, year, month))
+            
+            if year not in photos_by_year_month:
+                photos_by_year_month[year] = {}
+            if month not in photos_by_year_month[year]:
+                photos_by_year_month[year][month] = []
+            photos_by_year_month[year][month].append(path)
 
-        try:
-            self.progress.emit("Escaneando archivos en el directorio...")
+        if photos_to_upsert_in_db:
+            self.progress.emit(f"Guardando {len(photos_to_upsert_in_db)} fotos nuevas en la BD...")
+            self.db.bulk_upsert_photos(photos_to_upsert_in_db)
 
-            # 2. Escanear el disco
-            photo_paths_on_disk = find_photos(self.directory_path)
-
-            photos_by_year = {}
-            photos_to_upsert_in_db = [] # Lista de (filepath, year)
-
-            # 3. Comparar Disco vs BD
-            for i, path in enumerate(photo_paths_on_disk):
-
-                # 3a. La foto ya está en la BD (la BD manda)
-                if path in db_years:
-                    year = db_years[path]
-
-                # 3b. Foto nueva (no está en la BD)
-                else:
-                    self.progress.emit(f"Procesando nueva foto: {Path(path).name}")
-                    # Usamos metadata_reader solo para el año INICIAL
-                    year = metadata_reader.get_photo_date(path)
-                    # La añadimos a la lista para guardarla en la BD
-                    photos_to_upsert_in_db.append((path, year))
-
-                # 4. Agrupar para la GUI
-                if year not in photos_by_year:
-                    photos_by_year[year] = []
-                photos_by_year[year].append(path)
-
-            # 5. Guardar todas las fotos nuevas en la BD de una sola vez
-            if photos_to_upsert_in_db:
-                self.progress.emit(f"Guardando {len(photos_to_upsert_in_db)} fotos nuevas en la BD...")
-                self.db.bulk_upsert_photos(photos_to_upsert_in_db)
-
-        except Exception as e:
-            self.progress.emit(f"Error crítico durante el escaneo: {e}")
-            # Si hay un error, photo_paths_on_disk sigue siendo [].
-
-        # ⬅️ Usa la variable correctamente inicializada
         self.progress.emit(f"Escaneo finalizado. Encontradas {len(photo_paths_on_disk)} fotos.")
-        self.finished.emit(photos_by_year)
+        self.finished.emit(photos_by_year_month)
 
 # =================================================================
 # VENTANA PRINCIPAL DE LA APLICACIÓN (VisageVaultApp)
@@ -403,92 +523,58 @@ class VisageVaultApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VisageVault")
+        self.setWindowIcon(QIcon("visagevault.png"))
         self.setMinimumSize(QSize(900, 600))
-
         self.db = VisageVaultDB()
-
         self.current_directory = None
-        self.photos_by_year = {}
-
-        # Hilos para el escaneo principal
+        self.photos_by_year_month = {}
         self.thread = None
         self.worker = None
-
-        # Pool de hilos para cargar miniaturas (mejor para muchas tareas pequeñas)
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(os.cpu_count() or 4)
-
-        # NUEVO: Objeto de señales global para todos los ThumbnailLoaders
         self.thumb_signals = ThumbnailLoaderSignals()
-
-        # Conectar las señales globales a los slots de la aplicación
         self.thumb_signals.thumbnail_loaded.connect(self._update_thumbnail)
         self.thumb_signals.load_failed.connect(self._handle_thumbnail_failed)
-
         self._setup_ui()
-
-        # Iniciar la comprobación inicial después de que la ventana se muestre
         QTimer.singleShot(100, self._initial_check)
 
 
     def _setup_ui(self):
-        # 1. El QSplitter AHORA es el Widget Central
         self.main_splitter = QSplitter(Qt.Horizontal)
-
-        # --- IZQUIERDA: Área de Fotos (Scroll) ---
-        # (Esta parte es casi igual, pero la añadimos al splitter)
         photo_area_widget = QWidget()
         self.photo_container_layout = QVBoxLayout(photo_area_widget)
-        self.photo_container_layout.addStretch(1)
-
+        self.photo_container_layout.setSpacing(20)
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(photo_area_widget)
-
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._load_visible_thumbnails)
-
-        # Añadimos el área de scroll al splitter
         self.main_splitter.addWidget(self.scroll_area)
 
-        # --- DERECHA: Barra de Navegación (Panel) ---
-        # (Necesitamos un QWidget contenedor para el panel derecho)
         right_panel_widget = QWidget()
         right_panel_layout = QVBoxLayout(right_panel_widget)
-
-        # A. Botón y Ruta
         top_controls = QVBoxLayout()
         self.select_dir_button = QPushButton("Cambiar Directorio")
         self.select_dir_button.clicked.connect(self._open_directory_dialog)
         top_controls.addWidget(self.select_dir_button)
-
         self.path_label = QLabel("Ruta: No configurada")
         self.path_label.setWordWrap(True)
         top_controls.addWidget(self.path_label)
-        right_panel_layout.addLayout(top_controls) # Añadir a right_panel_layout
+        right_panel_layout.addLayout(top_controls)
+        
+        # --- Reemplazar QListWidget por QTreeWidget ---
+        year_label = QLabel("Navegación por Fecha:")
+        right_panel_layout.addWidget(year_label)
+        self.date_tree_widget = QTreeWidget()
+        self.date_tree_widget.setHeaderHidden(True)
+        self.date_tree_widget.currentItemChanged.connect(self._scroll_to_item)
+        right_panel_layout.addWidget(self.date_tree_widget)
 
-        # B. Lista de Años
-        year_label = QLabel("Años Encontrados:")
-        right_panel_layout.addWidget(year_label) # Añadir a right_panel_layout
-
-        self.year_list_widget = QListWidget()
-        # Quitamos el setMaximumWidth(110) para que el splitter lo controle
-        self.year_list_widget.currentRowChanged.connect(self._scroll_to_year)
-        right_panel_layout.addWidget(self.year_list_widget) # Añadir a right_panel_layout
-
-        # C. Etiqueta de Estado
         self.status_label = QLabel("Estado: Inicializando...")
-        right_panel_layout.addWidget(self.status_label) # Añadir a right_panel_layout
-
-        # Añadimos el panel derecho (el QWidget) al splitter
+        right_panel_layout.addWidget(self.status_label)
         self.main_splitter.addWidget(right_panel_widget)
-
-        # --- Ensamblar el layout principal ---
-        # El QSplitter es ahora el widget central de la ventana
         self.setCentralWidget(self.main_splitter)
-        self._set_status("Aplicación iniciada. Comprobando configuración...")
-
-        right_panel_widget.setMinimumWidth(150)
-        # --- Conectar y Cargar el Estado del Splitter ---
+        self._set_status("Aplicación iniciada.")
+        right_panel_widget.setMinimumWidth(180)
         self.main_splitter.splitterMoved.connect(self._save_splitter_state)
         self._load_splitter_state()
 
@@ -517,7 +603,7 @@ class VisageVaultApp(QMainWindow):
             self.current_directory = directory
             config_manager.set_photo_directory(directory)
             self.path_label.setText(f"Ruta: {Path(directory).name}")
-            self.year_list_widget.clear()
+            self.date_tree_widget.clear()
             self._start_photo_search(directory)
         elif force_select:
              self._set_status("¡Debes seleccionar un directorio para comenzar!")
@@ -564,130 +650,132 @@ class VisageVaultApp(QMainWindow):
     # ----------------------------------------------------
 
     def _display_photos(self):
-        """Muestra las fotos agrupadas y llena la barra de años."""
-
-        # 1. Limpiar el layout de fotos anterior
+        # Limpiar Vistas
         while self.photo_container_layout.count() > 0:
             item = self.photo_container_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.spacerItem():
-                pass # Evitar borrar el stretch item si aún no hay nada
+            if item.widget(): item.widget().deleteLater()
+        self.date_tree_widget.clear()
+        
+        self.group_widgets = {} # Almacenará { 'year-month': widget }
 
-        self.year_list_widget.clear()
-
-        # 2. Ordenar por año (descendente)
-        sorted_years = sorted(self.photos_by_year.keys(), reverse=True)
-
-        self.year_group_widgets = {}
+        # Ordenar años (descendente) y meses (ascendente)
+        sorted_years = sorted(self.photos_by_year_month.keys(), reverse=True)
 
         for year in sorted_years:
-            photos = self.photos_by_year[year]
+            if year == "Sin Fecha": continue # Opcional: saltar fechas no válidas
+            year_item = QTreeWidgetItem(self.date_tree_widget, [str(year)])
+            self.group_widgets[year] = None # Placeholder para el grupo del año
 
-            # --- Crear el Grupo por Año ---
-            year_group = QGroupBox(f"Año {year} ({len(photos)} fotos)")
-            year_group.setObjectName(f"year_group_{year}")
-            # Layout de rejilla para las fotos dentro del grupo
-            year_layout = QGridLayout(year_group)
+            sorted_months = sorted(self.photos_by_year_month[year].keys())
+            
+            year_group_box = QGroupBox(f"Año {year}")
+            year_group_box.setObjectName(f"group_{year}")
+            year_main_layout = QVBoxLayout(year_group_box)
+            self.group_widgets[year] = year_group_box
 
-            self.year_group_widgets[year] = year_group
+            for month in sorted_months:
+                if month == "00": continue # Saltar mes no válido
+                photos = self.photos_by_year_month[year][month]
+                if not photos: continue
 
-            # --- Crear los placeholders de las fotos ---
-            for i, photo_path in enumerate(photos):
-                photo_label = ZoomableClickableLabel(photo_path)
-                # Ajustamos el tamaño fijo basado en el tamaño de la miniatura
-                photo_label.setFixedSize(THUMBNAIL_SIZE[0] + 10, THUMBNAIL_SIZE[1] + 25)
-                photo_label.setToolTip(photo_path)
-                photo_label.setAlignment(Qt.AlignCenter)
-                photo_label.setText(Path(photo_path).name.split('.')[0] + "\nCargando...")
+                # Añadir mes al árbol
+                try:
+                    if month and month != "00":
+                        month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
+                    else:
+                        month_name = "Mes Desconocido"
+                except ValueError:
+                    month_name = "Mes Desconocido"
+                
+                month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(photos)})"])
+                month_item.setData(0, Qt.UserRole, (year, month)) # Guardar año y mes
 
-                # Almacenamos la ruta original para que el cargador la sepa
-                photo_label.setProperty("original_path", photo_path)
-                # NUEVO: Marcamos el estado inicial como NO_CARGADO
-                photo_label.setProperty("loaded", False)
+                # Añadir separador y rejilla de fotos para el mes
+                month_label = QLabel(month_name)
+                month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
+                year_main_layout.addWidget(month_label)
+                self.group_widgets[f"{year}-{month}"] = month_label
 
-                photo_label.doubleClickedPath.connect(self._open_photo_detail)
+                photo_grid_widget = QWidget()
+                photo_grid_layout = QGridLayout(photo_grid_widget)
+                
+                for i, photo_path in enumerate(photos):
+                    photo_label = ZoomableClickableLabel(photo_path)
+                    photo_label.is_thumbnail_view = True
+                    photo_label.setFixedSize(THUMBNAIL_SIZE[0] + 10, THUMBNAIL_SIZE[1] + 25)
+                    photo_label.setToolTip(photo_path)
+                    photo_label.setAlignment(Qt.AlignCenter)
+                    photo_label.setText(Path(photo_path).name.split('.')[0] + "\nCargando...")
+                    photo_label.setProperty("original_path", photo_path)
+                    photo_label.setProperty("loaded", False)
+                    photo_label.doubleClickedPath.connect(self._open_photo_detail)
+                    row, col = i // 5, i % 5
+                    photo_grid_layout.addWidget(photo_label, row, col)
+                
+                year_main_layout.addWidget(photo_grid_widget)
 
-                row = i // 5
-                col = i % 5
-                year_layout.addWidget(photo_label, row, col)
+            self.photo_container_layout.addWidget(year_group_box)
+            year_item.setExpanded(True)
 
-            # Asegurar que las fotos se empujan hacia la izquierda
-            year_layout.addItem(QSpacerItem(20, 20, QSizePolicy.Minimum, QSizePolicy.Expanding), year_layout.rowCount(), 0)
+        self.photo_container_layout.addStretch(1)
+        QTimer.singleShot(100, self._load_visible_thumbnails)
 
-            self.photo_container_layout.addWidget(year_group)
-            self.year_list_widget.addItem(year)
+    @Slot(QTreeWidgetItem, QTreeWidgetItem)
+    def _scroll_to_item(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
+        if not current_item: return
 
-        self.photo_container_layout.addStretch(1) # Stretch al final del layout principal
+        # Si es un item de mes (tiene padre)
+        if current_item.parent():
+            year, month = current_item.data(0, Qt.UserRole)
+            target_key = f"{year}-{month}"
+        # Si es un item de año (no tiene padre)
+        else:
+            year = current_item.text(0)
+            target_key = year
+        
+        target_widget = self.group_widgets.get(target_key)
+        if target_widget:
+            self.scroll_area.ensureWidgetVisible(target_widget, 50, 50)
+            QTimer.singleShot(200, self._load_visible_thumbnails)
 
-        # Iniciar la carga de miniaturas para las visibles al inicio
-        QTimer.singleShot(500, self._load_visible_thumbnails)
-
-
-    def _load_visible_thumbnails(self):
-        """Carga las miniaturas de las fotos visibles y un margen de precarga."""
-        viewport = self.scroll_area.viewport()
-
-        # 1. Crear el rectángulo de precarga (más grande que el viewport)
-        # .adjusted(izquierda, arriba, derecha, abajo)
-        # Añadimos margen arriba (negativo) y abajo (positivo)
-        preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
-
-        # 2. Iteramos sobre TODOS los widgets hijos del CONTENEDOR del scroll
-        # (Usamos self.scroll_area.widget() para acceder al 'photo_area_widget' interno)
-        for photo_label in self.scroll_area.widget().findChildren(QLabel):
-            original_path = photo_label.property("original_path")
-            is_loaded = photo_label.property("loaded")
-
-            if original_path and is_loaded is False:
-
-                # 3. Usamos tu corrección con mapTo para obtener la geometría correcta
-                label_pos = photo_label.mapTo(viewport, photo_label.rect().topLeft())
-                label_rect_in_viewport = photo_label.rect().translated(label_pos)
-
-                # 4. Comprobar intersección con el RECTÁNGULO DE PRECARGA
-                if preload_rect.intersects(label_rect_in_viewport):
-                    # Marcamos como en proceso
-                    photo_label.setProperty("loaded", None)
-                    loader = ThumbnailLoader(original_path, self.thumb_signals)
-                    self.threadpool.start(loader)
-
-
-    @Slot(str, QPixmap)
-    def _update_thumbnail(self, original_path: str, pixmap: QPixmap):
-        """Actualiza el QLabel con la miniatura cargada (ejecutado en el hilo principal)."""
-
-        for photo_label in self.scroll_area.viewport().findChildren(QLabel):
-            if photo_label.property("original_path") == original_path:
-                # Escalamos el pixmap y lo asignamos
-                photo_label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                photo_label.setText("") # Quitar texto "Cargando..."
-
-                # NUEVO: Marcamos como CARGADA
-                photo_label.setProperty("loaded", True)
-                break
-
-    @Slot(int)
-    def _scroll_to_year(self, row):
-        """Mueve la barra de desplazamiento al grupo de año seleccionado."""
-        if row >= 0:
-            year = self.year_list_widget.item(row).text()
-            target_group = self.year_group_widgets.get(year)
-
-            if target_group:
-                # Asegura que el widget sea visible en el área de scroll
-                self.scroll_area.ensureWidgetVisible(target_group, 50, 50)
-
-                # Cargar las miniaturas del área visible tras el scroll
-                QTimer.singleShot(200, self._load_visible_thumbnails)
+    @Slot(dict)
+    def _handle_search_finished(self, photos_by_year_month):
+        self.photos_by_year_month = photos_by_year_month
+        self.select_dir_button.setEnabled(True)
+        num_fotos = sum(len(photos) for months in photos_by_year_month.values() for photos in months.values())
+        self._set_status(f"Escaneo finalizado. {num_fotos} fotos encontradas.")
+        self._display_photos()
 
     def _set_status(self, message):
         self.status_label.setText(f"Estado: {message}")
 
+    def _load_visible_thumbnails(self):
+        viewport = self.scroll_area.viewport()
+        preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
+        for photo_label in self.scroll_area.widget().findChildren(QLabel):
+            original_path = photo_label.property("original_path")
+            is_loaded = photo_label.property("loaded")
+            if original_path and is_loaded is False:
+                label_pos = photo_label.mapTo(viewport, photo_label.rect().topLeft())
+                label_rect_in_viewport = photo_label.rect().translated(label_pos)
+                if preload_rect.intersects(label_rect_in_viewport):
+                    photo_label.setProperty("loaded", None)
+                    loader = ThumbnailLoader(original_path, self.thumb_signals)
+                    self.threadpool.start(loader)
+
+    @Slot(str, QPixmap)
+    def _update_thumbnail(self, original_path: str, pixmap: QPixmap):
+        for photo_label in self.scroll_area.widget().findChildren(QLabel):
+            if photo_label.property("original_path") == original_path:
+                photo_label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                photo_label.setText("")
+                photo_label.setProperty("loaded", True)
+                break
+
     @Slot(str)
     def _handle_thumbnail_failed(self, original_path: str):
         """Maneja el caso en que la miniatura no se pudo cargar."""
-        for photo_label in self.scroll_area.viewport().findChildren(QLabel):
+        for photo_label in self.scroll_area.widget().findChildren(QLabel):
             if photo_label.property("original_path") == original_path:
                 photo_label.setText("Error al cargar.")
                 photo_label.setProperty("loaded", True) # Marcar como "terminado" para no reintentar
@@ -744,74 +832,27 @@ class VisageVaultApp(QMainWindow):
         """Abre la ventana de detalle de la foto."""
         self._set_status(f"Abriendo detalle para: {Path(original_path).name}")
 
-        # Creamos y ejecutamos el diálogo
-        # 'self' es el 'parent' para que el diálogo se centre sobre la app
         dialog = PhotoDetailDialog(original_path, self.db, self)
-        dialog.metadata_changed.connect(self._handle_photo_year_changed)
-        dialog.exec() # .exec() la hace modal (bloquea la ventana principal)
+        dialog.metadata_changed.connect(self._handle_photo_date_changed)
+        dialog.exec()
 
         self._set_status("Detalle cerrado.")
 
     @Slot()
-    def _trigger_full_rescan(self):
+    def _handle_photo_date_changed(self):
         """
-        Limpia la GUI y vuelve a escanear el directorio.
-        Se llama cuando un metadato (como el año) ha cambiado.
+        Actualiza la vista reconstruyendo todo cuando una fecha cambia.
         """
-        self._set_status("Metadatos cambiados. Re-escaneando el directorio...")
-
-        # Limpiar la GUI
-        self.year_list_widget.clear()
-        while self.photo_container_layout.count() > 0:
-            item = self.photo_container_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # Volver a escanear (esto reconstruirá los grupos de años)
+        self._set_status("Metadatos cambiados. Reconstruyendo vista...")
         if self.current_directory:
             self._start_photo_search(self.current_directory)
-
-    @Slot(str, str, str)
-    def _handle_photo_year_changed(self, photo_path: str, old_year: str, new_year: str):
-        """
-        Actualiza el modelo de datos en memoria y reconstruye la GUI
-        sin re-escanear el disco.
-        """
-        self._set_status(f"Moviendo foto de {old_year} a {new_year}...")
-
-        # 1. Actualizar el modelo de datos (self.photos_by_year)
-
-        # Quitar la foto de la lista del año antiguo
-        if old_year in self.photos_by_year and photo_path in self.photos_by_year[old_year]:
-            self.photos_by_year[old_year].remove(photo_path)
-            # Si la lista del año antiguo queda vacía, eliminamos la clave
-            if not self.photos_by_year[old_year]:
-                del self.photos_by_year[old_year]
-
-        # Añadir la foto a la lista del año nuevo
-        if new_year not in self.photos_by_year:
-            self.photos_by_year[new_year] = [] # Crear el nuevo año si no existe
-
-        self.photos_by_year[new_year].append(photo_path)
-
-        # 2. Reconstruir la GUI
-        # Llamamos a _display_photos(), que limpia y reconstruye la vista
-        # usando el diccionario self.photos_by_year actualizado.
-        self._display_photos()
-
-        self._set_status(f"Foto movida a {new_year}.")
-
-        # 3. (Opcional) Resaltar el nuevo año en la lista
-        items = self.year_list_widget.findItems(new_year, Qt.MatchExactly)
-        if items:
-            self.year_list_widget.setCurrentItem(items[0])
 
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""
     app = QApplication(sys.argv)
     window = VisageVaultApp()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 if __name__ == "__main__":

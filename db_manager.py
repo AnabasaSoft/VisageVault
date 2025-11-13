@@ -10,7 +10,6 @@ class VisageVaultDB:
     """
     def __init__(self, db_file="visagevault.db"):
         self.db_file = db_file
-        # No almacenamos self.connection aquí para evitar errores de multihilo
         self.create_tables()
 
     def _get_connection(self):
@@ -20,20 +19,28 @@ class VisageVaultDB:
         return conn
 
     def create_tables(self):
-        """Define y crea las tablas si no existen."""
+        """Define y crea las tablas si no existen, y añade la columna 'month' si es necesario."""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
 
-            # 1. Tabla PHOTOS (MODIFICADA: Añadida la columna 'year')
+            # 1. Tabla PHOTOS (Añadida la columna 'month')
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS photos (
                     id INTEGER PRIMARY KEY,
                     filepath TEXT NOT NULL UNIQUE,
                     file_hash TEXT UNIQUE,
-                    year TEXT
+                    year TEXT,
+                    month TEXT
                 )
             """)
+
+            # --- MIGRACIÓN: Añadir columna 'month' si no existe ---
+            cursor.execute("PRAGMA table_info(photos)")
+            columns = [info[1] for info in cursor.fetchall()]
+            if 'month' not in columns:
+                print("Migrando base de datos: añadiendo columna 'month'...")
+                cursor.execute("ALTER TABLE photos ADD COLUMN month TEXT")
 
             # 2. Tabla FACES (Datos de reconocimiento)
             cursor.execute("""
@@ -42,7 +49,6 @@ class VisageVaultDB:
                     photo_id INTEGER NOT NULL,
                     encoding BLOB NOT NULL,
                     location TEXT,
-
                     FOREIGN KEY (photo_id) REFERENCES photos (id)
                 )
             """)
@@ -69,44 +75,39 @@ class VisageVaultDB:
             conn.commit()
             print("Tablas verificadas y listas.")
         except sqlite3.Error as e:
-            print(f"Error al crear tablas: {e}")
+            print(f"Error al crear/migrar tablas: {e}")
         finally:
             conn.close()
 
     # --- Funciones de Lectura (Usadas por PhotoFinderWorker) ---
 
-    def load_all_photo_years(self) -> dict:
+    def load_all_photo_dates(self) -> dict:
         """
-        Carga todas las rutas y años conocidos desde la BD a un diccionario.
+        Carga todas las rutas, años y meses conocidos desde la BD a un diccionario.
+        Devuelve: {'/ruta/foto1.jpg': ('2025', '08'), ...}
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT filepath, year FROM photos")
-            # Devuelve: {'/ruta/foto1.jpg': '2025', '/ruta/foto2.jpg': '2024'}
-            return {row['filepath']: row['year'] for row in cursor.fetchall()}
+            cursor.execute("SELECT filepath, year, month FROM photos")
+            return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
         except sqlite3.Error as e:
-            print(f"Error al cargar años de la BD: {e}")
+            print(f"Error al cargar fechas de la BD: {e}")
             return {}
         finally:
             conn.close()
 
-    def bulk_upsert_photos(self, photos_data: list[tuple[str, str]]):
+    def bulk_upsert_photos(self, photos_data: list[tuple[str, str, str]]):
         """
-        Inserta o reemplaza (si la ruta ya existe) una lista de fotos nuevas
-        con su año inicial. Usado por el Worker al encontrar nuevas fotos.
-        (photos_data es una lista de tuplas: (filepath, year))
+        Inserta o reemplaza una lista de fotos con su año y mes.
+        (photos_data es una lista de tuplas: (filepath, year, month))
         """
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            # 'INSERT OR IGNORE' solo inserta si la clave primaria no existe.
-            # Necesitas 'INSERT OR REPLACE' si quisieras que el año se actualice
-            # si la foto ya existe, pero para fotos nuevas, 'INSERT' basta.
-            # Usaremos INSERT OR REPLACE para ser seguros con el 'year' y 'filepath'.
             cursor.executemany("""
-                INSERT OR REPLACE INTO photos (filepath, year)
-                VALUES (?, ?)
+                INSERT OR REPLACE INTO photos (filepath, year, month)
+                VALUES (?, ?, ?)
             """, photos_data)
             conn.commit()
         except sqlite3.Error as e:
@@ -116,33 +117,31 @@ class VisageVaultDB:
 
     # --- Funciones de Edición (Usadas por PhotoDetailDialog) ---
 
-    def update_photo_year(self, filepath: str, new_year: str):
-        """Actualiza el año de una foto específica."""
+    def update_photo_date(self, filepath: str, new_year: str, new_month: str):
+        """Actualiza el año y mes de una foto específica."""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("UPDATE photos SET year = ? WHERE filepath = ?", (new_year, filepath))
+            cursor.execute("UPDATE photos SET year = ?, month = ? WHERE filepath = ?", (new_year, new_month, filepath))
             conn.commit()
         except sqlite3.Error as e:
-            print(f"Error al actualizar el año: {e}")
+            print(f"Error al actualizar la fecha: {e}")
         finally:
             conn.close()
 
-    def get_photo_year(self, filepath: str) -> str | None:
-        """Obtiene el año guardado para una sola foto."""
+    def get_photo_date(self, filepath: str) -> tuple[str, str] | None:
+        """Obtiene el año y mes guardados para una sola foto."""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT year FROM photos WHERE filepath = ?", (filepath,))
+            cursor.execute("SELECT year, month FROM photos WHERE filepath = ?", (filepath,))
             result = cursor.fetchone()
-            return result['year'] if result else None
+            return (result['year'], result['month']) if result else None
         except sqlite3.Error:
             return None
         finally:
             conn.close()
 
-    # El método close() ya no es estrictamente necesario, pero lo mantenemos como placeholder
-    # para futuras funcionalidades que requieran un cierre explícito.
     def close(self):
         pass
 
@@ -150,17 +149,17 @@ if __name__ == "__main__":
     # Ejemplo de uso:
     db = VisageVaultDB(db_file="test_visagevault.db")
     print("\nPrueba de carga:")
-    print(db.load_all_photo_years())
+    print(db.load_all_photo_dates())
 
     # Pruebas de inserción
     test_data = [
-        ("/home/test/foto1.jpg", "2024"),
-        ("/home/test/foto2.jpg", "2025"),
+        ("/home/test/foto1.jpg", "2024", "01"),
+        ("/home/test/foto2.jpg", "2025", "12"),
     ]
     db.bulk_upsert_photos(test_data)
-    print(db.load_all_photo_years())
+    print(db.load_all_photo_dates())
 
     # Prueba de actualización
-    db.update_photo_year("/home/test/foto1.jpg", "2023")
-    print(db.get_photo_year("/home/test/foto1.jpg"))
+    db.update_photo_date("/home/test/foto1.jpg", "2023", "05")
+    print(db.get_photo_date("/home/test/foto1.jpg"))
     db.close()
