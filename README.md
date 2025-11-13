@@ -1,23 +1,34 @@
+Aquí tienes el archivo `README.md` actualizado para incluir las nuevas funciones de reconocimiento facial y las nuevas dependencias que hemos añadido.
+
+He modificado 3 secciones:
+
+1.  **Características Principales:** Añadidas las funciones de reconocimiento facial.
+2.  **Pila Tecnológica:** Añadida la biblioteca `face_recognition`.
+3.  **Instalación y Ejecución:** Actualizado el comando `pip install` con las nuevas dependencias.
+
+-----
 
 # VisageVault - Gestor de Fotografías Inteligente
 
 DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 
-VisageVault es una aplicación de escritorio moderna y de alto rendimiento para gestionar grandes colecciones de fotografías. Se centra en una navegación ultrarrápida basada en la fecha de tus fotos, utilizando escaneo asíncrono, una base de datos local y generación de miniaturas en hilos para una experiencia de usuario fluida.
+VisageVault es una aplicación de escritorio moderna y de alto rendimiento para gestionar grandes colecciones de fotografías. Se centra en una navegación ultrarrápida basada en la **fecha y las personas** de tus fotos, utilizando escaneo asíncrono, una base de datos local y generación de miniaturas en hilos para una experiencia de usuario fluida.
 
 -----
 
 ## 🚀 Características Principales
 
   * **Navegación por Fechas:** Organiza y agrupa automáticamente toda tu biblioteca por **Año** y **Mes**, permitiéndote encontrar recuerdos al instante.
-  * **Interfaz Fluida y Asíncrona:** El escaneo de archivos y la carga de miniaturas se realizan en hilos separados (`QThread`, `QThreadPool`), evitando que la aplicación se congele, incluso con decenas de miles de fotos.
+  * **Reconocimiento Facial:** Escanea tus fotos en segundo plano para detectar y recortar caras automáticamente.
+  * **Gestión de Personas:** Muestra todas las caras detectadas (en formato circular) en una pestaña dedicada, listas para ser etiquetadas y agrupadas por nombre.
+  * **Interfaz Fluida y Asíncrona:** El escaneo de archivos, la detección de caras y la carga de miniaturas se realizan en hilos separados (`QThread`, `QThreadPool`), evitando que la aplicación se congele, incluso con decenas de miles de fotos.
   * **Carga Diferida (Lazy Loading):** Las miniaturas solo se cargan cuando son visibles (o están a punto de serlo), optimizando el uso de memoria y la velocidad de desplazamiento.
-  * **Caché de Base de Datos:** Utiliza `SQLite` para almacenar las rutas y las fechas (Año/Mes) de todas las fotos. Los escaneos posteriores son casi instantáneos, leyendo solo los archivos nuevos.
+  * **Caché de Base de Datos:** Utiliza `SQLite` para almacenar las rutas, las fechas y los datos faciales de todas las fotos. Los escaneos posteriores son casi instantáneos.
   * **Editor de Fechas:** ¿Una foto escaneada o antigua tiene una fecha incorrecta? Puedes editar fácilmente el **Año** y el **Mes** en la base de datos a través del diálogo de detalles, sin modificar el archivo original.
-  * **Lector de Metadatos EXIF:** Extrae la fecha de captura (`DateTimeOriginal`) de tus fotos usando `Pillow` y `piexif`. Si no existe, utiliza la fecha de modificación del archivo como respaldo.
+  * **Lector de Metadatos EXIF:** Extrae la fecha de captura (`DateTimeOriginal`) de tus fotos. Si no existe, utiliza la fecha de modificación del archivo como respaldo.
   * **Visor de Detalles Avanzado:**
       * Haz doble clic para abrir una vista de detalle con la imagen en alta resolución.
-      * **Zoom interactivo** dentro del visor de detalles.
+      * **Zoom interactivo** y arrastre (panning) dentro del visor de detalles.
       * Muestra una **tabla completa con todos los metadatos EXIF** encontrados en el archivo.
   * **Vista Previa Rápida (Quick-Look):** En la vista de miniaturas, mantén pulsado `Ctrl` y usa la **rueda del ratón** para una vista previa ampliada e instantánea de cualquier foto sin necesidad de abrirla.
   * **Caché de Miniaturas:** Genera y guarda las miniaturas en un directorio local (`.visagevault_cache`) para una carga visual instantánea.
@@ -27,7 +38,8 @@ VisageVault es una aplicación de escritorio moderna y de alto rendimiento para 
   * **Python 3**
   * **PySide6:** Para la interfaz gráfica de usuario (GUI).
   * **SQLite3:** (Módulo nativo de Python) Para la base de datos.
-  * **Pillow (PIL):** Para la lectura de imágenes y generación de miniaturas.
+  * **face\_recognition:** Para la detección y el reconocimiento facial (basado en `dlib`).
+  * **Pillow (PIL):** Para la lectura de imágenes, recorte de caras y generación de miniaturas.
   * **piexif:** Para la lectura avanzada de metadatos EXIF.
 
 ## 📦 Instalación y Ejecución
@@ -43,7 +55,7 @@ VisageVault es una aplicación de escritorio moderna y de alto rendimiento para 
     (Se recomienda crear un entorno virtual)
 
     ```bash
-    pip install PySide6 Pillow piexif
+    pip install PySide6 Pillow piexif face_recognition setuptools
     ```
 
 3.  **Ejecuta la aplicación:**
@@ -52,7 +64,7 @@ VisageVault es una aplicación de escritorio moderna y de alto rendimiento para 
     python visagevault.py
     ```
 
-4.  **Primer Inicio:** La aplicación te pedirá que selecciones el directorio raíz que contiene todas tus fotografías. Comenzará el primer escaneo.
+4.  **Primer Inicio:** La aplicación te pedirá que selecciones el directorio raíz que contiene todas tus fotografías. Comenzará el primer escaneo. El escaneo de caras se iniciará automáticamente la primera vez que visites la pestaña "Personas".
 
 -----
 

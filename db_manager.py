@@ -2,6 +2,7 @@
 
 import sqlite3
 from pathlib import Path
+import pickle
 
 class VisageVaultDB:
     """
@@ -41,6 +42,9 @@ class VisageVaultDB:
             if 'month' not in columns:
                 print("Migrando base de datos: añadiendo columna 'month'...")
                 cursor.execute("ALTER TABLE photos ADD COLUMN month TEXT")
+            if 'faces_scanned' not in columns:
+                print("Migrando base de datos: añadiendo columna 'faces_scanned'...")
+                cursor.execute("ALTER TABLE photos ADD COLUMN faces_scanned INTEGER DEFAULT 0")
 
             # 2. Tabla FACES (Datos de reconocimiento)
             cursor.execute("""
@@ -253,6 +257,33 @@ class VisageVaultDB:
 
     def close(self):
         pass
+
+    def get_unscanned_photos(self) -> list:
+        """Devuelve todas las fotos que aún no han sido escaneadas para caras."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            # Busca fotos que NO están marcadas como escaneadas (0)
+            cursor.execute("""
+                SELECT id, filepath
+                FROM photos
+                WHERE faces_scanned = 0
+            """)
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    def mark_photo_as_scanned(self, photo_id: int):
+        """Marca una foto como escaneada (faces_scanned = 1)."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE photos SET faces_scanned = 1 WHERE id = ?", (photo_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            print(f"Error al marcar foto como escaneada: {e}")
+        finally:
+            conn.close()
 
 if __name__ == "__main__":
     # Ejemplo de uso:

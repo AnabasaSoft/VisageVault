@@ -43,6 +43,16 @@ import os
 from pathlib import Path
 import datetime
 import locale
+import warnings
+
+
+# --- Silenciar solo el aviso de pkg_resources ---
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API",
+    category=UserWarning,
+)
+
 
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
@@ -59,11 +69,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QSize, QObject, Signal, QThread, Slot, QTimer,
     QRunnable, QThreadPool, QPropertyAnimation, QEasingCurve, QRect, QPoint, QRectF,
-    QPointF
+    QPointF, QBuffer, QIODevice
 )
-from PySide6.QtGui import QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent
+from PySide6.QtGui import (
+    QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent,
+    QPainterPath
+)
 
-# --- Importamos módulos auxiliares (ASUMIDOS EXISTENTES) ---
 from photo_finder import find_photos
 import config_manager
 from metadata_reader import get_photo_date
@@ -73,6 +85,10 @@ import piexif.helper
 import re
 import db_manager
 from db_manager import VisageVaultDB
+import face_recognition
+from PIL import Image
+import ast
+import pickle
 
 # --- Configuración regional para nombres de meses ---
 try:
@@ -200,6 +216,50 @@ class ImagePreviewDialog(QDialog):
         if self.label._current_scale == 1.0:
             self.label.fitToWindow()
         super().resizeEvent(event)
+
+# =================================================================
+# CLASE PARA MOSTRAR CARAS RECORTADAS (CIRCULAR Y CLICABLE)
+# =================================================================
+class CircularFaceLabel(QLabel):
+    """
+    Un QLabel que muestra un QPixmap recortado en forma de círculo
+    y emite una señal 'clicked' cuando se presiona.
+    """
+    # --- NUEVA SEÑAL ---
+    clicked = Signal()
+
+    def __init__(self, pixmap: QPixmap, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(100, 100) # Tamaño fijo para la cuadrícula de caras
+
+        # Escala la imagen para que "rellene" el círculo
+        self._pixmap = pixmap.scaled(100, 100, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        self.setToolTip("Cara detectada (Haz clic para etiquetar)")
+        self.setCursor(Qt.PointingHandCursor)
+
+    def paintEvent(self, event: QPaintEvent):
+        """Pinta la imagen de forma circular."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing) # Suavizado de bordes
+
+        path = QPainterPath()
+        # Crea un círculo/elipse del tamaño del widget
+        path.addEllipse(0, 0, self.width(), self.height())
+
+        # Establece el círculo como la "máscara" de recorte
+        painter.setClipPath(path)
+
+        # Dibuja la imagen
+        painter.drawPixmap(0, 0, self._pixmap)
+
+        painter.end()
+
+    # --- NUEVO MÉTODO ---
+    def mousePressEvent(self, event):
+        """Emite la señal 'clicked' al hacer clic."""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 # =================================================================
 # CLASE: ZoomableClickableLabel (CON ZOOM AL PUNTERO)
@@ -693,6 +753,88 @@ class PhotoFinderWorker(QObject):
         self.finished.emit(photos_by_year_month)
 
 # =================================================================
+# CLASE TRABAJADORA DEL ESCANEO DE CARAS (QThread)
+# =================================================================
+class FaceScanSignals(QObject):
+    """Señales para el trabajador de escaneo de caras."""
+    scan_progress = Signal(str)
+    scan_percentage = Signal(int)
+    scan_finished = Signal() # Se emite cuando todo el lote ha terminado
+
+class FaceScanWorker(QObject):
+    """
+    Escanea fotos no procesadas en un hilo separado para encontrar caras.
+    """
+    def __init__(self, db_manager: VisageVaultDB):
+        super().__init__()
+        self.db = db_manager
+        self.signals = FaceScanSignals()
+
+    @Slot()
+    def run(self):
+        """
+        Bucle principal del trabajador.
+        """
+        try:
+            self.signals.scan_progress.emit("Buscando fotos sin escanear...")
+            unscanned_photos = self.db.get_unscanned_photos()
+            total = len(unscanned_photos)
+            if total == 0:
+                self.signals.scan_progress.emit("No hay fotos nuevas que escanear.")
+                self.signals.scan_percentage.emit(100)
+                self.signals.scan_finished.emit()
+                return
+
+            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
+
+            for i, row in enumerate(unscanned_photos):
+                photo_id = row['id']
+                photo_path = row['filepath']
+
+                self.signals.scan_progress.emit(f"Procesando ({i+1}/{total}): {Path(photo_path).name}")
+                # Calcular porcentaje y emitirlo
+                percentage = (i + 1) * 100 // total
+                self.signals.scan_percentage.emit(percentage)
+
+                try:
+                    # Cargar imagen
+                    image = face_recognition.load_image_file(photo_path)
+
+                    # 1. Encontrar ubicaciones
+                    locations = face_recognition.face_locations(image)
+
+                    if not locations:
+                        # Si no hay caras, marcarla y continuar
+                        self.db.mark_photo_as_scanned(photo_id)
+                        continue
+
+                    # 2. Encontrar "encodings" (datos de la cara)
+                    encodings = face_recognition.face_encodings(image, locations)
+
+                    # 3. Guardar cada cara en la BD
+                    for loc, enc in zip(locations, encodings):
+                        location_str = str(loc) # Guardamos la tupla (top, right, bottom, left) como string
+                        encoding_blob = pickle.dumps(enc) # Serializamos el array numpy
+
+                        self.db.add_face(photo_id, encoding_blob, location_str)
+
+                    # 4. Marcar la foto como procesada
+                    self.db.mark_photo_as_scanned(photo_id)
+
+                except Exception as e:
+                    print(f"Error procesando caras en {photo_path}: {e}")
+                    # Marcamos como escaneada igualmente para no reintentar
+                    self.db.mark_photo_as_scanned(photo_id)
+
+            self.signals.scan_progress.emit("Escaneo de caras finalizado.")
+            self.signals.scan_finished.emit()
+
+        except Exception as e:
+            print(f"Error crítico en el hilo de escaneo de caras: {e}")
+            self.signals.scan_progress.emit(f"Error: {e}")
+            self.signals.scan_finished.emit() # Emitir para desbloquear la UI
+
+# =================================================================
 # VENTANA PRINCIPAL DE LA APLICACIÓN (VisageVaultApp)
 # =================================================================
 class VisageVaultApp(QMainWindow):
@@ -707,6 +849,9 @@ class VisageVaultApp(QMainWindow):
         self.photos_by_year_month = {}
         self.thread = None
         self.worker = None
+        self.face_scan_thread = None
+        self.face_scan_worker = None
+        self.face_loading_label = None
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(os.cpu_count() or 4)
         self.thumb_signals = ThumbnailLoaderSignals()
@@ -770,11 +915,58 @@ class VisageVaultApp(QMainWindow):
         # 4. Añadir el splitter al layout de la Pestaña "Fotos"
         fotos_layout.addWidget(self.main_splitter)
 
-        # 5. Crear la Pestaña "Personas" (Placeholder)
+        # 5. Crear la Pestaña "Personas" (Interfaz real)
         self.personas_tab_widget = QWidget()
         personas_layout = QVBoxLayout(self.personas_tab_widget)
-        # (Aquí es donde irá la futura cuadrícula de caras)
-        personas_layout.addWidget(QLabel("Próximamente: Gestión de Caras y Personas"))
+        personas_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 5a. Crear el Splitter para la pestaña "Personas"
+        self.people_splitter = QSplitter(Qt.Horizontal)
+
+        # 5b. Panel Izquierdo (Cuadrícula de Caras)
+        face_area_widget = QWidget()
+        self.face_container_layout = QVBoxLayout(face_area_widget)
+
+        # Aquí crearemos la cuadrícula, pero la pondremos dentro de un GroupBox
+        # Empezamos con las caras "Sin Asignar"
+        self.unknown_faces_group = QGroupBox("Caras Sin Asignar")
+        self.unknown_faces_layout = QGridLayout(self.unknown_faces_group)
+        self.unknown_faces_layout.setSpacing(10)
+        self.face_container_layout.addWidget(self.unknown_faces_group)
+
+        self.face_container_layout.addStretch(1) # Empuja todo hacia arriba
+
+        self.face_scroll_area = QScrollArea()
+        self.face_scroll_area.setWidgetResizable(True)
+        self.face_scroll_area.setWidget(face_area_widget)
+        self.people_splitter.addWidget(self.face_scroll_area)
+
+        # 5c. Panel Derecho (El "Cajón" de Nombres de Personas)
+        people_panel_widget = QWidget()
+        people_panel_layout = QVBoxLayout(people_panel_widget)
+        people_panel_widget.setMinimumWidth(180) # Igual que el panel de navegación
+        people_panel_widget.setMaximumWidth(450)
+
+        people_label = QLabel("Navegación por Personas:")
+        people_panel_layout.addWidget(people_label)
+
+        self.people_tree_widget = QTreeWidget()
+        self.people_tree_widget.setHeaderHidden(True)
+        # self.people_tree_widget.currentItemChanged.connect(self._scroll_to_person)
+        people_panel_layout.addWidget(self.people_tree_widget)
+
+        # Botones de acción (ej: "Nueva Persona")
+        self.add_person_button = QPushButton("Añadir Persona")
+        # self.add_person_button.clicked.connect(self._add_new_person)
+        people_panel_layout.addWidget(self.add_person_button)
+
+        self.people_splitter.addWidget(people_panel_widget)
+
+        # 5d. Añadir el splitter de personas al layout de la pestaña
+        personas_layout.addWidget(self.people_splitter)
+
+        # 5e. Ajustar tamaños del splitter de personas
+        self.people_splitter.setSizes([int(self.width() * 0.8), int(self.width() * 0.2)])
 
         # 6. Añadir las pestañas al TabWidget
         self.tab_widget.addTab(fotos_tab_widget, "Fotos")
@@ -787,6 +979,7 @@ class VisageVaultApp(QMainWindow):
         right_panel_widget.setMinimumWidth(180)
         self.main_splitter.splitterMoved.connect(self._save_splitter_state)
         self._load_splitter_state()
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
     # ----------------------------------------------------
     # Lógica de Inicio y Configuración
@@ -843,6 +1036,33 @@ class VisageVaultApp(QMainWindow):
 
         self.select_dir_button.setEnabled(False)
         self.thread.start()
+
+    # ----------------------------------------------------
+    # Escaneo de caras
+    # ----------------------------------------------------
+    def _start_face_scan(self):
+        """Configura y lanza el trabajador de escaneo de caras."""
+        if self.face_scan_thread and self.face_scan_thread.isRunning():
+            self._set_status("El escaneo de caras ya está en curso.")
+            return
+
+        self.face_scan_thread = QThread()
+        self.face_scan_worker = FaceScanWorker(self.db)
+        self.face_scan_worker.moveToThread(self.face_scan_thread)
+
+        # Conectar señales del worker
+        self.face_scan_worker.signals.scan_progress.connect(self._set_status)
+        self.face_scan_worker.signals.scan_percentage.connect(self._update_face_scan_percentage)
+        self.face_scan_worker.signals.scan_finished.connect(self._load_faces_to_grid)
+
+        # Conectar control del hilo
+        self.face_scan_thread.started.connect(self.face_scan_worker.run)
+        self.face_scan_worker.signals.scan_finished.connect(self.face_scan_thread.quit)
+        self.face_scan_worker.signals.scan_finished.connect(self.face_scan_worker.deleteLater)
+        self.face_scan_thread.finished.connect(self.face_scan_thread.deleteLater)
+
+        self._set_status("Iniciando escaneo de caras...")
+        self.face_scan_thread.start()
 
     # ----------------------------------------------------
     # Lógica de Visualización y Miniaturas
@@ -1113,6 +1333,167 @@ class VisageVaultApp(QMainWindow):
         # 3. Reconstruir la UI (esto es rápido, es solo UI)
         self._display_photos()
 
+    @Slot(int)
+    def _on_tab_changed(self, index):
+        """
+        Se llama cuando el usuario cambia de pestaña (Fotos <-> Personas).
+        """
+        # Obtenemos el nombre de la pestaña
+        tab_name = self.tab_widget.tabText(index)
+
+        if tab_name == "Personas":
+            self._set_status("Cargando vista de personas...")
+            self._load_people_list()
+
+            # --- INICIO DE LA MODIFICACIÓN ---
+
+            # Comprobar SI YA hay un escaneo en curso ANTES de tocar la UI
+            if self.face_scan_thread and self.face_scan_thread.isRunning():
+                # Ya hay un escaneo. No hacer nada.
+                # El label de porcentaje que ya existía seguirá actualizándose.
+                # No limpiamos la cuadrícula, no ponemos un nuevo label de "0%".
+                self._set_status("Escaneo de caras en curso...")
+            else:
+                # No hay escaneo. Este es un inicio limpio.
+
+                # 1. Limpiar la cuadrícula inmediatamente
+                while self.unknown_faces_layout.count() > 0:
+                    item = self.unknown_faces_layout.takeAt(0)
+                    if item.widget(): item.widget().deleteLater()
+
+                # 2. Mostrar el mensaje y GUARDAR la referencia
+                self.face_loading_label = QLabel("Buscando caras de personas... 0%")
+                self.face_loading_label.setAlignment(Qt.AlignCenter)
+                self.face_loading_label.setStyleSheet("font-size: 14pt;")
+
+                self.unknown_faces_layout.addWidget(self.face_loading_label, 0, 0, Qt.AlignCenter)
+
+                # 3. Iniciar el escaneo (ahora sí)
+                self._start_face_scan()
+
+            # --- FIN DE LA MODIFICACIÓN ---
+
+            # La llamada a _load_people_list() ya la hicimos arriba
+            # La llamada a _load_faces_to_grid() sigue comentada (¡correcto!)
+
+    def _load_people_list(self):
+        """
+        (Próximamente) Carga la lista de nombres en el árbol/cajón derecho.
+        """
+        self.people_tree_widget.clear()
+        # Aquí cargaremos de self.db.get_all_people()
+        # Por ahora, un placeholder:
+        unknown_item = QTreeWidgetItem(self.people_tree_widget, ["Caras Sin Asignar"])
+        self.people_tree_widget.setCurrentItem(unknown_item)
+
+    def _load_faces_to_grid(self):
+        """
+        Carga las caras "Sin Asignar" desde la BD y las muestra en la cuadrícula.
+        """
+        self.face_loading_label = None
+        # 1. Limpiar la cuadrícula actual
+        while self.unknown_faces_layout.count() > 0:
+            item = self.unknown_faces_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        # 2. Cargar las caras de la BD
+        unknown_faces = self.db.get_unknown_faces()
+
+        if not unknown_faces:
+            placeholder_label = QLabel("No se han encontrado caras nuevas sin asignar.")
+            placeholder_label.setAlignment(Qt.AlignCenter)
+            self.unknown_faces_layout.addWidget(placeholder_label, 0, 0)
+            return
+
+        # 3. Calcular el ancho para la cuadrícula responsive
+        #    Restamos 30px para dar margen al borde y la barra de scroll.
+        viewport_width = self.face_scroll_area.viewport().width() - 30
+
+        #    (Ancho del widget 100px + 10px de espacio entre ellos)
+        widget_width = 100 + 10
+
+        # 4. Calcular cuántas columnas caben (asegurando un mínimo de 1)
+        num_cols = max(1, viewport_width // widget_width)
+
+        # 5. Iterar y mostrar las caras
+        for i, face_row in enumerate(unknown_faces):
+            try:
+                face_id = face_row['id']
+                photo_path = face_row['filepath']
+                location_str = face_row['location']
+
+                # Convertir el string "(top, right, bottom, left)" a tupla
+                location = ast.literal_eval(location_str)
+                (top, right, bottom, left) = location
+
+                # Recortar la cara desde la imagen original usando PIL
+                img = Image.open(photo_path)
+                face_image_pil = img.crop((left, top, right, bottom))
+
+                # Convertir la imagen PIL a QPixmap (en memoria, sin guardar)
+                pixmap = QPixmap()
+                buffer = QBuffer()
+                buffer.open(QIODevice.OpenModeFlag.ReadWrite)
+                # Guardamos como PNG para mantener la calidad
+                face_image_pil.save(buffer, "PNG")
+                pixmap.loadFromData(buffer.data())
+                buffer.close()
+
+                if pixmap.isNull():
+                    raise Exception("QPixmap nulo después de la conversión.")
+
+                # Crear el widget circular
+                face_widget = CircularFaceLabel(pixmap)
+                face_widget.setProperty("face_id", face_id)
+                face_widget.setProperty("photo_path", photo_path)
+
+                # Conectar el clic (para el próximo paso)
+                face_widget.clicked.connect(self._on_face_clicked)
+
+                # Añadir a la cuadrícula
+                row, col = i // num_cols, i % num_cols
+                self.unknown_faces_layout.addWidget(face_widget, row, col, Qt.AlignTop)
+
+            except Exception as e:
+                print(f"Error al cargar/recortar la cara ID {face_id} de {photo_path}: {e}")
+                # Si falla, mostramos un placeholder de error
+                error_label = QLabel(f"Error\nCara ID: {face_id}")
+                error_label.setFixedSize(100, 100)
+                error_label.setAlignment(Qt.AlignCenter)
+                row, col = i // num_cols, i % num_cols
+                self.unknown_faces_layout.addWidget(error_label, row, col, Qt.AlignTop)
+
+        # Añadir un stretch al final para que todo se alinee arriba
+        self.unknown_faces_layout.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding), len(unknown_faces) // num_cols + 1, 0)
+
+    @Slot()
+    def _on_face_clicked(self):
+        """
+        Se llama cuando el usuario hace clic en una 'CircularFaceLabel'.
+        """
+        # Obtenemos el widget que emitió la señal
+        sender_widget = self.sender()
+
+        face_id = sender_widget.property("face_id")
+        photo_path = sender_widget.property("photo_path")
+
+        self._set_status(f"Clic en Cara ID: {face_id} (de la foto: {Path(photo_path).name})")
+
+        # PRÓXIMO PASO:
+        # Aquí es donde abriremos un diálogo para preguntar:
+        # 1. ¿Quién es esta persona? (Seleccionar de una lista)
+        # 2. O, crear una "Nueva Persona".
+        print(f"Clic en Cara ID: {face_id}")
+
+    @Slot(int)
+    def _update_face_scan_percentage(self, percentage):
+        """
+        Actualiza el label de carga en la pestaña 'Personas' con el porcentaje.
+        """
+        # Solo actualiza si el label de carga todavía existe
+        # (no se ha terminado y borrado por _load_faces_to_grid)
+        if self.face_loading_label:
+            self.face_loading_label.setText(f"Buscando caras de personas... {percentage}%")
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""
