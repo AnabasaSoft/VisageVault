@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 0.2 pre-release
+# VERSIÓN: 1.0 First Relaese!!!
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -60,7 +60,7 @@ import sklearn
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QHeaderView, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
-    QComboBox
+    QComboBox, QMenu
 )
 
 from PySide6.QtWidgets import (
@@ -1018,7 +1018,12 @@ class FaceClusterDialog(QDialog):
             # --- Guardado en la BD ---
             if self.person_id_to_save:
                 for face_id in self.face_ids:
+                    # --- INICIO DE LA MODIFICACIÓN ---
+                    # 1. Restaurar la cara (set is_deleted = 0)
+                    self.db.restore_face(face_id)
+                    # 2. Enlazar la cara a la persona
                     self.db.link_face_to_person(face_id, self.person_id_to_save)
+                    # --- FIN DE LA MODIFICACIÓN ---
 
                 self.accept() # Cierra el diálogo con éxito
 
@@ -1083,8 +1088,13 @@ class FaceClusterDialog(QDialog):
     @Slot()
     def _delete_and_reject(self):
         """Marca todas las caras del diálogo como eliminadas y cierra."""
+        # --- INICIO DE LA CORRECCIÓN ---
+        # Usamos soft_delete_face en lugar de bulk_soft_delete_faces
+        # para asegurar que la cara aparezca en la vista "Eliminadas".
         if self.face_ids:
-            self.db.bulk_soft_delete_faces(self.face_ids)
+            for face_id in self.face_ids:
+                self.db.soft_delete_face(face_id)
+        # --- FIN DE LA CORRECCIÓN ---
         self.done(self.DeleteRole)
 
 # =================================================================
@@ -1278,10 +1288,14 @@ class VisageVaultApp(QMainWindow):
         self.cluster_signals.clusters_found.connect(self._handle_clusters_found)
         self.cluster_signals.clustering_progress.connect(self._set_status)
         self.cluster_signals.clustering_finished.connect(self._handle_clustering_finished)
+
+        # --- LÍNEA RESTAURADA ---
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.setInterval(200) # 200ms de espera
         self.resize_timer.timeout.connect(self._handle_resize_timeout)
+        # --- FIN DE LA RESTAURACIÓN ---
+
         self._setup_ui()
         QTimer.singleShot(100, self._initial_check)
 
@@ -1407,8 +1421,7 @@ class VisageVaultApp(QMainWindow):
         self.cluster_faces_button.clicked.connect(self._start_clustering)
         people_panel_layout.addWidget(self.cluster_faces_button)
 
-        self.add_person_button = QPushButton("Añadir Persona")
-        people_panel_layout.addWidget(self.add_person_button)
+        # Botón "Añadir Persona" eliminado
 
         # Añadimos el CAJÓN (índice 1) al splitter
         self.people_splitter.addWidget(people_panel_widget)
@@ -1632,7 +1645,7 @@ class VisageVaultApp(QMainWindow):
         else:
             year = current_item.text(0)
             target_key = year
-        
+
         target_widget = self.group_widgets.get(target_key)
         if target_widget:
             self.scroll_area.ensureWidgetVisible(target_widget, 50, 50)
@@ -1697,7 +1710,7 @@ class VisageVaultApp(QMainWindow):
         def update_in_container(container_widget):
             if not container_widget:
                 return
-            
+
             # Using ZoomableClickableLabel is more specific
             for label in container_widget.findChildren(ZoomableClickableLabel):
                 # Update if path matches and it's not already loaded
@@ -1983,9 +1996,10 @@ class VisageVaultApp(QMainWindow):
         if not sender_widget:
             return
 
-        # Si estamos en la vista de eliminados, el clic izquierdo no hace nada
-        if sender_widget.property("is_deleted_view"):
-            return
+        # --- INICIO DE LA MODIFICACIÓN ---
+        # Guardamos el estado (si estaba eliminada) ANTES de abrir el diálogo
+        is_deleted_view = sender_widget.property("is_deleted_view")
+        # --- FIN DE LA MODIFICACIÓN ---
 
         face_id = sender_widget.property("face_id")
         photo_path = sender_widget.property("photo_path")
@@ -2008,19 +2022,30 @@ class VisageVaultApp(QMainWindow):
 
         result = dialog.exec()
 
-        # 2. Si el usuario guardó (puso un nombre):
+        # --- INICIO DE LA MODIFICACIÓN ---
+        # Refrescar la vista correcta basándose en el estado anterior
         if result == QDialog.Accepted:
             self._set_status("Cara etiquetada. Refrescando...")
-
-            # 3. Refrescar la lista de nombres (por si es una persona nueva)
             self._load_people_list()
 
-            # 4. Refrescar la cuadrícula de "Caras Sin Asignar"
-            #    (Esta función la redibujará y la cara etiquetada
-            #    ya no aparecerá, ¡que es lo que queremos!)
-            self._load_existing_faces_async()
-        else:
+            # Si estábamos en "Eliminadas", refrescamos esa vista
+            if is_deleted_view:
+                self._show_deleted_faces()
+            else:
+                self._load_existing_faces_async()
+
+        elif result == FaceClusterDialog.DeleteRole:
+            self._set_status("Cara eliminada. Refrescando...")
+
+            # Si estábamos en "Eliminadas", refrescamos esa vista
+            if is_deleted_view:
+                self._show_deleted_faces()
+            else:
+                self._load_existing_faces_async()
+
+        else: # Incluye Cancel y Skip
             self._set_status("Etiquetado cancelado.")
+        # --- FIN DE LA MODIFICACIÓN ---
 
     @Slot(QPoint)
     def _on_face_right_clicked(self, pos):
@@ -2048,13 +2073,14 @@ class VisageVaultApp(QMainWindow):
         self.db.soft_delete_face(face_id)
         widget.deleteLater()
         self._set_status(f"Cara ID {face_id} eliminada.")
+        self._load_existing_faces_async()
 
     def _restore_face(self, face_id: int, widget: QWidget):
         """Restaura una cara y la quita de la vista de eliminados."""
         self.db.restore_face(face_id)
         widget.deleteLater()
         self._set_status(f"Cara ID {face_id} restaurada.")
-
+        self._show_deleted_faces()
 
     @Slot()
     def _show_deleted_faces(self):
@@ -2092,7 +2118,7 @@ class VisageVaultApp(QMainWindow):
             self._show_deleted_faces()
 
         # ID >= 0: Una persona real
-        else:
+        elif person_id >= 0:
             self.left_people_stack.setCurrentIndex(1)
             person_name = current_item.text(0)
             self._load_photos_for_person(person_id, person_name)
@@ -2200,13 +2226,21 @@ class VisageVaultApp(QMainWindow):
             placeholder.setPixmap(pixmap)
             placeholder.setText("") # Borrar el "..."
             placeholder.setProperty("photo_path", photo_path)
-            placeholder.clicked.connect(self._on_face_clicked)
+            #placeholder.clicked.connect(self._on_face_clicked) # La conexión ya se hizo en _populate_face_grid_async
         else:
             # Es una cara 'nueva' (del FaceScanWorker), la añadimos al final
+
+            # Comprobar si estamos en la vista de "Sin Asignar"
+            # (No queremos añadir una cara nueva si el usuario está viendo "Eliminadas")
+            if self.unknown_faces_group.title() != "Caras Sin Asignar":
+                return # Estamos en otra vista (ej: Eliminadas), no añadirla visualmente
+
             face_widget = CircularFaceLabel(pixmap)
             face_widget.setProperty("face_id", face_id)
             face_widget.setProperty("photo_path", photo_path)
+            face_widget.setProperty("is_deleted_view", False)
             face_widget.clicked.connect(self._on_face_clicked)
+            face_widget.rightClicked.connect(self._on_face_right_clicked)
 
             # Añadir al grid en la siguiente posición
             num_cols = max(1, (self.face_scroll_area.viewport().width() - 30) // 110)
@@ -2277,7 +2311,6 @@ class VisageVaultApp(QMainWindow):
         # Desactivar botones para evitar clics múltiples
         self.cluster_faces_button.setText("Procesando...")
         self.cluster_faces_button.setEnabled(False)
-        self.add_person_button.setEnabled(False)
         self._set_status("Iniciando búsqueda de duplicados...")
 
         # Crear e iniciar el worker
@@ -2308,7 +2341,6 @@ class VisageVaultApp(QMainWindow):
         """
         self.cluster_faces_button.setText("Buscar Duplicados")
         self.cluster_faces_button.setEnabled(True)
-        self.add_person_button.setEnabled(True)
 
         # Si la cola está vacía, significa que no se encontró nada
         if not self.cluster_queue:
@@ -2352,6 +2384,11 @@ class VisageVaultApp(QMainWindow):
             # El usuario omitió. No hacemos nada, solo continuamos.
             print(f"Grupo omitido. Quedan {len(self.cluster_queue)}.")
 
+        elif result == FaceClusterDialog.DeleteRole:
+            # (ELIMINAR GRUPO)
+            print(f"Grupo eliminado. Quedan {len(self.cluster_queue)}.")
+            # No es necesario refrescar el grid aquí, se refrescará al final
+
         else:
             # (CANCELAR o 'X')
             # El usuario canceló, vaciamos la cola para detener
@@ -2365,50 +2402,23 @@ class VisageVaultApp(QMainWindow):
         # Llamada recursiva para el siguiente grupo
         QTimer.singleShot(100, self._process_cluster_queue)
 
-    @Slot(QTreeWidgetItem, QTreeWidgetItem)
-    def _on_person_selected(self, current: QTreeWidgetItem, previous: QTreeWidgetItem):
+    def _load_photos_for_person(self, person_id: int, person_name: str):
         """
-        Se llama al hacer clic en un item del árbol de personas.
-        Filtra la cuadrícula de caras.
+        Carga las fotos de una persona específica y las muestra.
         """
-        if not current:
-            return
+        self._set_status(f"Mostrando caras de {person_name}.")
 
-        person_id = current.data(0, Qt.UserRole)
-        person_name = current.text(0)
+        # Desactivar botones (no aplican aquí)
+        self.cluster_faces_button.setEnabled(False)
+        self.show_deleted_faces_button.setEnabled(True)
 
-        if person_id == -1:
-            # --- VISTA: "Caras Sin Asignar" ---
-            self._set_status("Mostrando caras sin asignar.")
 
-            # --- MODIFICACIÓN ---
-            # Mostrar la página 0 (caras) del stack
-            self.left_people_stack.setCurrentIndex(0)
+        # Obtener las fotos de la persona
+        person_photos = self.db.get_faces_for_person(person_id)
 
-            # Activar botones de clustering
-            self.cluster_faces_button.setEnabled(True)
-            self.add_person_button.setEnabled(True)
+        # Llamar al nuevo método para dibujar las fotos
+        self._display_person_photos(person_photos, person_name)
 
-            # Recargar la cuadrícula de caras
-            self._load_existing_faces_async()
-
-        elif person_id:
-            # --- VISTA: "Fotos de [Persona]" ---
-            self._set_status(f"Mostrando caras de {person_name}.")
-
-            # --- MODIFICACIÓN ---
-            # Mostrar la página 1 (fotos) del stack
-            self.left_people_stack.setCurrentIndex(1)
-
-            # Desactivar botones (no aplican aquí)
-            self.cluster_faces_button.setEnabled(False)
-            self.add_person_button.setEnabled(False)
-
-            # Obtener las fotos de la persona
-            person_photos = self.db.get_faces_for_person(person_id)
-
-            # Llamar al nuevo método para dibujar las fotos
-            self._display_person_photos(person_photos, person_name)
 
     def _display_person_photos(self, photos_list: list, person_name: str):
         """
@@ -2436,7 +2446,9 @@ class VisageVaultApp(QMainWindow):
                 photos_by_year_month[year] = {}
             if month not in photos_by_year_month[year]:
                 photos_by_year_month[year][month] = []
-            photos_by_year_month[year][month].append(path)
+            # Evitar duplicados de la *misma foto* en la vista
+            if path not in photos_by_year_month[year][month]:
+                photos_by_year_month[year][month].append(path)
 
         # 3. Calcular columnas (igual que en _display_photos)
         # Obtenemos el ancho del panel 1 del splitter (que es 'person_photo_scroll_area')
