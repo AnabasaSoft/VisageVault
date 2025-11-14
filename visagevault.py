@@ -850,6 +850,7 @@ class FaceClusterDialog(QDialog):
     Un QDialog que muestra un grupo de caras (IDs) y permite asignarlas
     a una persona (nueva o existente).
     """
+    SkipRole = QDialog.Accepted + 1 # (Esto será '2')
     def __init__(self, db: VisageVaultDB, threadpool: QThreadPool,
                  face_ids: list, parent=None):
 
@@ -908,6 +909,10 @@ class FaceClusterDialog(QDialog):
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        # Añadimos el botón "Siguiente" manualmente
+        self.skip_button = self.button_box.addButton("Siguiente", QDialogButtonBox.ButtonRole.ActionRole)
+        self.skip_button.clicked.connect(self._skip) # Conectar al nuevo slot
+
         self.button_box.accepted.connect(self._save_and_accept)
         self.button_box.rejected.connect(self.reject)
         main_layout.addWidget(self.button_box)
@@ -1058,6 +1063,12 @@ class FaceClusterDialog(QDialog):
         # y no puedas hacer clic en "Guardar" mientras ves la foto.
         preview_dialog.setModal(True)
         preview_dialog.show_with_animation()
+
+    @Slot()
+    def _skip(self):
+        """Cierra el diálogo con el código 'SkipRole'."""
+        # Usamos .done() para cerrar el diálogo y devolver nuestro código (2)
+        self.done(self.SkipRole)
 
 # =================================================================
 # CLASE TRABAJADORA DEL ESCANEO (MODIFICADA)
@@ -2220,18 +2231,25 @@ class VisageVaultApp(QMainWindow):
         result = dialog.exec()
 
         if result == QDialog.Accepted:
-            # Si el usuario guardó, refrescamos la lista de personas
-            # y continuamos con el siguiente cluster
+            # (GUARDAR)
+            # El usuario guardó, refrescamos la lista de personas
             print(f"Grupo guardado. Quedan {len(self.cluster_queue)}.")
             self._load_people_list() # Recargar el árbol de personas
+
+        elif result == FaceClusterDialog.SkipRole:
+            # (SIGUIENTE)
+            # El usuario omitió. No hacemos nada, solo continuamos.
+            print(f"Grupo omitido. Quedan {len(self.cluster_queue)}.")
+
         else:
-            # Si el usuario canceló, vaciamos la cola para detener
+            # (CANCELAR o 'X')
+            # El usuario canceló, vaciamos la cola para detener
             print("Cancelado el etiquetado de grupos.")
             self.cluster_queue = []
             self._set_status("Etiquetado cancelado.")
             # Refrescar la cuadrícula igualmente
             self._load_existing_faces_async()
-            return
+            return # <-- DETENER la recursión/cola
 
         # Llamada recursiva para el siguiente grupo
         QTimer.singleShot(100, self._process_cluster_queue)
