@@ -49,7 +49,7 @@ VisageVault es una aplicación de escritorio moderna y de alto rendimiento para 
     (Se recomienda crear un entorno virtual)
 
     ```bash
-    pip install PySide6 Pillow piexif face_recognition setuptools
+    pip install PySide6 Pillow piexif face_recognition setuptools scikit-learn
     ```
 
 3.  **Ejecuta la aplicación:**

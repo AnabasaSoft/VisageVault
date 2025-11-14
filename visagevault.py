@@ -53,6 +53,9 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
+import numpy as np
+from sklearn.cluster import DBSCAN
+import sklearn
 
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
@@ -73,7 +76,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent,
-    QPainterPath
+    QPainterPath, QKeyEvent
 )
 
 from photo_finder import find_photos
@@ -180,6 +183,89 @@ class FaceLoader(QRunnable):
             self.signals.face_load_failed.emit(self.face_id)
 
 # =================================================================
+# SEÑALES Y WORKER PARA AGRUPAR CARAS (CLUSTERING)
+# =================================================================
+class ClusterSignals(QObject):
+    """Contenedor de señales para el ClusterWorker QRunnable."""
+    # Señal que emite los grupos encontrados
+    # Formato: [[face_id_1, face_id_5], [face_id_2, face_id_10, face_id_12], ...]
+    clusters_found = Signal(list)
+
+    # Señal para actualizar la UI (ej: "Procesando... 0/150")
+    clustering_progress = Signal(str)
+
+    # Señal para cuando todo el proceso termina
+    clustering_finished = Signal()
+
+class ClusterWorker(QRunnable):
+    """
+    QRunnable que ejecuta el clustering DBSCAN en los encodings faciales
+    en un hilo separado del pool.
+    """
+    def __init__(self, signals: ClusterSignals, db_manager: VisageVaultDB):
+        super().__init__()
+        self.signals = signals
+        self.db = db_manager
+
+    @Slot()
+    def run(self):
+        """Ejecuta la tarea de clustering en el hilo del pool."""
+        try:
+            self.signals.clustering_progress.emit("Cargando datos de caras...")
+
+            # 1. Obtener todos los encodings de la BD
+            face_data = self.db.get_unknown_face_encodings()
+
+            if len(face_data) < 2:
+                self.signals.clustering_progress.emit("No hay suficientes caras para comparar.")
+                self.signals.clusters_found.emit([]) # Emitir lista vacía
+                self.signals.clustering_finished.emit()
+                return
+
+            self.signals.clustering_progress.emit(f"Comparando {len(face_data)} caras...")
+
+            # 2. Preparar los datos para DBSCAN
+            # 'face_ids' se mantiene en el mismo orden que 'encodings'
+            face_ids = [data[0] for data in face_data]
+            encodings = np.array([data[1] for data in face_data])
+
+            # 3. Ejecutar el clustering
+            # eps=0.4 es una buena "tolerancia" para face_recognition.
+            # min_samples=2 significa que se necesitan al menos 2 caras para formar un grupo.
+            clt = DBSCAN(eps=0.4, min_samples=2, metric="euclidean")
+            clt.fit(encodings)
+
+            # 4. Procesar los resultados
+            clusters = {} # Un diccionario para agrupar los IDs por etiqueta
+
+            # clt.labels_ es una lista: [0, 1, 0, -1, 1, 2, -1, ...]
+            # Mismo orden que 'face_ids'
+            for face_id, label in zip(face_ids, clt.labels_):
+
+                # Ignorar el "ruido" (etiqueta -1)
+                if label == -1:
+                    continue
+
+                # Añadir el face_id al grupo correspondiente
+                if label not in clusters:
+                    clusters[label] = []
+                clusters[label].append(face_id)
+
+            # 5. Convertir el diccionario a la lista que queremos emitir
+            # (Solo nos interesan los valores, no las etiquetas)
+            final_clusters_list = list(clusters.values())
+
+            self.signals.clustering_progress.emit(f"Se encontraron {len(final_clusters_list)} grupos.")
+            self.signals.clusters_found.emit(final_clusters_list)
+
+        except Exception as e:
+            print(f"Error crítico en el ClusterWorker: {e}")
+            self.signals.clustering_progress.emit(f"Error: {e}")
+
+        finally:
+            self.signals.clustering_finished.emit()
+
+# =================================================================
 # CLASE PARA VISTA PREVIA CON ZOOM (QDialog)
 # =================================================================
 class ImagePreviewDialog(QDialog):
@@ -256,6 +342,13 @@ class ImagePreviewDialog(QDialog):
         """Resetea el flag y cierra el diálogo."""
         ImagePreviewDialog.is_showing = False
         self.accept()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """Cierra la ventana si se presiona la tecla ESC."""
+        if event.key() == Qt.Key_Escape:
+            self.close_with_animation()
+        else:
+            super().keyPressEvent(event)
 
     def resizeEvent(self, event):
         """Reescala el pixmap para que se ajuste si no estamos zoomeados."""
@@ -750,6 +843,223 @@ class PhotoDetailDialog(QDialog):
             print(f"Error al guardar la fecha en la BD: {e}")
 
 # =================================================================
+# CLASE: DIÁLOGO DE ETIQUETADO DE GRUPOS (CLUSTERS)
+# =================================================================
+class FaceClusterDialog(QDialog):
+    """
+    Un QDialog que muestra un grupo de caras (IDs) y permite asignarlas
+    a una persona (nueva o existente).
+    """
+    def __init__(self, db: VisageVaultDB, threadpool: QThreadPool,
+                 face_ids: list, parent=None):
+
+        super().__init__(parent)
+        self.db = db
+        self.threadpool = threadpool
+        self.face_ids = face_ids # <-- Ahora 'face_ids' es la lista
+
+        # NO aceptamos 'face_loader_signals', creamos las nuestras
+        self.local_face_signals = FaceLoaderSignals()
+
+        # Conectamos la señal a un *nuevo slot* local
+        self.local_face_signals.face_loaded.connect(self._on_dialog_face_loaded)
+
+        # Esta línea AHORA funcionará
+        self.setWindowTitle(f"Agrupar {len(self.face_ids)} Caras")
+        self.setMinimumSize(600, 400)
+        self.person_id_to_save = None
+
+        self._setup_ui()
+        self._load_people_combo()
+        self._load_faces_async()
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+
+        # 1. ScrollArea para las caras
+        face_scroll_area = QScrollArea()
+        face_scroll_area.setWidgetResizable(True)
+
+        face_widget = QWidget()
+        self.face_grid_layout = QGridLayout(face_widget)
+        self.face_grid_layout.setSpacing(10)
+
+        face_scroll_area.setWidget(face_widget)
+        main_layout.addWidget(face_scroll_area, 1) # Darle stretch
+
+        # 2. GroupBox para asignar persona
+        assign_group = QGroupBox("Asignar Persona")
+        assign_layout = QGridLayout(assign_group)
+
+        assign_layout.addWidget(QLabel("Persona Existente:"), 0, 0)
+        self.people_combo = QComboBox()
+        self.people_combo.currentIndexChanged.connect(self._on_combo_changed)
+        assign_layout.addWidget(self.people_combo, 0, 1)
+
+        assign_layout.addWidget(QLabel("O Nueva Persona:"), 1, 0)
+        self.new_person_edit = QLineEdit()
+        self.new_person_edit.setPlaceholderText("Ej: Ana García")
+        self.new_person_edit.textChanged.connect(self._on_text_changed)
+        assign_layout.addWidget(self.new_person_edit, 1, 1)
+
+        main_layout.addWidget(assign_group)
+
+        # 3. Botones
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.button_box.accepted.connect(self._save_and_accept)
+        self.button_box.rejected.connect(self.reject)
+        main_layout.addWidget(self.button_box)
+
+    def _load_people_combo(self):
+        """Carga la lista de personas conocidas en el ComboBox."""
+        self.people_combo.addItem("--- Seleccionar ---", -1) # item -1: sin selección
+
+        people = self.db.get_all_people() # Asume que esto devuelve (id, name)
+        for person_row in people:
+            person_id = person_row['id']
+            person_name = person_row['name']
+            self.people_combo.addItem(person_name, person_id)
+
+    def _load_faces_async(self):
+        """
+        Pone placeholders y lanza FaceLoaders al threadpool para
+        cargar las caras de este cluster.
+        """
+        # (Usamos self.face_loader_signals, que es la señal *global*
+        # de la app principal)
+
+        num_cols = max(1, (self.width() - 50) // 110)
+
+        for i, face_id in enumerate(self.face_ids):
+            # 1. Crear un placeholder
+            face_widget = CircularFaceLabel(QPixmap()) # Vacío
+            face_widget.setText("...")
+            face_widget.setProperty("face_id", face_id)
+            face_widget.clicked.connect(self._show_face_preview)
+
+            # 2. Añadir placeholder al grid
+            row, col = i // num_cols, i % num_cols
+            self.face_grid_layout.addWidget(face_widget, row, col, Qt.AlignTop)
+
+            # 3. Pedir al FaceLoader que cargue esta cara
+            # (El FaceLoader necesita info de la BD que no tenemos aquí...
+            # ... ¡Ah! El FaceLoader necesita (face_id, photo_path, location_str)
+            # ... y solo tenemos face_id. Necesitamos modificar la BD.)
+
+            # --- CORRECCIÓN DE LÓGICA RÁPIDA ---
+            # Vamos a pedirle a la BD la info que falta
+            face_info = self.db.get_face_info(face_id) # NECESITAREMOS CREAR ESTA FUNCIÓN
+            if face_info:
+                # Pasa las señales locales, no las globales
+                loader = FaceLoader(
+                    self.local_face_signals,
+                    face_id,
+                    face_info['filepath'],
+                    face_info['location']
+                )
+                self.threadpool.start(loader)
+
+    @Slot()
+    def _on_combo_changed(self):
+        """Si se selecciona una persona, borra el texto de 'nueva persona'."""
+        if self.people_combo.currentIndex() > 0:
+            self.new_person_edit.clear()
+
+    @Slot()
+    def _on_text_changed(self, text):
+        """Si se escribe un nombre nuevo, resetea el combo."""
+        if text:
+            self.people_combo.setCurrentIndex(0) # Volver a "--- Seleccionar ---"
+
+    @Slot()
+    def _save_and_accept(self):
+        """Valida, guarda la persona/etiquetas y cierra."""
+        try:
+            new_name = self.new_person_edit.text().strip()
+            selected_id = self.people_combo.currentData()
+
+            if new_name:
+                # Usuario creó una persona nueva
+                person_id = self.db.add_person(new_name)
+                if person_id == -1:
+                    # El nombre probablemente ya existía
+                    existing = self.db.get_person_by_name(new_name)
+                    person_id = existing['id']
+                self.person_id_to_save = person_id
+
+            elif selected_id != -1:
+                # Usuario seleccionó una persona existente
+                self.person_id_to_save = selected_id
+
+            else:
+                # No se seleccionó nada
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Acción Requerida",
+                                    "Por favor, selecciona una persona existente o escribe un nombre nuevo.")
+                return
+
+            # --- Guardado en la BD ---
+            if self.person_id_to_save:
+                for face_id in self.face_ids:
+                    self.db.link_face_to_person(face_id, self.person_id_to_save)
+
+                self.accept() # Cierra el diálogo con éxito
+
+        except Exception as e:
+            print(f"Error al guardar el cluster: {e}")
+
+    @Slot(int, QPixmap, str)
+    def _on_dialog_face_loaded(self, face_id: int, pixmap: QPixmap, photo_path: str):
+        """
+        Recibe un pixmap CORTADO desde el QThreadPool y actualiza
+        el placeholder *dentro* de este diálogo.
+        """
+        # Buscar el placeholder en la cuadrícula de *este* diálogo
+        for i in range(self.face_grid_layout.count()):
+            widget = self.face_grid_layout.itemAt(i).widget()
+
+            # Comprobar si es un widget válido y tiene la propiedad
+            if widget and hasattr(widget, 'property') and widget.property("face_id") == face_id:
+                widget.setPixmap(pixmap)
+                widget.setText("") # Borrar el "..."
+                widget.setProperty("photo_path", photo_path)
+                break
+
+    @Slot()
+    def _show_face_preview(self):
+        """
+        Se llama cuando se hace clic en una cara del diálogo de cluster.
+        Abre la vista previa de la imagen completa.
+        """
+        sender_widget = self.sender()
+        if not sender_widget:
+            return
+
+        # Obtenemos la ruta de la foto que guardamos en la propiedad
+        photo_path = sender_widget.property("photo_path")
+
+        if not photo_path:
+            # Esto pasa si la cara aún está cargando ("...") y no tiene la ruta
+            print("Por favor, espera a que la cara termine de cargar.")
+            return
+
+        # Cargar la imagen completa
+        full_pixmap = QPixmap(photo_path)
+        if full_pixmap.isNull():
+            print(f"Error: No se pudo cargar la imagen completa de {photo_path}")
+            return
+
+        # Crear y mostrar el diálogo de vista previa
+        preview_dialog = ImagePreviewDialog(full_pixmap, self)
+
+        # ¡Importante! Lo hacemos "Modal" para que bloquee este diálogo
+        # y no puedas hacer clic en "Guardar" mientras ves la foto.
+        preview_dialog.setModal(True)
+        preview_dialog.show_with_animation()
+
+# =================================================================
 # CLASE TRABAJADORA DEL ESCANEO (MODIFICADA)
 # =================================================================
 class PhotoFinderWorker(QObject):
@@ -935,6 +1245,11 @@ class VisageVaultApp(QMainWindow):
         self.face_loader_signals = FaceLoaderSignals()
         self.face_loader_signals.face_loaded.connect(self._handle_face_loaded)
         self.face_loader_signals.face_load_failed.connect(self._handle_face_load_failed)
+        self.cluster_queue = [] # Cola para procesar clusters uno por uno
+        self.cluster_signals = ClusterSignals()
+        self.cluster_signals.clusters_found.connect(self._handle_clusters_found)
+        self.cluster_signals.clustering_progress.connect(self._set_status)
+        self.cluster_signals.clustering_finished.connect(self._handle_clustering_finished)
         self.resize_timer = QTimer(self)
         self.resize_timer.setSingleShot(True)
         self.resize_timer.setInterval(200) # 200ms de espera
@@ -1032,6 +1347,12 @@ class VisageVaultApp(QMainWindow):
         self.people_tree_widget.setHeaderHidden(True)
         # self.people_tree_widget.currentItemChanged.connect(self._scroll_to_person)
         people_panel_layout.addWidget(self.people_tree_widget)
+
+        # Botón para agrupar duplicados
+        self.cluster_faces_button = QPushButton("Buscar Duplicados")
+        self.cluster_faces_button.clicked.connect(self._start_clustering)
+
+        people_panel_layout.addWidget(self.cluster_faces_button)
 
         # Botones de acción (ej: "Nueva Persona")
         self.add_person_button = QPushButton("Añadir Persona")
@@ -1440,43 +1761,75 @@ class VisageVaultApp(QMainWindow):
 
     def _load_people_list(self):
         """
-        (Próximamente) Carga la lista de nombres en el árbol/cajón derecho.
+        Carga la lista de personas desde la BD y las muestra
+        en el árbol de navegación de personas.
         """
         self.people_tree_widget.clear()
-        # Aquí cargaremos de self.db.get_all_people()
-        # Por ahora, un placeholder:
+
+        # 1. Añadir el item raíz "Caras Sin Asignar"
+        # Guardamos un 'id' especial (-1) para saber qué es
         unknown_item = QTreeWidgetItem(self.people_tree_widget, ["Caras Sin Asignar"])
+        unknown_item.setData(0, Qt.UserRole, -1) # -1 significa "sin asignar"
+
+        # 2. Cargar las personas de la BD
+        people = self.db.get_all_people() #
+
+        if people:
+            # 3. Crear un item "padre" para agruparlas
+            people_root_item = QTreeWidgetItem(self.people_tree_widget, ["Personas"])
+
+            # 4. Añadir cada persona como "hijo"
+            for person_row in people:
+                person_id = person_row['id']
+                person_name = person_row['name']
+
+                person_item = QTreeWidgetItem(people_root_item, [person_name])
+                # Guardamos el ID de la BD dentro del item
+                person_item.setData(0, Qt.UserRole, person_id)
+
+            people_root_item.setExpanded(True) # Expandir la lista de "Personas"
+
+        # Seleccionar "Caras Sin Asignar" por defecto
         self.people_tree_widget.setCurrentItem(unknown_item)
 
     def _load_existing_faces_async(self):
         """
         Carga las caras existentes de la BD de forma asíncrona.
-        No bloquea la UI: obtiene los datos (rápido) y pone a trabajar
-        al QThreadPool (lento).
+        Limpia la cuadrícula y la vuelve a poblar.
         """
+
+        # 1. Limpiar la cuadrícula y resetear el contador
+        #    (Esta es la parte que faltaba)
+        while self.unknown_faces_layout.count() > 0:
+            item = self.unknown_faces_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+        self.current_face_count = 0
+
+        # 2. Obtener las caras que QUEDAN sin asignar
         unknown_faces = self.db.get_unknown_faces() # Rápido
         if not unknown_faces:
-            self.current_face_count = 0
+            # self.current_face_count ya es 0
             return
 
         self.current_face_count = len(unknown_faces)
 
-        # Calcular grid
+        # 3. Calcular el grid
         num_cols = max(1, (self.face_scroll_area.viewport().width() - 30) // 110)
 
+        # 4. Volver a poblar la cuadrícula solo con los placeholders
         for i, face_row in enumerate(unknown_faces):
             face_id = face_row['id']
 
-            # 1. Crear un *placeholder*
+            # Crear un *placeholder*
             face_widget = CircularFaceLabel(QPixmap()) # Pixmap vacío
             face_widget.setText("...") # Pone "..."
             face_widget.setProperty("face_id", face_id)
 
-            # 2. Añadir placeholder al grid
+            # Añadir placeholder al grid
             row, col = i // num_cols, i % num_cols
             self.unknown_faces_layout.addWidget(face_widget, row, col, Qt.AlignTop)
 
-            # 3. Iniciar el worker para este placeholder
+            # Iniciar el worker para este placeholder
             loader = FaceLoader(
                 self.face_loader_signals,
                 face_id,
@@ -1489,21 +1842,47 @@ class VisageVaultApp(QMainWindow):
     @Slot()
     def _on_face_clicked(self):
         """
-        Se llama cuando el usuario hace clic en una 'CircularFaceLabel'.
+        Se llama cuando el usuario hace clic en una 'CircularFaceLabel'
+        en la cuadrícula principal de "Caras Sin Asignar".
         """
-        # Obtenemos el widget que emitió la señal
         sender_widget = self.sender()
+        if not sender_widget:
+            return
 
         face_id = sender_widget.property("face_id")
         photo_path = sender_widget.property("photo_path")
 
-        self._set_status(f"Clic en Cara ID: {face_id} (de la foto: {Path(photo_path).name})")
+        if not face_id or not photo_path:
+            # Esto puede pasar si la cara aún está cargando ("...")
+            print("Clic en una cara que aún no tiene datos (cargando).")
+            return
 
-        # PRÓXIMO PASO:
-        # Aquí es donde abriremos un diálogo para preguntar:
-        # 1. ¿Quién es esta persona? (Seleccionar de una lista)
-        # 2. O, crear una "Nueva Persona".
-        print(f"Clic en Cara ID: {face_id}")
+        self._set_status(f"Etiquetando Cara ID: {face_id}...")
+
+        # 1. Reutilizamos el diálogo de "Agrupar Caras", pero
+        #    pasándole una lista con UN SOLO face_id.
+        dialog = FaceClusterDialog(
+            self.db,
+            self.threadpool,
+            [face_id],  # Pasamos la cara como una lista de un solo ítem
+            self
+        )
+
+        result = dialog.exec()
+
+        # 2. Si el usuario guardó (puso un nombre):
+        if result == QDialog.Accepted:
+            self._set_status("Cara etiquetada. Refrescando...")
+
+            # 3. Refrescar la lista de nombres (por si es una persona nueva)
+            self._load_people_list()
+
+            # 4. Refrescar la cuadrícula de "Caras Sin Asignar"
+            #    (Esta función la redibujará y la cara etiquetada
+            #    ya no aparecerá, ¡que es lo que queremos!)
+            self._load_existing_faces_async()
+        else:
+            self._set_status("Etiquetado cancelado.")
 
     @Slot(int)
     def _update_face_scan_percentage(self, percentage):
@@ -1675,6 +2054,96 @@ class VisageVaultApp(QMainWindow):
 
         print("Todos los hilos finalizados. Saliendo.")
         event.accept()
+
+    @Slot()
+    def _start_clustering(self):
+        """
+        Se llama al pulsar el botón "Buscar Duplicados".
+        Inicia el ClusterWorker en el QThreadPool.
+        """
+        # Desactivar botones para evitar clics múltiples
+        self.cluster_faces_button.setText("Procesando...")
+        self.cluster_faces_button.setEnabled(False)
+        self.add_person_button.setEnabled(False)
+        self._set_status("Iniciando búsqueda de duplicados...")
+
+        # Crear e iniciar el worker
+        worker = ClusterWorker(self.cluster_signals, self.db)
+        self.threadpool.start(worker)
+
+    @Slot(list)
+    def _handle_clusters_found(self, clusters: list):
+        """
+        Recibe los grupos de face_ids desde el ClusterWorker.
+        Los añade a la cola y empieza a procesarlos.
+        """
+        if not clusters:
+            self._set_status("No se encontraron nuevos duplicados.")
+            return
+
+        self.cluster_queue = clusters
+        self._set_status(f"¡Encontrados {len(self.cluster_queue)} grupos! Procesando...")
+
+        # Iniciar el procesamiento del primer grupo de la cola
+        self._process_cluster_queue()
+
+    @Slot()
+    def _handle_clustering_finished(self):
+        """
+        Se llama cuando el ClusterWorker ha terminado.
+        Reactiva los botones de la UI.
+        """
+        self.cluster_faces_button.setText("Buscar Duplicados")
+        self.cluster_faces_button.setEnabled(True)
+        self.add_person_button.setEnabled(True)
+
+        # Si la cola está vacía, significa que no se encontró nada
+        if not self.cluster_queue:
+             self._set_status("Búsqueda de duplicados finalizada. No se encontraron grupos.")
+
+    @Slot()
+    def _process_cluster_queue(self):
+        """
+        Procesa el siguiente grupo de caras en la cola.
+        Muestra el FaceClusterDialog.
+        """
+        if not self.cluster_queue:
+            self._set_status("¡Etiquetado de grupos completado!")
+            # Ya que hemos etiquetado caras, refrescamos la cuadrícula
+            self._load_existing_faces_async()
+            return
+
+        # Sacar el primer grupo de la cola
+        next_cluster_ids = self.cluster_queue.pop(0)
+
+        self._set_status(f"Procesando grupo... quedan {len(self.cluster_queue)} grupos.")
+
+        # Crear y mostrar el diálogo
+        dialog = FaceClusterDialog(
+            self.db,
+            self.threadpool,
+            next_cluster_ids,
+            self
+        )
+
+        result = dialog.exec()
+
+        if result == QDialog.Accepted:
+            # Si el usuario guardó, refrescamos la lista de personas
+            # y continuamos con el siguiente cluster
+            print(f"Grupo guardado. Quedan {len(self.cluster_queue)}.")
+            self._load_people_list() # Recargar el árbol de personas
+        else:
+            # Si el usuario canceló, vaciamos la cola para detener
+            print("Cancelado el etiquetado de grupos.")
+            self.cluster_queue = []
+            self._set_status("Etiquetado cancelado.")
+            # Refrescar la cuadrícula igualmente
+            self._load_existing_faces_async()
+            return
+
+        # Llamada recursiva para el siguiente grupo
+        QTimer.singleShot(100, self._process_cluster_queue)
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""

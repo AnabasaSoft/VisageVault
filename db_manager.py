@@ -285,6 +285,64 @@ class VisageVaultDB:
         finally:
             conn.close()
 
+    def get_unknown_face_encodings(self) -> list:
+        """
+        Devuelve una lista de tuplas (face_id, encoding) para todas las
+        caras que aún no están asignadas a una persona.
+        """
+        conn = self._get_connection()
+        face_data = []
+        try:
+            cursor = conn.cursor()
+            # Busca caras (f.id) que NO están en la tabla face_labels
+            cursor.execute("""
+                SELECT f.id, f.encoding
+                FROM faces f
+                LEFT JOIN face_labels fl ON f.id = fl.face_id
+                WHERE fl.person_id IS NULL
+            """)
+
+            for row in cursor.fetchall():
+                face_id = row['id']
+                encoding_blob = row['encoding']
+
+                # Deserializar el encoding de blob (pickle) a array numpy
+                try:
+                    encoding = pickle.loads(encoding_blob)
+                    face_data.append((face_id, encoding))
+                except Exception as e:
+                    print(f"Error al deserializar encoding para face_id {face_id}: {e}")
+
+            return face_data
+
+        except sqlite3.Error as e:
+            print(f"Error al obtener encodings desconocidos: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def get_face_info(self, face_id: int):
+        """
+        Devuelve la 'filepath' y 'location' de una sola cara
+        a partir de su ID.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT p.filepath, f.location
+                FROM faces f
+                JOIN photos p ON f.photo_id = p.id
+                WHERE f.id = ?
+            """, (face_id,))
+            result = cursor.fetchone()
+            return result # Devuelve un objeto Fila (dict-like)
+        except sqlite3.Error as e:
+            print(f"Error en get_face_info: {e}")
+            return None
+        finally:
+            conn.close()
+
 if __name__ == "__main__":
     # Ejemplo de uso:
     db = VisageVaultDB(db_file="test_visagevault.db")
