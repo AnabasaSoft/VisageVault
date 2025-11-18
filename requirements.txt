@@ -7,3 +7,4 @@ scikit-learn
 mypy
 numpy
 opencv-python-headless
+rawpy

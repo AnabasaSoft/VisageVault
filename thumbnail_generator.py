@@ -1,9 +1,10 @@
 # thumbnail_generator.py
-from PIL import Image
+from PIL import Image, UnidentifiedImageError # <-- MODIFICADO
 from pathlib import Path
 import os
-import hashlib # Movido arriba
-import cv2 # <-- IMPORTACIÓN NUEVA
+import hashlib
+import cv2
+import rawpy # <-- NUEVO
 
 THUMBNAIL_SIZE = (128, 128)
 THUMBNAIL_DIR = Path(".visagevault_cache/thumbnails")
@@ -14,9 +15,11 @@ def get_thumbnail_path(original_filepath: str) -> Path:
     return THUMBNAIL_DIR / f"{file_hash}.jpg"
 
 # --- RENOMBRADA: de 'generate_thumbnail' a 'generate_image_thumbnail' ---
+# --- MODIFICADA: para incluir soporte RAW ---
 def generate_image_thumbnail(original_filepath: str) -> str | None:
     """
     Genera una miniatura para una IMAGEN y la guarda en caché.
+    Intenta con PIL, y si falla, con rawpy.
     Devuelve la ruta de la miniatura o None si falla.
     """
     original_filepath = Path(original_filepath)
@@ -30,13 +33,40 @@ def generate_image_thumbnail(original_filepath: str) -> str | None:
         return str(thumbnail_path)
 
     try:
-        with Image.open(original_filepath) as img:
-            img.thumbnail(THUMBNAIL_SIZE)
-            img.save(thumbnail_path, "JPEG")
+        img_to_process = None
+
+        try:
+            # Intento 1: Abrir con PIL (rápido para JPG, PNG, WEBP, etc.)
+            img_pil = Image.open(original_filepath)
+            img_pil.load() # Cargar datos antes de que se cierre el archivo
+            img_to_process = img_pil
+
+        except (UnidentifiedImageError, IOError):
+            # Intento 2: Abrir con rawpy (para NEF, CR2, ARW, DNG, etc.)
+            try:
+                with rawpy.imread(str(original_filepath)) as raw:
+                    # use_camera_wb=True usa el balance de blancos de la cámara
+                    rgb = raw.postprocess(use_camera_wb=True)
+                    img_to_process = Image.fromarray(rgb)
+            except Exception as raw_e:
+                print(f"Error específico de rawpy en {original_filepath}: {raw_e}")
+                return None # Falló con PIL y con rawpy
+
+        if not img_to_process:
+            raise Exception("No se pudo cargar la imagen con PIL ni rawpy.")
+
+        # --- Lógica original (ahora se aplica a la imagen cargada) ---
+        img_to_process.thumbnail(THUMBNAIL_SIZE)
+        img_to_process.save(thumbnail_path, "JPEG")
+        img_to_process.close() # Importante cerrar
+
         return str(thumbnail_path)
+
     except Exception as e:
         print(f"❌ Error crítico generando miniatura de IMAGEN para {original_filepath}: {e}")
         return None
+# --- FIN DE MODIFICACIÓN ---
+
 
 def generate_video_thumbnail(original_filepath: str) -> str | None:
     """

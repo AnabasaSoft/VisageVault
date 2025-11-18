@@ -3,8 +3,19 @@ from pathlib import Path
 import time
 
 # --- CONFIGURACIÓN DE EXTENSIONES A BUSCAR ---
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tiff', '.webp')
+IMAGE_EXTENSIONS = (
+    # Formatos web/estándar
+    '.jpg', '.jpeg', '.png', '.tiff', '.webp', '.heic', '.heif',
 
+    # Formatos RAW (añadidos)
+    '.nef', '.cr2', '.cr3', '.crw',  # Nikon, Canon
+    '.arw', '.srf',                 # Sony
+    '.orf',                         # Olympus
+    '.rw2',                         # Panasonic
+    '.raf',                         # Fujifilm
+    '.pef', '.dng',                 # Pentax, Adobe
+    '.raw'                          # Genérico
+)
 VIDEO_EXTENSIONS = (
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg'
 )

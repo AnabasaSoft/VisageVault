@@ -19,6 +19,9 @@ dist/
 AppDir/
 # Ignora el producto final y las herramientas descargadas
 *.AppImage
+*.json
+*.desktop
+*.zip
 
 # ==================================
 # Datos de Runtime de VisageVault

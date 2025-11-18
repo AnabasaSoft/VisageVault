@@ -1,517 +1,345 @@
-# db_manager.py
+# ==============================================================================
+# ARCHIVO: db_manager.py
+# DESCRIPCIÓN: Gestor de base de datos SQLite para VisageVault
+# INCLUYE: Migraciones automáticas, soporte para Ocultar/Borrar y optimización.
+# ==============================================================================
 
 import sqlite3
-from pathlib import Path
+import os
 import pickle
+import datetime
 
 class VisageVaultDB:
-    """
-    Clase que maneja la conexión y las operaciones de la base de datos SQLite.
-    Cada método abre y cierra su propia conexión para ser seguro en múltiples hilos.
-    """
-    def __init__(self, db_file="visagevault.db"):
-        self.db_file = db_file
-        # --- MODIFICADO: create_tables() ahora se llama desde __init__ ---
-        self.create_tables()
+    def __init__(self, db_name="visagevault.db"):
+        """
+        Inicializa la conexión a la base de datos.
+        Crea las tablas si no existen y verifica migraciones para versiones antiguas.
+        """
+        # Guardar la BD en el mismo directorio que el script
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = os.path.join(base_dir, db_name)
 
-    def _get_connection(self):
-        """Función auxiliar para obtener una conexión local al hilo."""
-        conn = sqlite3.connect(self.db_file)
-        conn.row_factory = sqlite3.Row
-        return conn
+        # check_same_thread=False es necesario para aplicaciones GUI con hilos (QThread)
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row  # Permite acceder a columnas por nombre
 
-    def create_tables(self):
-        """Define y crea las tablas si no existen, y añade la columna 'month' si es necesario."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
+        # Inicialización
+        self._create_tables()
+        self._check_migrations()
 
-            # 1. Tabla PHOTOS (Añadida la columna 'month')
-            cursor.execute("""
+    def _create_tables(self):
+        """Crea la estructura inicial de tablas si no existe."""
+        with self.conn:
+            # 1. Tabla de FOTOS
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS photos (
-                    id INTEGER PRIMARY KEY,
-                    filepath TEXT NOT NULL UNIQUE,
-                    file_hash TEXT UNIQUE,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filepath TEXT UNIQUE,
                     year TEXT,
                     month TEXT,
-                    faces_scanned INTEGER DEFAULT 0
+                    scanned_for_faces INTEGER DEFAULT 0,
+                    is_hidden INTEGER DEFAULT 0
                 )
             """)
 
-            # --- MIGRACIÓN: Añadir columna 'month' y 'faces_scanned' si no existe ---
-            cursor.execute("PRAGMA table_info(photos)")
-            columns = [info[1] for info in cursor.fetchall()]
-            if 'month' not in columns:
-                print("Migrando base de datos: añadiendo columna 'month'...")
-                cursor.execute("ALTER TABLE photos ADD COLUMN month TEXT")
-            if 'faces_scanned' not in columns:
-                print("Migrando base de datos: añadiendo columna 'faces_scanned'...")
-                cursor.execute("ALTER TABLE photos ADD COLUMN faces_scanned INTEGER DEFAULT 0")
-
-            # --- ¡NUEVA TABLA DE VÍDEOS! ---
-            cursor.execute("""
+            # 2. Tabla de VÍDEOS
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS videos (
-                    id INTEGER PRIMARY KEY,
-                    filepath TEXT NOT NULL UNIQUE,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filepath TEXT UNIQUE,
                     year TEXT,
-                    month TEXT
-                )
-            """)
-            # --- FIN DE LO NUEVO ---
-
-            # 2. Tabla FACES (Datos de reconocimiento)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS faces (
-                    id INTEGER PRIMARY KEY,
-                    photo_id INTEGER NOT NULL,
-                    encoding BLOB NOT NULL,
-                    location TEXT,
-                    is_deleted INTEGER DEFAULT 0,
-                    FOREIGN KEY (photo_id) REFERENCES photos (id)
+                    month TEXT,
+                    is_hidden INTEGER DEFAULT 0
                 )
             """)
 
-            # --- MIGRACIÓN: Añadir columna 'is_deleted' a faces si no existe ---
-            cursor.execute("PRAGMA table_info(faces)")
-            columns = [info[1] for info in cursor.fetchall()]
-            if 'is_deleted' not in columns:
-                print("Migrando base de datos: añadiendo columna 'is_deleted' a la tabla faces...")
-                cursor.execute("ALTER TABLE faces ADD COLUMN is_deleted INTEGER DEFAULT 0")
-
-            # 3. Tabla PEOPLE (Etiquetas de personas)
-            cursor.execute("""
+            # 3. Tabla de PERSONAS
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS people (
-                    id INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE
                 )
             """)
 
-            # 4. Tabla de Unión para etiquetar las caras
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS face_labels (
-                    face_id INTEGER NOT NULL,
-                    person_id INTEGER NOT NULL,
-                    PRIMARY KEY (face_id, person_id),
-                    FOREIGN KEY (face_id) REFERENCES faces (id),
-                    FOREIGN KEY (person_id) REFERENCES people (id)
+            # 4. Tabla de CARAS (Relacionada con Fotos y Personas)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS faces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    photo_id INTEGER,
+                    encoding BLOB,
+                    location TEXT,
+                    person_id INTEGER DEFAULT NULL,
+                    is_deleted INTEGER DEFAULT 0,
+                    FOREIGN KEY(photo_id) REFERENCES photos(id),
+                    FOREIGN KEY(person_id) REFERENCES people(id)
                 )
             """)
 
-            conn.commit()
-            # print("Tablas verificadas y listas.")
-        except sqlite3.Error as e:
-            print(f"Error al crear/migrar tablas: {e}")
-        finally:
-            conn.close()
-
-    # --- Funciones de Lectura (Usadas por PhotoFinderWorker) ---
-
-    def load_all_photo_dates(self) -> dict:
+    def _check_migrations(self):
         """
-        Carga todas las rutas, años y meses conocidos desde la BD a un diccionario.
-        Devuelve: {'/ruta/foto1.jpg': ('2025', '08'), ...}
+        Verifica si la base de datos existente necesita actualizaciones de estructura
+        (por ejemplo, si el usuario viene de una versión anterior sin 'is_hidden').
         """
-        conn = self._get_connection()
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT filepath, year, month FROM photos")
-            return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
-        except sqlite3.Error as e:
-            print(f"Error al cargar fechas de FOTOS de la BD: {e}")
-            return {}
-        finally:
-            conn.close()
+            with self.conn:
+                # --- Migración FOTOS ---
+                cursor = self.conn.execute("PRAGMA table_info(photos)")
+                columns_photos = [col['name'] for col in cursor.fetchall()]
 
-    # --- ¡NUEVA FUNCIÓN! ---
-    def load_all_video_dates(self) -> dict:
-        """
-        Carga todas las rutas de VÍDEO, años y meses conocidos desde la BD.
-        Devuelve: {'/ruta/video1.mp4': ('2025', '08'), ...}
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT filepath, year, month FROM videos")
-            return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
-        except sqlite3.Error as e:
-            print(f"Error al cargar fechas de VÍDEOS de la BD: {e}")
-            return {}
-        finally:
-            conn.close()
-    # --- FIN DE LO NUEVO ---
+                if 'is_hidden' not in columns_photos:
+                    print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a photos.")
+                    self.conn.execute("ALTER TABLE photos ADD COLUMN is_hidden INTEGER DEFAULT 0")
 
-    def bulk_upsert_photos(self, photos_data: list[tuple[str, str, str]]):
-        """
-        Inserta o reemplaza una lista de fotos con su año y mes.
-        (photos_data es una lista de tuplas: (filepath, year, month))
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.executemany("""
-                INSERT OR REPLACE INTO photos (filepath, year, month)
+                # --- Migración VÍDEOS ---
+                cursor = self.conn.execute("PRAGMA table_info(videos)")
+                columns_videos = [col['name'] for col in cursor.fetchall()]
+
+                if 'is_hidden' not in columns_videos:
+                    print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a videos.")
+                    self.conn.execute("ALTER TABLE videos ADD COLUMN is_hidden INTEGER DEFAULT 0")
+        except Exception as e:
+            print(f"ERROR en migraciones de BD: {e}")
+
+    # =========================================================================
+    # GESTIÓN DE FOTOS
+    # =========================================================================
+
+    def load_all_photo_dates(self):
+        """Carga todas las fechas de fotos para el escaneo inicial."""
+        # Solo cargamos las que NO están ocultas para el mapa visual normal,
+        # o cargamos todas y filtramos luego. Para sincronizar es mejor cargar todo.
+        cursor = self.conn.execute("SELECT filepath, year, month FROM photos")
+        return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
+
+    def bulk_upsert_photos(self, photos_list):
+        """Inserta o actualiza muchas fotos de golpe (optimización)."""
+        with self.conn:
+            self.conn.executemany("""
+                INSERT INTO photos (filepath, year, month)
                 VALUES (?, ?, ?)
-            """, photos_data)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en bulk_upsert_photos: {e}")
-        finally:
-            conn.close()
+                ON CONFLICT(filepath) DO UPDATE SET
+                year=excluded.year,
+                month=excluded.month
+            """, photos_list)
 
-    # --- ¡NUEVA FUNCIÓN! ---
-    def bulk_upsert_videos(self, videos_data: list[tuple[str, str, str]]):
-        """
-        Inserta o reemplaza una lista de vídeos con su año y mes.
-        (videos_data es una lista de tuplas: (filepath, year, month))
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.executemany("""
-                INSERT OR REPLACE INTO videos (filepath, year, month)
+    def bulk_delete_photos(self, paths_list):
+        """Elimina fotos que ya no existen en disco de la BD."""
+        if not paths_list:
+            return
+        with self.conn:
+            # Convertir lista a lista de tuplas para executemany
+            tuples = [(p,) for p in paths_list]
+            self.conn.executemany("DELETE FROM photos WHERE filepath = ?", tuples)
+
+    def get_photo_date(self, filepath):
+        cursor = self.conn.execute("SELECT year, month FROM photos WHERE filepath = ?", (filepath,))
+        row = cursor.fetchone()
+        if row:
+            return row['year'], row['month']
+        return None, None
+
+    def update_photo_date(self, filepath, year, month):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
+
+    # --- Funciones de Ocultar/Borrar Fotos ---
+
+    def hide_photo(self, photo_path):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET is_hidden = 1 WHERE filepath = ?", (photo_path,))
+
+    def unhide_photo(self, photo_path):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET is_hidden = 0 WHERE filepath = ?", (photo_path,))
+
+    def get_hidden_photos(self):
+        """Devuelve lista de rutas de fotos ocultas."""
+        cursor = self.conn.execute("SELECT filepath FROM photos WHERE is_hidden = 1")
+        return [row['filepath'] for row in cursor.fetchall()]
+
+    def delete_photo_permanently(self, photo_path):
+        """Borra la foto de la BD y sus caras asociadas."""
+        with self.conn:
+            # 1. Obtener ID para borrar caras
+            cur = self.conn.execute("SELECT id FROM photos WHERE filepath = ?", (photo_path,))
+            row = cur.fetchone()
+            if row:
+                photo_id = row['id']
+                self.conn.execute("DELETE FROM faces WHERE photo_id = ?", (photo_id,))
+
+            # 2. Borrar la entrada de la foto
+            self.conn.execute("DELETE FROM photos WHERE filepath = ?", (photo_path,))
+
+    # =========================================================================
+    # GESTIÓN DE VÍDEOS
+    # =========================================================================
+
+    def load_all_video_dates(self):
+        cursor = self.conn.execute("SELECT filepath, year, month FROM videos")
+        return {row['filepath']: (row['year'], row['month']) for row in cursor.fetchall()}
+
+    def get_video_date(self, filepath):
+        cursor = self.conn.execute("SELECT year, month FROM videos WHERE filepath = ?", (filepath,))
+        row = cursor.fetchone()
+        if row:
+            return row['year'], row['month']
+        return None, None
+
+    def bulk_upsert_videos(self, videos_list):
+        with self.conn:
+            self.conn.executemany("""
+                INSERT INTO videos (filepath, year, month)
                 VALUES (?, ?, ?)
-            """, videos_data)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en bulk_upsert_videos: {e}")
-        finally:
-            conn.close()
-    # --- FIN DE LO NUEVO ---
+                ON CONFLICT(filepath) DO UPDATE SET
+                year=excluded.year,
+                month=excluded.month
+            """, videos_list)
 
-    # --- ¡NUEVA FUNCIÓN! ---
-    def bulk_delete_photos(self, filepaths: list[str]):
-        """Elimina una lista de fotos de la BD."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            # Prepara los datos como una lista de tuplas para executemany
-            data = [(path,) for path in filepaths]
-            cursor.executemany("DELETE FROM photos WHERE filepath = ?", data)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en bulk_delete_photos: {e}")
-        finally:
-            conn.close()
-    # --- FIN DE LO NUEVO ---
+    def bulk_delete_videos(self, paths_list):
+        if not paths_list:
+            return
+        with self.conn:
+            tuples = [(p,) for p in paths_list]
+            self.conn.executemany("DELETE FROM videos WHERE filepath = ?", tuples)
 
-    # --- ¡NUEVA FUNCIÓN! ---
-    def bulk_delete_videos(self, filepaths: list[str]):
-        """Elimina una lista de vídeos de la BD."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            data = [(path,) for path in filepaths]
-            cursor.executemany("DELETE FROM videos WHERE filepath = ?", data)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en bulk_delete_videos: {e}")
-        finally:
-            conn.close()
-    # --- FIN DE LO NUEVO ---
+    # --- Funciones de Ocultar/Borrar Vídeos ---
 
+    def hide_video(self, video_path):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET is_hidden = 1 WHERE filepath = ?", (video_path,))
 
-    # --- Funciones de Edición (Usadas por PhotoDetailDialog) ---
+    def unhide_video(self, video_path):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET is_hidden = 0 WHERE filepath = ?", (video_path,))
 
-    def update_photo_date(self, filepath: str, new_year: str, new_month: str):
-        """Actualiza el año y mes de una foto específica."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE photos SET year = ?, month = ? WHERE filepath = ?", (new_year, new_month, filepath))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error al actualizar la fecha: {e}")
-        finally:
-            conn.close()
+    def get_hidden_videos(self):
+        cursor = self.conn.execute("SELECT filepath FROM videos WHERE is_hidden = 1")
+        return [row['filepath'] for row in cursor.fetchall()]
 
-    def get_photo_date(self, filepath: str) -> tuple[str, str] | None:
-        """Obtiene el año y mes guardados para una sola foto."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT year, month FROM photos WHERE filepath = ?", (filepath,))
-            result = cursor.fetchone()
-            return (result['year'], result['month']) if result else None
-        except sqlite3.Error:
-            return None
-        finally:
-            conn.close()
+    def delete_video_permanently(self, video_path):
+        with self.conn:
+            self.conn.execute("DELETE FROM videos WHERE filepath = ?", (video_path,))
 
-    def add_person(self, name: str) -> int:
-        """Añade una nueva persona y devuelve su ID."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO people (name) VALUES (?)", (name,))
-            conn.commit()
+    def update_video_date(self, filepath, year, month):
+        with self.conn:
+            self.conn.execute("UPDATE videos SET year = ?, month = ? WHERE filepath = ?", (year, month, filepath))
+
+    # =========================================================================
+    # GESTIÓN DE CARAS (Reconocimiento Facial)
+    # =========================================================================
+
+    def get_unscanned_photos(self):
+        """Devuelve fotos que aún no han sido escaneadas en busca de caras y no están ocultas."""
+        cursor = self.conn.execute("""
+            SELECT id, filepath FROM photos
+            WHERE scanned_for_faces = 0 AND is_hidden = 0
+        """)
+        return cursor.fetchall()
+
+    def mark_photo_as_scanned(self, photo_id):
+        with self.conn:
+            self.conn.execute("UPDATE photos SET scanned_for_faces = 1 WHERE id = ?", (photo_id,))
+
+    def add_face(self, photo_id, encoding_blob, location_str):
+        with self.conn:
+            cursor = self.conn.execute("""
+                INSERT INTO faces (photo_id, encoding, location)
+                VALUES (?, ?, ?)
+            """, (photo_id, encoding_blob, location_str))
             return cursor.lastrowid
-        except sqlite3.Error as e:
-            print(f"Error al añadir persona: {e}")
-            return -1
-        finally:
-            conn.close()
 
-    def get_person_by_name(self, name: str):
-        """Busca una persona por su nombre."""
-        conn = self._get_connection()
+    def get_unknown_faces(self):
+        """Obtiene caras no asignadas a ninguna persona y no eliminadas."""
+        cursor = self.conn.execute("""
+            SELECT f.id, f.location, p.filepath
+            FROM faces f
+            JOIN photos p ON f.photo_id = p.id
+            WHERE f.person_id IS NULL AND f.is_deleted = 0 AND p.is_hidden = 0
+        """)
+        return cursor.fetchall()
+
+    def get_unknown_face_encodings(self):
+        """Obtiene encodings de caras desconocidas para el clustering."""
+        cursor = self.conn.execute("""
+            SELECT id, encoding FROM faces
+            WHERE person_id IS NULL AND is_deleted = 0
+        """)
+        data = []
+        for row in cursor.fetchall():
+            try:
+                encoding = pickle.loads(row['encoding'])
+                data.append((row['id'], encoding))
+            except:
+                pass
+        return data
+
+    def get_face_info(self, face_id):
+        """Obtiene ruta y ubicación para recortar la miniatura de la cara."""
+        cursor = self.conn.execute("""
+            SELECT f.location, p.filepath
+            FROM faces f
+            JOIN photos p ON f.photo_id = p.id
+            WHERE f.id = ?
+        """, (face_id,))
+        row = cursor.fetchone()
+        if row:
+            return {'location': row['location'], 'filepath': row['filepath']}
+        return None
+
+    def soft_delete_face(self, face_id):
+        """Marca una cara como eliminada (falso positivo)."""
+        with self.conn:
+            self.conn.execute("UPDATE faces SET is_deleted = 1, person_id = NULL WHERE id = ?", (face_id,))
+
+    def restore_face(self, face_id):
+        """Restaura una cara eliminada."""
+        with self.conn:
+            self.conn.execute("UPDATE faces SET is_deleted = 0 WHERE id = ?", (face_id,))
+
+    def get_deleted_faces(self):
+        """Devuelve caras marcadas como eliminadas (papelera de caras)."""
+        cursor = self.conn.execute("""
+            SELECT f.id, f.location, p.filepath
+            FROM faces f
+            JOIN photos p ON f.photo_id = p.id
+            WHERE f.is_deleted = 1 AND p.is_hidden = 0
+        """)
+        return cursor.fetchall()
+
+    # =========================================================================
+    # GESTIÓN DE PERSONAS
+    # =========================================================================
+
+    def add_person(self, name):
         try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM people WHERE name = ?", (name,))
-            return cursor.fetchone()
-        finally:
-            conn.close()
+            with self.conn:
+                cursor = self.conn.execute("INSERT INTO people (name) VALUES (?)", (name,))
+                return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            return -1 # Ya existe
 
-    def get_all_people(self) -> list:
-        """Devuelve una lista de todas las personas conocidas."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM people ORDER BY name")
-            return cursor.fetchall()
-        finally:
-            conn.close()
+    def get_all_people(self):
+        cursor = self.conn.execute("SELECT id, name FROM people ORDER BY name ASC")
+        return cursor.fetchall()
 
-    def add_face(self, photo_id: int, encoding: bytes, location: str) -> int:
-        """Añade una cara detectada a la BD y devuelve su ID."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO faces (photo_id, encoding, location) VALUES (?, ?, ?)",
-                           (photo_id, encoding, location))
-            conn.commit()
-            return cursor.lastrowid
-        except sqlite3.Error as e:
-            print(f"Error al añadir cara: {e}")
-            return -1
-        finally:
-            conn.close()
+    def get_person_by_name(self, name):
+        cursor = self.conn.execute("SELECT id, name FROM people WHERE name = ?", (name,))
+        row = cursor.fetchone()
+        if row:
+            return {'id': row['id'], 'name': row['name']}
+        return None
 
-    def link_face_to_person(self, face_id: int, person_id: int):
-        """Asigna (o re-asigna) una cara a una persona."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            # 'INSERT OR REPLACE' maneja la re-asignación (corrige errores)
-            cursor.execute("INSERT OR REPLACE INTO face_labels (face_id, person_id) VALUES (?, ?)",
-                           (face_id, person_id))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error al etiquetar cara: {e}")
-        finally:
-            conn.close()
+    def link_face_to_person(self, face_id, person_id):
+        with self.conn:
+            self.conn.execute("UPDATE faces SET person_id = ? WHERE id = ?", (person_id, face_id))
 
-    def soft_delete_face(self, face_id: int):
-        """Marca una cara como eliminada (soft delete)."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE faces SET is_deleted = 1 WHERE id = ?", (face_id,))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en soft_delete_face: {e}")
-        finally:
-            conn.close()
-
-    def restore_face(self, face_id: int):
-        """Restaura una cara marcada como eliminada."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE faces SET is_deleted = 0 WHERE id = ?", (face_id,))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en restore_face: {e}")
-        finally:
-            conn.close()
-
-    def bulk_soft_delete_faces(self, face_ids: list[int]):
-        """Marca un lote de caras como eliminadas."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            # Preparamos los datos como una lista de tuplas para executemany
-            data = [(face_id,) for face_id in face_ids]
-            cursor.executemany("UPDATE faces SET is_deleted = 1 WHERE id = ?", data)
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error en bulk_soft_delete_faces: {e}")
-        finally:
-            conn.close()
-
-    def get_deleted_faces(self) -> list:
-        """Devuelve todas las caras que están marcadas como eliminadas."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT f.id, f.photo_id, f.location, p.filepath
-                FROM faces f
-                JOIN photos p ON f.photo_id = p.id
-                WHERE f.is_deleted = 1
-            """)
-            return cursor.fetchall()
-        finally:
-            conn.close()
-
-    def get_unknown_faces(self) -> list:
-        """
-        Devuelve todas las caras que aún no están asignadas a una persona
-        y no están marcadas como eliminadas.
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            # Busca caras que no están etiquetadas Y no están eliminadas
-            cursor.execute("""
-                SELECT f.id, f.photo_id, f.location, p.filepath
-                FROM faces f
-                JOIN photos p ON f.photo_id = p.id
-                LEFT JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id IS NULL AND f.is_deleted = 0
-            """)
-            return cursor.fetchall()
-        finally:
-            conn.close()
-
-    def get_faces_for_person(self, person_id: int) -> list:
-        """
-        Devuelve las fotos (filepath, year, month) asociadas con
-        una persona, ordenadas por fecha y sin duplicados, excluyendo caras eliminadas.
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT DISTINCT p.filepath, p.year, p.month
-                FROM photos p
-                JOIN faces f ON p.id = f.photo_id
-                JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id = ? AND f.is_deleted = 0
-                ORDER BY p.year DESC, p.month DESC
-            """, (person_id,))
-            return cursor.fetchall() # Devuelve una lista de filas (dict-like)
-        finally:
-            conn.close()
-
-    def get_photo_id(self, filepath: str) -> int | None:
-        """Obtiene el ID de la foto (PK) a partir de su ruta."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM photos WHERE filepath = ?", (filepath,))
-            result = cursor.fetchone()
-            return result['id'] if result else None
-        except sqlite3.Error:
-            return None
-        finally:
-            conn.close()
-
-    def close(self):
-        pass
-
-    def get_unscanned_photos(self) -> list:
-        """Devuelve todas las fotos que aún no han sido escaneadas para caras."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            # Busca fotos que NO están marcadas como escaneadas (0)
-            cursor.execute("""
-                SELECT id, filepath
-                FROM photos
-                WHERE faces_scanned = 0
-            """)
-            return cursor.fetchall()
-        finally:
-            conn.close()
-
-    def mark_photo_as_scanned(self, photo_id: int):
-        """Marca una foto como escaneada (faces_scanned = 1)."""
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE photos SET faces_scanned = 1 WHERE id = ?", (photo_id,))
-            conn.commit()
-        except sqlite3.Error as e:
-            print(f"Error al marcar foto como escaneada: {e}")
-        finally:
-            conn.close()
-
-    def get_unknown_face_encodings(self) -> list:
-        """
-        Devuelve una lista de tuplas (face_id, encoding) para todas las
-        caras que aún no están asignadas a una persona y no están eliminadas.
-        """
-        conn = self._get_connection()
-        face_data = []
-        try:
-            cursor = conn.cursor()
-            # Busca caras que no están etiquetadas Y no están eliminadas
-            cursor.execute("""
-                SELECT f.id, f.encoding
-                FROM faces f
-                LEFT JOIN face_labels fl ON f.id = fl.face_id
-                WHERE fl.person_id IS NULL AND f.is_deleted = 0
-            """)
-
-            for row in cursor.fetchall():
-                face_id = row['id']
-                encoding_blob = row['encoding']
-
-                # Deserializar el encoding de blob (pickle) a array numpy
-                try:
-                    encoding = pickle.loads(encoding_blob)
-                    face_data.append((face_id, encoding))
-                except Exception as e:
-                    print(f"Error al deserializar encoding para face_id {face_id}: {e}")
-
-            return face_data
-
-        except sqlite3.Error as e:
-            print(f"Error al obtener encodings desconocidos: {e}")
-            return []
-        finally:
-            conn.close()
-
-    def get_face_info(self, face_id: int):
-        """
-        Devuelve la 'filepath' y 'location' de una sola cara
-        a partir de su ID.
-        """
-        conn = self._get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT p.filepath, f.location
-                FROM faces f
-                JOIN photos p ON f.photo_id = p.id
-                WHERE f.id = ?
-            """, (face_id,))
-            result = cursor.fetchone()
-            return result # Devuelve un objeto Fila (dict-like)
-        except sqlite3.Error as e:
-            print(f"Error en get_face_info: {e}")
-            return None
-        finally:
-            conn.close()
-
-if __name__ == "__main__":
-    # Ejemplo de uso:
-    db = VisageVaultDB(db_file="test_visagevault.db")
-    print("\nPrueba de carga de fotos:")
-    print(db.load_all_photo_dates())
-
-    print("\nPrueba de carga de vídeos:")
-    print(db.load_all_video_dates())
-
-    # Pruebas de inserción
-    test_data = [
-        ("/home/test/foto1.jpg", "2024", "01"),
-        ("/home/test/foto2.jpg", "2025", "12"),
-    ]
-    db.bulk_upsert_photos(test_data)
-    print(db.load_all_photo_dates())
-
-    # Prueba de actualización
-    db.update_photo_date("/home/test/foto1.jpg", "2023", "05")
-    print(db.get_photo_date("/home/test/foto1.jpg"))
-    db.close()
+    def get_faces_for_person(self, person_id):
+        """Obtiene todas las fotos donde aparece esta persona."""
+        cursor = self.conn.execute("""
+            SELECT p.filepath, p.year, p.month, f.location
+            FROM faces f
+            JOIN photos p ON f.photo_id = p.id
+            WHERE f.person_id = ? AND f.is_deleted = 0 AND p.is_hidden = 0
+            ORDER BY p.year DESC, p.month DESC
+        """, (person_id,))
+        return cursor.fetchall()

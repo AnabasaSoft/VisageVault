@@ -7,8 +7,12 @@ CONFIG_FILE = Path("visagevault_config.json")
 def load_config():
     """Carga la configuración desde el archivo JSON."""
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print("Error: El archivo de configuración está corrupto. Se usarán valores por defecto.")
+            return {}
     return {}
 
 def save_config(config_data):
@@ -25,4 +29,16 @@ def set_photo_directory(directory_path):
     """Establece y guarda la nueva ruta de la carpeta de fotos."""
     config = load_config()
     config['photo_directory'] = directory_path
+    save_config(config)
+
+def get_thumbnail_size():
+    """Obtiene el tamaño de miniatura preferido por el usuario."""
+    config = load_config()
+    # Devuelve el tamaño guardado, o 128 como valor por defecto
+    return config.get('thumbnail_size', 128)
+
+def set_thumbnail_size(size):
+    """Guarda el tamaño de miniatura preferido por el usuario."""
+    config = load_config()
+    config['thumbnail_size'] = size
     save_config(config)
