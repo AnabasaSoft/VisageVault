@@ -55,7 +55,8 @@ Para más detalles, consulta el archivo `LICENSE` o la cabecera de `visagevault.
 Para ejecutar VisageVault, necesitas **Python 3.11 o superior**.
 
 ### Dependencias de Sistema (Compilación)
-La librería `face_recognition` y `rawpy` requieren herramientas de compilación de C++ instaladas:
+La librería `face_recognition` y `rawpy` requieren herramientas de compilación de C++ 
+  instaladas:
 * **Windows:** Visual Studio con "Desarrollo para el escritorio con C++".
 * **Linux:** `cmake`, `gcc`, `libarchive-tools` (para empaquetado).
   ```bash
