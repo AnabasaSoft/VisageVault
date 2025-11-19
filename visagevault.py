@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.4 (con Pestaña de Vídeos)
+# VERSIÓN: 1.4.5 (con Pestaña de Vídeos)
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -34,6 +34,7 @@ import numpy as np
 from sklearn.cluster import DBSCAN
 import sklearn
 import rawpy # Importar rawpy para soporte RAW
+import cv2
 
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
@@ -1205,6 +1206,139 @@ class FaceScanWorker(QObject):
             self.signals.scan_finished.emit()
 
 # =================================================================
+# CLASE: DIÁLOGO DE AYUDA Y ACERCA DE
+# =================================================================
+class HelpDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Ayuda y Acerca de VisageVault")
+        self.setFixedSize(500, 600)
+
+        layout = QVBoxLayout(self)
+
+        # 1. Logo
+        logo_label = QLabel()
+        logo_label.setAlignment(Qt.AlignCenter)
+        # Usamos resource_path para que funcione en el .exe compilado
+        logo_path = resource_path("visagevault.png")
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            logo_label.setPixmap(pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(logo_label)
+
+        # 2. Título y Versión
+        title_label = QLabel("<h2>VisageVault v1.4</h2>")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+
+        # 3. Texto de Ayuda (HTML)
+        help_text = """
+        <style>
+            p { margin-bottom: 10px; line-height: 1.4; }
+            a { color: #3daee9; text-decoration: none; font-weight: bold; }
+        </style>
+
+        <h3>📖 Guía Rápida</h3>
+        <p><b>📷 Fotos / 🎥 Vídeos:</b> Navega por tus recuerdos organizados por fecha.
+        Haz <b>doble clic</b> para ver en detalle. Usa <b>Ctrl+Rueda</b> para zoom.</p>
+
+        <p><b>👥 Personas:</b> La IA agrupa caras automáticamente.
+        Entra en esta pestaña para etiquetar a tus amigos y familiares.</p>
+
+        <p><b>🖱️ Acciones:</b> Haz <b>Clic Derecho</b> en una foto o vídeo para:
+        <ul>
+            <li>Cambiar su fecha (y actualizar el archivo).</li>
+            <li>Ocultarlo de la vista principal.</li>
+            <li>Eliminarlo permanentemente.</li>
+        </ul>
+        </p>
+
+        <hr>
+
+        <h3>📬 Contacto y Soporte</h3>
+        <p>Desarrollado por <b>Daniel Serrano Armenta</b>.</p>
+
+        <p>🐙 <b>GitHub:</b><br>
+        <a href="https://github.com/danitxu79/VisageVault">github.com/danitxu79/VisageVault</a></p>
+
+        <p>📧 <b>Email:</b><br>
+        <a href="mailto:dani.eus79@gmail.com">dani.eus79@gmail.com</a></p>
+        """
+
+        info_label = QLabel(help_text)
+        info_label.setWordWrap(True)
+        info_label.setOpenExternalLinks(True) # ¡Importante para que funcionen los links!
+        info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        info_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+
+        # Área de scroll por si el texto es largo
+        scroll = QScrollArea()
+        scroll.setWidget(info_label)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        layout.addWidget(scroll)
+
+        # 4. Botón Cerrar
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.accept)
+        layout.addWidget(btn_box)
+
+# =================================================================
+# CLASE: VIGILANTE DEL SISTEMA DE ARCHIVOS (AUTO-REFRESH)
+# =================================================================
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class PhotoDirWatcher(QObject):
+    """
+    Vigila cambios en el directorio de fotos y emite señales para refrescar la UI.
+    """
+    directory_changed = Signal()
+
+    def __init__(self, path_to_watch):
+        super().__init__()
+        self.path_to_watch = path_to_watch
+        self.observer = Observer()
+        self.handler = self.ChangeHandler(self.directory_changed)
+
+    def start(self):
+        if os.path.isdir(self.path_to_watch):
+            self.observer.schedule(self.handler, self.path_to_watch, recursive=True)
+            self.observer.start()
+            print(f"Vigilando cambios en: {self.path_to_watch}")
+
+    def stop(self):
+        if self.observer.is_alive():
+            self.observer.stop()
+            self.observer.join()
+
+    class ChangeHandler(FileSystemEventHandler):
+        def __init__(self, signal):
+            self.signal = signal
+            self.last_emit_time = 0
+
+        def on_any_event(self, event):
+            # Ignorar directorios y archivos temporales o de caché
+            if event.is_directory:
+                return
+
+            filename = os.path.basename(event.src_path)
+            if filename.startswith('.') or "face_cache" in event.src_path:
+                return
+
+            # Comprobar extensiones relevantes (Fotos y Vídeos)
+            valid_exts = (
+                '.jpg', '.jpeg', '.png', '.tiff', '.webp', '.heic', '.nef', '.cr2', '.dng', '.raw', # Fotos
+                '.mp4', '.avi', '.mkv', '.mov' # Vídeos
+            )
+            if not filename.lower().endswith(valid_exts):
+                return
+
+            # Debounce: Evitar emitir 100 señales si copias 100 fotos de golpe
+            # Emitimos la señal y dejamos que la App gestione el refresco con un Timer
+            self.signal.emit()
+
+# =================================================================
 # VENTANA PRINCIPAL DE LA APLICACIÓN (VisageVaultApp)
 # =================================================================
 class VisageVaultApp(QMainWindow):
@@ -1221,6 +1355,13 @@ class VisageVaultApp(QMainWindow):
         self.cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_cache")
         if not os.path.exists(self.cache_dir):
             os.makedirs(self.cache_dir)
+
+        self.refresh_timer = QTimer()
+        self.refresh_timer.setSingleShot(True)
+        self.refresh_timer.setInterval(2000) # Esperar 2 segundos de inactividad antes de refrescar
+        self.refresh_timer.timeout.connect(self._perform_auto_refresh)
+
+        self.file_watcher = None
 
         self.setMinimumSize(QSize(900, 600))
         self.db = VisageVaultDB()
@@ -1429,15 +1570,68 @@ class VisageVaultApp(QMainWindow):
         self.people_splitter.setSizes([left_width, min_right_width])
 
         # ==========================================================
-        # 5. Añadir pestañas al Widget Central
+        # 5. Pestaña "Ayuda" (NUEVO)
+        # ==========================================================
+        help_tab_widget = QWidget()
+        help_layout = QVBoxLayout(help_tab_widget)
+        help_layout.setAlignment(Qt.AlignCenter)
+
+        # Logo grande en la pestaña
+        tab_logo = QLabel()
+        logo_path = resource_path("visagevault.png")
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            tab_logo.setPixmap(pixmap.scaled(256, 256, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        # Ajuste fino para centrar ópticamente si la imagen tiene márgenes desiguales
+        tab_logo.setStyleSheet("margin-left: 100px;") # Prueba valores pequeños
+        help_layout.addWidget(tab_logo)
+
+        help_layout.addSpacing(20)
+
+        # Texto de bienvenida
+        welcome_label = QLabel("<h1>Bienvenido a VisageVault</h1>")
+        welcome_label.setAlignment(Qt.AlignCenter)
+        help_layout.addWidget(welcome_label)
+
+        subtitle_label = QLabel("Tu gestor de recuerdos inteligente, privado y local.")
+        subtitle_label.setStyleSheet("font-size: 14pt; color: gray;")
+        subtitle_label.setAlignment(Qt.AlignCenter)
+        help_layout.addWidget(subtitle_label)
+
+        help_layout.addSpacing(40)
+
+        # Botón para abrir el diálogo
+        btn_open_help = QPushButton("  Ver Ayuda / Acerca de / Contacto  ")
+        btn_open_help.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
+        btn_open_help.setStyleSheet("""
+            QPushButton {
+                font-size: 14pt;
+                padding: 15px;
+                border-radius: 8px;
+                background-color: #3daee9;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #4dbef9; }
+        """)
+        btn_open_help.setCursor(Qt.PointingHandCursor)
+        btn_open_help.clicked.connect(self._open_help_dialog) # Conectamos a la función
+
+        help_layout.addWidget(btn_open_help)
+        help_layout.addStretch(1)
+
+        # ==========================================================
+        # 6. Añadir pestañas al Widget Central (MODIFICADO)
         # ==========================================================
         self.tab_widget.addTab(fotos_tab_widget, "Fotos")
-        self.tab_widget.addTab(videos_tab_widget, "Vídeos") # <-- NUEVO
+        self.tab_widget.addTab(videos_tab_widget, "Vídeos")
         self.tab_widget.addTab(self.personas_tab_widget, "Personas")
+        self.tab_widget.addTab(help_tab_widget, "Ayuda") # <--- AÑADIR ESTA LÍNEA
+
         self.setCentralWidget(self.tab_widget)
 
         # ==========================================================
-        # 6. Cargar estado de los splitters
+        # 7. Cargar estado de los splitters
         # ==========================================================
         photo_right_panel_widget.setMinimumWidth(180)
         # self.main_splitter.splitterMoved.connect(self._save_photo_splitter_state)
@@ -1491,8 +1685,37 @@ class VisageVaultApp(QMainWindow):
         """Inicia los escaneos de fotos y vídeos."""
         if not directory:
             return
+
+        if self.file_watcher:
+            self.file_watcher.stop()
+
+        self.file_watcher = PhotoDirWatcher(directory)
+        self.file_watcher.directory_changed.connect(self._on_directory_changed)
+        self.file_watcher.start()
+
         self._start_photo_search(directory)
         self._start_video_search(directory)
+
+    @Slot()
+    def _on_directory_changed(self):
+        """Se llama cuando watchdog detecta un cambio. Reinicia el temporizador."""
+        # Cada vez que hay un cambio, reiniciamos la cuenta atrás.
+        # Solo se ejecutará _perform_auto_refresh cuando pasen 2 segundos SIN cambios.
+        self.refresh_timer.start()
+
+    @Slot()
+    def _perform_auto_refresh(self):
+        """Ejecuta el re-escaneo real tras el periodo de calma."""
+        print("Detectados cambios en el disco. Actualizando galería...")
+        self._set_status("Detectados cambios externos. Actualizando...")
+
+        if self.current_directory:
+            # Relanzamos los escaneos.
+            # Nota: Tus workers actuales son inteligentes (usan fechas de la BD),
+            # pero para detectar archivos NUEVOS o BORRADOS necesitan recorrer el disco.
+            self._start_photo_search(self.current_directory)
+            self._start_video_search(self.current_directory)
+            # El escaneo de caras se lanzará solo al terminar el de fotos
 
     def _start_photo_search(self, directory):
         """Configura y lanza el trabajador de escaneo de FOTOS."""
@@ -1820,7 +2043,7 @@ class VisageVaultApp(QMainWindow):
     # ----------------------------------------------------------------
 
     def _on_context_menu(self, pos, list_widget, is_video, is_hidden_view=False):
-        """Muestra el menú contextual con opción de cambio de fecha."""
+        """Muestra el menú contextual con opción de cambio de fecha y ojos rojos."""
         selected_items = list_widget.selectedItems()
         if not selected_items:
             return
@@ -1828,7 +2051,7 @@ class VisageVaultApp(QMainWindow):
         menu = QMenu(self)
 
         if is_hidden_view:
-            # --- OPCIONES PARA FOTOS OCULTAS ---
+            # --- OPCIONES PARA OCULTAS ---
             action_restore = menu.addAction("Restaurar a la galería")
             action_restore.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
 
@@ -1844,13 +2067,20 @@ class VisageVaultApp(QMainWindow):
         else:
             # --- OPCIONES NORMALES ---
 
-            # 1. Opción Cambiar Fecha (NUEVO)
+            # 1. Cambiar Fecha
             action_date = menu.addAction("Cambiar Fecha (Mover)")
             action_date.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
 
+            # 2. Corregir Ojos Rojos (SOLO PARA FOTOS)
+            action_redeye = None
+            if not is_video:
+                action_redeye = menu.addAction("Corregir Ojos Rojos (Auto)")
+                # No hay un icono estándar perfecto, usamos uno genérico o DialogApply
+                action_redeye.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+
             menu.addSeparator()
 
-            # 2. Resto de opciones
+            # 3. Resto de opciones
             action_hide = menu.addAction("Ocultar de la vista")
             action_delete = menu.addAction("Eliminar del disco (Permanente)")
             action_delete.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
@@ -1863,6 +2093,89 @@ class VisageVaultApp(QMainWindow):
                 self._delete_selected_media(selected_items, is_video, from_hidden_view=False)
             elif action == action_date:
                 self._change_date_for_selected(selected_items, is_video)
+            elif action_redeye and action == action_redeye:
+                self._remove_red_eyes_for_selected(selected_items)
+
+    def _remove_red_eye_from_image(self, image_path):
+        """Detecta y corrige ojos rojos automáticamente usando OpenCV."""
+        try:
+            # 1. Leer imagen
+            img = cv2.imread(image_path)
+            if img is None:
+                return False
+
+            img_out = img.copy()
+
+            # 2. Cargar clasificador de ojos pre-entrenado (Haar Cascade)
+            # OpenCV suele incluirlo en cv2.data.haarcascades
+            eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
+            eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
+
+            if eye_cascade.empty():
+                print("Error: No se encontró el clasificador de ojos XML.")
+                return False
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # 3. Detectar ojos
+            eyes = eye_cascade.detectMultiScale(gray, 1.3, 5)
+
+            if len(eyes) == 0:
+                return False # No se detectaron ojos
+
+            changed = False
+
+            for (x, y, w, h) in eyes:
+                # Extraer la región de interés (ROI) del ojo
+                eye_roi = img_out[y:y+h, x:x+w]
+
+                # Separar canales: Blue, Green, Red
+                b = eye_roi[:, :, 0]
+                g = eye_roi[:, :, 1]
+                r = eye_roi[:, :, 2]
+
+                # 4. Crear máscara de "ojo rojo"
+                # La rojez suele ser mucho mayor que el verde y el azul combinados
+                bg_sum = cv2.add(b, g)
+                mask = (r > 150) & (r > bg_sum) # Umbral simple
+                mask = mask.astype(np.uint8) * 255
+
+                # Refinar la máscara (llenar huecos)
+                mask = cv2.dilate(mask, None, iterations=1)
+
+                # Si hay píxeles rojos detectados
+                if np.sum(mask) > 0:
+                    changed = True
+                    # 5. Corregir: Reemplazar el canal rojo con el promedio de verde y azul
+                    mean_bg = cv2.addWeighted(b, 0.5, g, 0.5, 0)
+
+                    # Aplicar solo donde diga la máscara
+                    eye_roi_fixed = eye_roi.copy()
+                    # Usamos bitwise para mezclar
+                    # Donde la mascara es blanca, usamos el promedio cian (mean_bg)
+                    # Donde es negra, dejamos el original
+
+                    # Forma numpy rápida:
+                    # Convertir máscara a booleano para indexar
+                    mask_bool = mask.astype(bool)
+                    eye_roi_fixed[:, :, 2][mask_bool] = mean_bg[mask_bool]
+
+                    # Volver a poner el ROI corregido en la imagen principal
+                    img_out[y:y+h, x:x+w] = eye_roi_fixed
+
+            if changed:
+                # Guardar resultado sobrescribiendo (o podrías guardar copia)
+                cv2.imwrite(image_path, img_out)
+
+                # Actualizar fecha de modificación para que se refresquen metadatos si es necesario
+                os.utime(image_path, None)
+                return True
+
+            return False
+
+        except Exception as e:
+            print(f"Error corrigiendo ojos rojos en {image_path}: {e}")
+            return False
 
     def _restore_selected_media(self, items, is_video):
         """Restaura los elementos seleccionados a la vista principal."""
@@ -2172,23 +2485,66 @@ class VisageVaultApp(QMainWindow):
                 print("Aviso: No se pudo hacer scroll al widget de vídeo.")
 
     @Slot(dict)
-    def _handle_search_finished(self, photos_by_year_month):
+    def _handle_search_finished(self, new_photos_by_year_month):
         """Se llama cuando el PhotoFinderWorker termina."""
-        self.photos_by_year_month = photos_by_year_month
-        self.select_dir_button.setEnabled(True) # Reactivar botón
-        num_fotos = sum(len(photos) for months in photos_by_year_month.values() for photos in months.values())
-        self._set_status(f"Escaneo de fotos finalizado. {num_fotos} fotos encontradas.")
+        self.select_dir_button.setEnabled(True)
+
+        # 1. OPTIMIZACIÓN: Si los datos no han cambiado, NO redibujamos nada.
+        # Esto evita parpadeos por falsas alarmas del vigilante.
+        if self.photos_by_year_month == new_photos_by_year_month:
+            print("Escaneo completado: Sin cambios detectados.")
+            # Aún así lanzamos el escáner de caras por si acaso
+            self._start_face_scan()
+            return
+
+        # Si hay cambios reales, procedemos:
+        self.photos_by_year_month = new_photos_by_year_month
+
+        num_fotos = sum(len(photos) for months in self.photos_by_year_month.values() for photos in months.values())
+        self._set_status(f"Actualizando biblioteca... {num_fotos} fotos.")
+
+        # 2. TRUCO VISUAL: Congelar la interfaz para evitar el parpadeo blanco
+        self.scroll_area.setUpdatesEnabled(False)
+
+        # 3. Guardar posición del scroll
+        current_scroll = self.scroll_area.verticalScrollBar().value()
+
+        # Redibujar
         self._display_photos()
+
+        # 4. Restaurar scroll y descongelar
+        self.scroll_area.verticalScrollBar().setValue(current_scroll)
+        self.scroll_area.setUpdatesEnabled(True)
+
         self._start_face_scan()
 
     @Slot(dict)
-    def _handle_video_search_finished(self, videos_by_year_month):
+    def _handle_video_search_finished(self, new_videos_by_year_month):
         """Se llama cuando el VideoFinderWorker termina."""
-        self.videos_by_year_month = videos_by_year_month
-        self.select_dir_button.setEnabled(True) # Reactivar botón
-        num_videos = sum(len(videos) for months in videos_by_year_month.values() for videos in months.values())
-        self._set_status(f"Escaneo de vídeos finalizado. {num_videos} vídeos encontrados.")
+        self.select_dir_button.setEnabled(True)
+
+        # 1. Verificar cambios
+        if self.videos_by_year_month == new_videos_by_year_month:
+            print("Escaneo de vídeos completado: Sin cambios.")
+            return
+
+        self.videos_by_year_month = new_videos_by_year_month
+
+        num_videos = sum(len(videos) for months in self.videos_by_year_month.values() for videos in months.values())
+        self._set_status(f"Actualizando biblioteca... {num_videos} vídeos.")
+
+        # 2. Congelar
+        self.video_scroll_area.setUpdatesEnabled(False)
+
+        # 3. Guardar Scroll
+        current_scroll = self.video_scroll_area.verticalScrollBar().value()
+
+        # Redibujar
         self._display_videos()
+
+        # 4. Restaurar y Descongelar
+        self.video_scroll_area.verticalScrollBar().setValue(current_scroll)
+        self.video_scroll_area.setUpdatesEnabled(True)
 
     def _set_status(self, message):
         self.status_label.setText(f"Estado: {message}")
@@ -2915,6 +3271,9 @@ class VisageVaultApp(QMainWindow):
         except Exception as e:
             print(f"Error al guardar configuración al cerrar: {e}")
 
+        if self.file_watcher:
+            self.file_watcher.stop()
+
         # 1. Detener el hilo de escaneo de fotos
         if self.photo_thread and self.photo_thread.isRunning():
             print("Deteniendo el hilo de escaneo de fotos...")
@@ -3215,6 +3574,57 @@ class VisageVaultApp(QMainWindow):
         self.video_container_layout.addWidget(list_widget)
         self.video_container_layout.addStretch(1)
         QTimer.singleShot(100, self._load_visible_video_thumbnails)
+
+    @Slot()
+    def _open_help_dialog(self):
+        """Abre la ventana de ayuda."""
+        dialog = HelpDialog(self)
+        dialog.exec()
+
+    def _remove_red_eyes_for_selected(self, items):
+        """Aplica la corrección de ojos rojos a los elementos seleccionados."""
+        count = len(items)
+        # Confirmación de seguridad
+        confirm = QMessageBox.question(
+            self,
+            "Corrección de Ojos Rojos",
+            f"Se intentarán corregir los ojos rojos en {count} foto(s).\n\n"
+            "⚠️ Esto modificará el archivo original permanentemente.\n"
+            "¿Deseas continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        processed = 0
+        successes = 0
+
+        paths_to_update = [item.data(Qt.UserRole) for item in items]
+        total = len(paths_to_update)
+
+        for i, path in enumerate(paths_to_update):
+            self._set_status(f"Corrigiendo ojos rojos ({i+1}/{total}): {Path(path).name}...")
+            QApplication.processEvents() # Para que la UI no se congele
+
+            if self._remove_red_eye_from_image(path):
+                successes += 1
+
+                # Borrar miniatura antigua de la caché para obligar a regenerarla
+                # (Asumiendo que importaste hashlib y THUMBNAIL_DIR de thumbnail_generator o copiaste la lógica)
+                # Una forma rápida sin importar es borrarla si sabemos la ruta,
+                # o simplemente recargar el loader que la regenerará si detecta cambio (depende de tu implementación).
+                # Aquí simplemente recargamos la vista.
+
+            processed += 1
+
+        self._set_status(f"Proceso finalizado. {successes} fotos corregidas de {processed}.")
+
+        if successes > 0:
+            # Refrescar la vista actual para ver cambios (o regenerar thumbnails)
+            # Lo ideal sería invalidar la caché de thumbnails de estas fotos específicas
+            # Como solución simple, recargamos la vista:
+            self._display_photos()
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""

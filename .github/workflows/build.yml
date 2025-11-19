@@ -125,7 +125,6 @@ jobs:
           python-version: '3.11'
 
       - name: Install system dependencies
-        # AÑADIDO: libarchive-tools necesario para 'bsdtar' (error 127) en creación de paquetes pacman
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev \
@@ -147,7 +146,7 @@ jobs:
           pyinstaller --noconfirm \
             --onedir \
             --windowed \
-            --name "visagevault" \
+            --name "VisageVault" \
             --add-data "visagevault.png:." \
             --collect-data face_recognition_models \
             --collect-all rawpy \
@@ -164,19 +163,20 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          # CORRECCIÓN: Copiar TODO el contenido del directorio dist (libs + ejecutable)
-          cp -r dist/visagevault/* AppDir/usr/bin/
+          # COHERENCIA: Copiar carpeta generada con nombre "VisageVault"
+          cp -r dist/VisageVault/* AppDir/usr/bin/
 
-          # Asegurar permisos
-          chmod +x AppDir/usr/bin/visagevault
+          # Asegurar permisos al binario principal "VisageVault"
+          chmod +x AppDir/usr/bin/VisageVault
 
           cp visagevault.png AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png
 
+          # COHERENCIA: El Exec apunta a "VisageVault" (Mayúsculas)
           cat << EOF > AppDir/usr/share/applications/visagevault.desktop
           [Desktop Entry]
           Name=VisageVault
           Comment=Gestor Inteligente de Fotos y Videos
-          Exec=visagevault
+          Exec=VisageVault
           Icon=visagevault
           Type=Application
           Categories=Graphics;Photography;
@@ -189,7 +189,7 @@ jobs:
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --desktop-file AppDir/usr/share/applications/visagevault.desktop \
-            --executable AppDir/usr/bin/visagevault \
+            --executable AppDir/usr/bin/VisageVault \
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png \
             --output appimage
 
@@ -197,22 +197,24 @@ jobs:
         run: |
           VERSION_TAG=$(echo ${{ github.ref_name }} | sed 's/v//')
 
+          # COHERENCIA: Nombre del paquete "VisageVault"
+
           # DEB
-          fpm -s dir -t deb -n visagevault -v $VERSION_TAG \
+          fpm -s dir -t deb -n VisageVault -v $VERSION_TAG \
             --architecture amd64 \
             --description "Gestor de Fotos y Videos Inteligente" \
             --maintainer "Daniel Serrano" \
             -C AppDir --prefix "/" .
 
           # RPM
-          fpm -s dir -t rpm -n visagevault -v $VERSION_TAG \
+          fpm -s dir -t rpm -n VisageVault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Videos Inteligente" \
             --maintainer "Daniel Serrano" \
             -C AppDir --prefix "/" .
 
           # PACMAN
-          fpm -s dir -t pacman -n visagevault -v $VERSION_TAG \
+          fpm -s dir -t pacman -n VisageVault -v $VERSION_TAG \
             --architecture x86_64 \
             --description "Gestor de Fotos y Videos Inteligente" \
             --maintainer "Daniel Serrano" \

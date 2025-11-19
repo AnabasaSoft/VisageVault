@@ -56,7 +56,20 @@ def generate_image_thumbnail(original_filepath: str) -> str | None:
             raise Exception("No se pudo cargar la imagen con PIL ni rawpy.")
 
         # --- Lógica original (ahora se aplica a la imagen cargada) ---
-        img_to_process.thumbnail(THUMBNAIL_SIZE)
+        if img_to_process.mode in ('RGBA', 'LA') or (img_to_process.mode == 'P' and 'transparency' in img_to_process.info):
+            # Crear una nueva imagen de fondo blanco para pegar la transparente
+            # (Esto evita que el fondo transparente se vea negro)
+            background = Image.new('RGB', img_to_process.size, (255, 255, 255))
+
+            # Si tiene canal alfa, lo usamos como máscara para pegar
+            if img_to_process.mode == 'P':
+                img_to_process = img_to_process.convert('RGBA')
+
+            background.paste(img_to_process, mask=img_to_process.split()[3]) # 3 es el canal Alpha
+            img_to_process = background
+        elif img_to_process.mode != 'RGB':
+            # Para otros modos simples sin transparencia, conversión directa
+            img_to_process = img_to_process.convert('RGB')
         img_to_process.save(thumbnail_path, "JPEG")
         img_to_process.close() # Importante cerrar
 
