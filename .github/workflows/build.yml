@@ -5,14 +5,15 @@ on:
     types: [created]
 
 jobs:
+
   # ========================================================
-  # TAREA 1: WINDOWS (Con 'shell: bash' para arreglar el error)
+  # TAREA 1: WINDOWS (Shell bash forzado)
   # ========================================================
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
-        shell: bash  # <--- ESTO ES CRÍTICO PARA QUE FUNCIONE
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -21,12 +22,13 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar dependencias
+        shell: bash
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller cmake
+          pip install pyinstaller
 
       - name: Construir .exe con PyInstaller
-        # Usamos \ porque estamos en bash
+        shell: bash
         run: |
           pyinstaller --noconfirm \
             --onefile \
@@ -51,7 +53,7 @@ jobs:
           prerelease: false
 
   # ========================================================
-  # TAREA 2: MACOS (Con 'brew install' para arreglar el error)
+  # TAREA 2: MACOS (Homebrew + create-dmg)
   # ========================================================
   build-macos:
     runs-on: macos-latest
@@ -65,8 +67,17 @@ jobs:
       - name: Instalar dependencias
         run: |
           pip install -r requirements.txt
-          pip install pyinstaller cmake
-          # CORRECCIÓN: Usar brew en lugar de pip
+          pip install pyinstaller
+
+          # Instalar Homebrew si no existe
+          if ! command -v brew &> /dev/null; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.bash_profile
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+          else
+            eval "$(/opt/homebrew/bin/brew shellenv)" || true
+          fi
+
           brew install create-dmg
 
       - name: Construir .app con PyInstaller
@@ -87,7 +98,6 @@ jobs:
 
       - name: Crear .dmg
         run: |
-          # Aseguramos que dist existe
           ls -R dist/
           create-dmg \
             --volname "VisageVault Installer" \
@@ -109,7 +119,7 @@ jobs:
           prerelease: false
 
   # ========================================================
-  # TAREA 3: LINUX (Con ruta de Exec corregida)
+  # TAREA 3: LINUX (AppImage + .deb + .rpm + .pkg)
   # ========================================================
   build-linux:
     runs-on: ubuntu-latest
@@ -158,17 +168,16 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          cp -r dist/VisageVault/* AppDir/usr/bin/
+          # Copiar ejecutable real
+          cp dist/VisageVault/visagevault AppDir/usr/bin/VisageVault
           chmod +x AppDir/usr/bin/VisageVault
 
           cp visagevault.png AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png
-          cp visagevault.png AppDir/visagevault.png
 
-          # CORRECCIÓN: Exec apunta solo al nombre del binario
           cat << EOF > AppDir/usr/share/applications/visagevault.desktop
           [Desktop Entry]
           Name=VisageVault
-          Comment=Gestor de Fotografias Inteligente
+          Comment=Gestor de Fotografías Inteligente
           Exec=VisageVault
           Icon=visagevault
           Type=Application
@@ -181,7 +190,6 @@ jobs:
       - name: Generar AppImage
         run: |
           export LINUXDEPLOY_OUTPUT_VERSION="${{ github.event.release.tag_name }}"
-
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --executable AppDir/usr/bin/VisageVault \
