@@ -6,13 +6,13 @@ on:
 
 jobs:
   # ========================================================
-  # TAREA 1: WINDOWS (Corregido: Usando bash para sintaxis segura)
+  # TAREA 1: WINDOWS (Con 'shell: bash' para arreglar el error)
   # ========================================================
   build-windows:
     runs-on: windows-latest
     defaults:
       run:
-        shell: bash  # <--- CLAVE: Usar bash en Windows para evitar errores de PowerShell
+        shell: bash  # <--- ESTO ES CRÍTICO PARA QUE FUNCIONE
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +26,7 @@ jobs:
           pip install pyinstaller cmake
 
       - name: Construir .exe con PyInstaller
-        # Usamos \ para saltos de línea (bash syntax)
+        # Usamos \ porque estamos en bash
         run: |
           pyinstaller --noconfirm \
             --onefile \
@@ -51,7 +51,7 @@ jobs:
           prerelease: false
 
   # ========================================================
-  # TAREA 2: MACOS (Corregido: Instalar create-dmg con brew)
+  # TAREA 2: MACOS (Con 'brew install' para arreglar el error)
   # ========================================================
   build-macos:
     runs-on: macos-latest
@@ -66,7 +66,7 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pyinstaller cmake
-          # CORRECCIÓN: Usar brew para create-dmg
+          # CORRECCIÓN: Usar brew en lugar de pip
           brew install create-dmg
 
       - name: Construir .app con PyInstaller
@@ -87,7 +87,7 @@ jobs:
 
       - name: Crear .dmg
         run: |
-          # Verificar que la app se creó
+          # Aseguramos que dist existe
           ls -R dist/
           create-dmg \
             --volname "VisageVault Installer" \
@@ -109,7 +109,7 @@ jobs:
           prerelease: false
 
   # ========================================================
-  # TAREA 3: LINUX (Corregido: Ruta en .desktop)
+  # TAREA 3: LINUX (Con ruta de Exec corregida)
   # ========================================================
   build-linux:
     runs-on: ubuntu-latest
@@ -158,17 +158,13 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
 
-          # Copiar binarios
           cp -r dist/VisageVault/* AppDir/usr/bin/
-
-          # Permisos
           chmod +x AppDir/usr/bin/VisageVault
 
-          # Iconos
           cp visagevault.png AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png
           cp visagevault.png AppDir/visagevault.png
 
-          # CORRECCIÓN: Cambiar Exec para que linuxdeploy lo encuentre
+          # CORRECCIÓN: Exec apunta solo al nombre del binario
           cat << EOF > AppDir/usr/share/applications/visagevault.desktop
           [Desktop Entry]
           Name=VisageVault
@@ -190,7 +186,7 @@ jobs:
             --appdir AppDir \
             --executable AppDir/usr/bin/VisageVault \
             --desktop-file AppDir/usr/share/applications/visagevault.desktop \
-            --icon-file AppDir/visagevault.png \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png \
             --output appimage
 
       - name: Generar paquetes DEB/RPM/PKG
