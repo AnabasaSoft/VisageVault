@@ -76,6 +76,19 @@ class VisageVaultDB:
                 )
             """)
 
+            # 5. Tabla de GOOGLE DRIVE
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS drive_photos (
+                    id TEXT PRIMARY KEY,
+                    name TEXT,
+                    created_time TEXT,
+                    mime_type TEXT,
+                    thumbnail_link TEXT,
+                    web_content_link TEXT,
+                    parent_id TEXT
+                )
+            """)
+
     def _check_migrations(self):
         """
         Verifica si la base de datos existente necesita actualizaciones de estructura
@@ -344,3 +357,39 @@ class VisageVaultDB:
             ORDER BY p.year DESC, p.month DESC
         """, (person_id,))
         return cursor.fetchall()
+
+    def get_all_drive_photos(self):
+        """Recupera todas las fotos de Drive guardadas para carga instantánea."""
+        cursor = self.conn.execute("SELECT * FROM drive_photos")
+        # Convertimos a lista de dicts para que sea compatible con el resto del código
+        return [dict(row) for row in cursor.fetchall()]
+
+    def bulk_upsert_drive_photos(self, photos_list):
+        """Guarda o actualiza fotos de Drive masivamente."""
+        if not photos_list: return
+
+        # Preparamos los datos para SQLite
+        data_to_insert = []
+        for p in photos_list:
+            # Extraer parent_id si existe (Drive lo da como lista)
+            parent = p.get('parents', [''])[0] if p.get('parents') else ''
+
+            data_to_insert.append((
+                p.get('id'),
+                p.get('name'),
+                p.get('createdTime'), # Ojo: Drive usa 'createdTime'
+                p.get('mimeType'),
+                p.get('thumbnailLink'),
+                p.get('webContentLink'),
+                parent
+            ))
+
+        with self.conn:
+            self.conn.executemany("""
+                INSERT INTO drive_photos (id, name, created_time, mime_type, thumbnail_link, web_content_link, parent_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                thumbnail_link=excluded.thumbnail_link,
+                web_content_link=excluded.web_content_link
+            """, data_to_insert)

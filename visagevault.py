@@ -432,9 +432,9 @@ class DriveLoginWorker(QObject):
 
 class DriveScanWorker(QObject):
     """Worker dedicado a escanear Google Drive y enviar resultados a la UI."""
-    items_found = Signal(list)  # Señal para enviar lotes de fotos
-    progress = Signal(str)      # Señal para actualizar barra de estado
-    finished = Signal(int)      # Señal de finalización con total
+    items_found = Signal(list)
+    progress = Signal(str)
+    finished = Signal(int)
 
     def __init__(self, folder_id):
         super().__init__()
@@ -443,31 +443,31 @@ class DriveScanWorker(QObject):
 
     @Slot()
     def run(self):
+        # Instanciamos DriveManager AQUÍ, dentro del hilo, para que sus sockets sean locales al hilo.
+        # Si lo creamos fuera y lo usamos aquí, falla.
         try:
-            # Instancia local de DriveManager (Seguridad de Hilos)
-            # Importamos aquí por si acaso, aunque esté global
             from drive_manager import DriveManager
+            # IMPORTANTE: No pasarle 'parent' ni nada de Qt
             local_manager = DriveManager()
 
-            self.progress.emit("Iniciando escaneo recursivo en la nube...")
-            count = 0
+            # No emitimos logs de Qt aquí, solo señales
+            # self.progress.emit("Iniciando...")
 
-            # Iterar sobre el generador de imágenes
+            count = 0
+            # Iterar sobre el generador
             for batch_of_images in local_manager.list_images_recursively(self.folder_id):
                 if not self.is_running:
                     break
 
                 count += len(batch_of_images)
-                # Emitir señal: Esto despierta a la interfaz de forma segura
                 self.items_found.emit(batch_of_images)
                 self.progress.emit(f"Escaneando... {count} fotos encontradas.")
 
             self.finished.emit(count)
 
         except Exception as e:
-            print(f"Error en DriveScanWorker: {e}")
-            self.progress.emit(f"Error de escaneo: {e}")
-            self.finished.emit(count)
+            print(f"Error en worker: {e}") # Print seguro a consola
+            self.finished.emit(0)
 
 # =================================================================
 # CLASE OPTIMIZADA: CARGA DE CARAS CON CACHÉ DE DISCO
@@ -2009,6 +2009,7 @@ class VisageVaultApp(QMainWindow):
         # Variables de memoria para la nube
         self.drive_photos_by_date = {} # Estructura: { '2023': { '01': [datos_foto, ...] } }
         self.cloud_group_widgets = {}  # Para el scroll automático
+        self.cloud_photo_count = 0
 
         # ==========================================================
         # 6. Añadir pestañas al Widget Central (MODIFICADO)
@@ -4172,25 +4173,25 @@ class VisageVaultApp(QMainWindow):
         self.btn_gdrive.setEnabled(False)
         self.btn_gdrive.setStyleSheet("background-color: #34a853; color: white; padding: 12px; font-weight: bold;")
 
-        # --- CAMBIO IMPORTANTE: Mostrar siempre el botón de cambiar carpeta ---
-        # Así, si el usuario cancela el diálogo de selección, puede volver a abrirlo.
         self.btn_change_folder.setVisible(True)
-        # ----------------------------------------------------------------------
 
         # Inicializar el Manager real para usar la API
         try:
             self.drive_manager = DriveManager()
-            self.drive_manager.authenticate() # Ya tiene el token, será rápido
+            self.drive_manager.authenticate()
 
             # Verificar si ya tenemos carpeta configurada
             folder_id = config_manager.get_drive_folder_id()
 
             if folder_id:
                 self._set_status(f"Escaneando carpeta guardada...")
-                # Iniciamos escaneo en hilo aparte o directo
-                threading.Thread(target=self._scan_drive_content, args=(folder_id,), daemon=True).start()
+
+                # --- CORRECCIÓN CRÍTICA: LLAMADA DIRECTA (NO THREADING) ---
+                # _scan_drive_content YA gestiona sus propios hilos internamente.
+                # Al llamarla directo, permitimos que _load_drive_from_db pinte la UI sin crashear.
+                self._scan_drive_content(folder_id)
+                # ----------------------------------------------------------
             else:
-                # Si no hay carpeta, pedimos al usuario que elija
                 self._select_drive_folder()
 
         except Exception as e:
@@ -4199,9 +4200,7 @@ class VisageVaultApp(QMainWindow):
 
     def _select_drive_folder(self):
         """Abre el navegador de carpetas de Drive."""
-        # No listamos aquí, dejamos que el diálogo lo haga
         try:
-            # Pasamos el gestor completo al diálogo
             dialog = DriveFolderDialog(self.drive_manager, self)
             result = dialog.exec()
 
@@ -4216,8 +4215,9 @@ class VisageVaultApp(QMainWindow):
 
                 self._set_status(f"Escaneando carpeta: {folder_name}...")
 
-                # Iniciar escaneo
-                threading.Thread(target=self._scan_drive_content, args=(folder_id,), daemon=True).start()
+                # --- CORRECCIÓN CRÍTICA: LLAMADA DIRECTA ---
+                self._scan_drive_content(folder_id)
+                # -------------------------------------------
 
             dialog.deleteLater()
 
@@ -4225,28 +4225,77 @@ class VisageVaultApp(QMainWindow):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Error", f"Error al abrir navegador de Drive: {e}")
 
+    def _load_drive_from_db(self):
+        """Carga las fotos de Drive desde la BD local (Carga Instantánea)."""
+        self._set_status("Cargando caché de Drive...")
+
+        db_photos = self.db.get_all_drive_photos()
+        if not db_photos:
+            return
+
+        # Convertir formato de BD (snake_case) a formato Drive (camelCase) para reutilizar código
+        formatted_photos = []
+        for row in db_photos:
+            formatted_photos.append({
+                'id': row['id'],
+                'name': row['name'],
+                'createdTime': row['created_time'],
+                'mimeType': row['mime_type'],
+                'thumbnailLink': row['thumbnail_link'],
+                'webContentLink': row['web_content_link']
+            })
+
+        # Reutilizamos la lógica de clasificación
+        self.drive_photos_by_date = {} # Reiniciar memoria
+        self.cloud_photo_count = 0
+
+        # Usamos una versión interna de _add_drive_items que NO guarda en BD (para no buclear)
+        self._classify_drive_items_in_memory(formatted_photos)
+
+        # Pintar inmediatamente
+        self._display_cloud_photos()
+        self._set_status(f"Cargadas {self.cloud_photo_count} fotos desde caché.")
+
+    def _classify_drive_items_in_memory(self, items):
+        """Clasifica en el diccionario de fechas sin tocar la BD."""
+        for f in items:
+            created_time = f.get('createdTime', '')
+            year = "Sin Fecha"
+            month = "00"
+            if created_time:
+                try:
+                    dt = datetime.datetime.strptime(created_time[:10], "%Y-%m-%d")
+                    year = str(dt.year)
+                    month = f"{dt.month:02d}"
+                except: pass
+
+            if year not in self.drive_photos_by_date:
+                self.drive_photos_by_date[year] = {}
+            if month not in self.drive_photos_by_date[year]:
+                self.drive_photos_by_date[year][month] = []
+
+            self.drive_photos_by_date[year][month].append(f)
+            self.cloud_photo_count += 1
+
     def _scan_drive_content(self, folder_id):
-        """Inicia el escaneo de Drive."""
+        """Inicia el escaneo de Drive (Carga BD + Sincronización)."""
 
-        # Limpiar datos de memoria y reiniciar contador
-        self.drive_photos_by_date = {}
-        self.cloud_photo_count = 0  # <--- NUEVO: Contador para la barra de estado
+        # 1. CARGA INSTANTÁNEA: Si tenemos datos, los mostramos YA.
+        self._load_drive_from_db()
 
-        self._set_status("Conectando con la nube...")
+        self._set_status("Sincronizando cambios con la nube...")
 
-        # Configurar Hilo y Worker (Igual que antes)
+        # 2. Configurar Hilo de Escaneo (Igual que antes)
         self.drive_scan_thread = QThread()
         self.drive_scan_worker = DriveScanWorker(folder_id)
         self.drive_scan_worker.moveToThread(self.drive_scan_thread)
 
         self.drive_scan_thread.started.connect(self.drive_scan_worker.run)
-        self.drive_scan_worker.items_found.connect(self._add_drive_items)
+        self.drive_scan_worker.items_found.connect(self._add_drive_items) # Este guardará en BD
         self.drive_scan_worker.progress.connect(self._set_status)
-
-        # --- CAMBIO IMPORTANTE: Pintar SOLO cuando termine ---
         self.drive_scan_worker.finished.connect(self._on_drive_scan_finished)
-        # ---------------------------------------------------
 
+        # Limpieza
         self.drive_scan_worker.finished.connect(self.drive_scan_thread.quit)
         self.drive_scan_worker.finished.connect(self.drive_scan_worker.deleteLater)
         self.drive_scan_thread.finished.connect(self.drive_scan_thread.deleteLater)
@@ -4276,43 +4325,23 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(list)
     def _add_drive_items(self, items):
-        """
-        Acumula las fotos en memoria PERO NO REFRESCA LA PANTALLA
-        para evitar el parpadeo constante.
-        """
-        count_new = 0
+        """Recibe fotos nuevas del escáner, las guarda en BD y actualiza la vista."""
 
-        # 1. Clasificar en memoria
-        for f in items:
-            created_time = f.get('createdTime', '')
-            year = "Sin Fecha"
-            month = "00"
+        # 1. GUARDAR EN BASE DE DATOS (Persistencia)
+        try:
+            self.db.bulk_upsert_drive_photos(items)
+        except Exception as e:
+            print(f"Error guardando en BD Drive: {e}")
 
-            if created_time:
-                try:
-                    # Drive devuelve ISO formato: 2023-05-12T...
-                    dt = datetime.datetime.strptime(created_time[:10], "%Y-%m-%d")
-                    year = str(dt.year)
-                    month = f"{dt.month:02d}"
-                except:
-                    pass
+        # 2. Actualizar memoria y UI
+        # Usamos la función auxiliar que creamos antes para no repetir código
+        self._classify_drive_items_in_memory(items)
 
-            if year not in self.drive_photos_by_date:
-                self.drive_photos_by_date[year] = {}
-            if month not in self.drive_photos_by_date[year]:
-                self.drive_photos_by_date[year][month] = []
-
-            self.drive_photos_by_date[year][month].append(f)
-            count_new += 1
-
-        # 2. Actualizar solo el TEXTO de estado (mucho más rápido)
-        self.cloud_photo_count += count_new
-        self._set_status(f"Analizando nube... {self.cloud_photo_count} fotos encontradas.")
-
-        # ¡IMPORTANTE! NO llamamos a self._display_cloud_photos() aquí.
+        # Solo actualizamos el texto, no repintamos todo para no parpadear
+        self._set_status(f"Sincronizando... {self.cloud_photo_count} fotos procesadas.")
 
     def _display_cloud_photos(self):
-        """Dibuja la interfaz de Nube agrupada por fechas."""
+        """Dibuja la interfaz de Nube idéntica a la de Fotos (Estilo Nativo)."""
 
         # Limpiar layout anterior
         while self.cloud_container_layout.count() > 0:
@@ -4322,18 +4351,16 @@ class VisageVaultApp(QMainWindow):
         self.cloud_date_tree.clear()
         self.cloud_group_widgets = {}
 
-        # Ordenar años descendente (2025, 2024...)
         sorted_years = sorted(self.drive_photos_by_date.keys(), reverse=True)
 
         for year in sorted_years:
-            # Item del Árbol
             year_item = QTreeWidgetItem(self.cloud_date_tree, [str(year)])
 
-            # Etiqueta del Año en el Scroll
             year_label = QLabel(f"Año {year}")
-            year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; color: #3daee9;")
-            self.cloud_container_layout.addWidget(year_label)
-            self.cloud_group_widgets[str(year)] = year_label
+            year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
+
+            # Lista temporal para widgets del año
+            widgets_added_for_year = [year_label]
 
             sorted_months = sorted(self.drive_photos_by_date[year].keys(), reverse=True)
 
@@ -4341,42 +4368,49 @@ class VisageVaultApp(QMainWindow):
                 photos = self.drive_photos_by_date[year][month]
                 if not photos: continue
 
-                # Nombre del mes
                 try:
                     month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
                 except:
                     month_name = "Desconocido" if month == "00" else month
 
-                # Item del mes en el árbol
                 month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(photos)})"])
                 month_item.setData(0, Qt.UserRole, f"{year}-{month}")
 
-                # Etiqueta del Mes
                 month_label = QLabel(month_name)
                 month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
-                self.cloud_container_layout.addWidget(month_label)
+                widgets_added_for_year.append(month_label)
                 self.cloud_group_widgets[f"{year}-{month}"] = month_label
 
-                # --- LISTA DE FOTOS (PreviewListWidget) ---
+                # --- LISTA DE FOTOS (Configuración IDÉNTICA a _display_photos) ---
                 list_widget = PreviewListWidget()
-                list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
                 list_widget.setMovement(QListWidget.Static)
+                list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+                # Mismo espaciado que en local para consistencia
+                list_widget.setSpacing(20)
+
+                # Configuración visual
                 list_widget.setViewMode(QListWidget.IconMode)
                 list_widget.setResizeMode(QListWidget.Adjust)
-                list_widget.setIconSize(QSize(128, 128))
-                list_widget.setSpacing(10)
-                list_widget.setFrameShape(QFrame.NoFrame) # Queda más limpio
+                list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                list_widget.setFrameShape(QFrame.NoFrame)
 
-                # CONEXIONES CRÍTICAS
+                # --- QUITAMOS EL setStyleSheet ---
+                # Al quitarlo, usará el tema de tu sistema (Turquesa) y se verá igual que la otra pestaña.
+
                 list_widget.previewRequested.connect(self._on_drive_preview_requested)
-                # Nota: Para doble clic usamos la misma señal previewRequested
 
-                # Añadir fotos a la lista
+                # Tamaño de icono y celda
+                icon_size = 128 # O self.current_thumbnail_size si quieres zoom también aquí
+                list_widget.setIconSize(QSize(icon_size, icon_size))
+
+                item_w = icon_size + 8
+                item_h = icon_size + 8
+
                 for f in photos:
                     item = QListWidgetItem("Cargando...")
                     item.setToolTip(f['name'])
 
-                    # Datos seguros para evitar crash
                     safe_data = {
                         'id': str(f['id']),
                         'name': str(f['name']),
@@ -4385,21 +4419,38 @@ class VisageVaultApp(QMainWindow):
                         'webContentLink': f.get('webContentLink','')
                     }
                     item.setData(Qt.UserRole, safe_data)
-                    item.setData(Qt.UserRole + 1, "not_loaded") # Estado para lazy load
+                    item.setData(Qt.UserRole + 1, "not_loaded")
                     item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
+
+                    # Esto asegura que la celda mida lo justo y necesario
+                    item.setSizeHint(QSize(item_w, item_h))
 
                     list_widget.addItem(item)
 
-                # Calcular altura para que no tenga scroll interno
-                list_widget.setFixedHeight(self._calculate_list_height(len(photos), 128, self.cloud_scroll_area.viewport().width()))
+                # --- CÁLCULO DE ALTURA ---
+                viewport_width = self.cloud_scroll_area.viewport().width() - 30
+                thumb_total_width = item_w + list_widget.spacing()
 
-                self.cloud_container_layout.addWidget(list_widget)
+                num_cols = max(1, viewport_width // thumb_total_width)
+                rows = (len(photos) + num_cols - 1) // num_cols
+
+                total_height = (rows * item_h) + (rows * list_widget.spacing())
+
+                list_widget.setFixedHeight(total_height)
+
+                widgets_added_for_year.append(list_widget)
+
+            # Añadir al layout principal
+            self.cloud_container_layout.addWidget(year_label)
+            self.cloud_group_widgets[str(year)] = year_label
+
+            for i, w in enumerate(widgets_added_for_year):
+                if i == 0: continue
+                self.cloud_container_layout.addWidget(w)
 
             year_item.setExpanded(True)
 
         self.cloud_container_layout.addStretch(1)
-
-        # Cargar miniaturas iniciales
         QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)

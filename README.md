@@ -1,6 +1,3 @@
-
-
-````markdown
 <p align="center">
   <img src="https://github.com/danitxu79/visagevault/raw/master/visagevault.png" alt="Logo de VisageVault">
 </p>
@@ -81,7 +78,7 @@ La librería `face_recognition` y `rawpy` requieren herramientas de compilación
   ```
 * **Mac:** Xcode command line tools.
 
-----
+---
 
 ### Librerías Python
 
@@ -97,14 +94,14 @@ Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clav
   * **Google API Client** (NUEVO: `google-api-python-client`, `google-auth-oauthlib`)
   * `numpy`, `Pillow`, `requests`
 
------
+---
 
 ## 🚀 Instalación
 
 1.  **Clonar el repositorio:**
 
     ```bash
-    git clone [https://github.com/danitxu79/visagevault.git](https://github.com/danitxu79/visagevault.git)
+    git clone https://github.com/danitxu79/visagevault.git
     cd visagevault
     ```
 
@@ -124,7 +121,7 @@ Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clav
     python visagevault.py
     ```
 
------
+---
 
 ## 📖 Guía de Uso Rápida
 
@@ -158,5 +155,3 @@ Selecciona uno o varios elementos y haz clic derecho para acceder a las opciones
 | **Selección Múltiple** | `Ctrl` + `Clic` |
 | **Selección de Rango** | `Shift` + `Clic` |
 | **Selección por Arrastre** | Clic izquierdo y arrastrar sobre el fondo gris |
-
-````

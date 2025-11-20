@@ -2,10 +2,16 @@
 # Python (Entorno, Caché y Tipos)
 # ==================================
 venv/
+env/
 __pycache__/
 *.pyc
 .python-version
 visagevault_cache/
+.visagevault_cache/
+face_cache/
+drive_cache/
+drive_snapshot_cache/
+local_snapshot_cache/
 
 # ==================================
 # Artefactos de Build (PyInstaller)
@@ -18,12 +24,16 @@ dist/
 # Artefactos de Build (AppImage)
 # ==================================
 AppDir/
+
 # Ignora el producto final y las herramientas descargadas
 *.AppImage
 *.json
 *.desktop
 *.zip
 *.tar.gz
+client_secrets.json
+user_token.pickle
+credentials.json
 
 # ==================================
 # Datos de Runtime de VisageVault
