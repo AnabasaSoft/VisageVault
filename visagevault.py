@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.5
+# VERSIÓN: 1.5.1
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -1728,6 +1728,15 @@ class VisageVaultApp(QMainWindow):
         self.face_loading_label = None
         self.current_face_count = 0
 
+        # --- Variables de Nube ---
+        self.drive_photos_by_date = {}
+        self.cloud_group_widgets = {}
+        self.cloud_photo_count = 0
+        self.current_drive_folder_id = None
+        self.drive_scan_thread = None
+        self.drive_scan_worker = None
+        self.drive_loaded_ids = set()
+
         # --- Hilos y Señales ---
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(os.cpu_count() or 4)
@@ -3020,7 +3029,7 @@ class VisageVaultApp(QMainWindow):
     @Slot(str, QPixmap)
     def _update_thumbnail(self, original_path, pixmap):
         # ---------------------------------------------------------
-        # 1. BLOQUE PARA FOTOS
+        # 1. BLOQUE PARA FOTOS LOCALES
         # ---------------------------------------------------------
         if original_path in self.photo_list_widget_items:
             item = self.photo_list_widget_items[original_path]
@@ -3031,7 +3040,7 @@ class VisageVaultApp(QMainWindow):
                 Qt.SmoothTransformation
             )
             item.setIcon(QIcon(scaled_pixmap))
-            item.setSizeHint(scaled_pixmap.size())
+            item.setSizeHint(scaled_pixmap.size()) # <--- Esto ajusta el tamaño en local
             item.setText("")
             item.setData(Qt.UserRole + 1, "loaded")
             return
@@ -3054,32 +3063,36 @@ class VisageVaultApp(QMainWindow):
             return
 
         # ---------------------------------------------------------
-        # 3. BLOQUE PARA DRIVE (ACTUALIZADO PARA MÚLTIPLES LISTAS)
+        # 3. BLOQUE PARA DRIVE (CORREGIDO PARA AJUSTAR TAMAÑO)
         # ---------------------------------------------------------
-        # Buscamos en TODAS las listas que estén dentro de la pestaña Nube
         if self.cloud_scroll_area.widget():
             for list_widget in self.cloud_scroll_area.widget().findChildren(PreviewListWidget):
-                # Optimización: Solo buscar si la lista está visible
                 if not list_widget.isVisible(): continue
 
                 for i in range(list_widget.count()):
                     item = list_widget.item(i)
                     data = item.data(Qt.UserRole)
 
-                    # original_path aquí es el FILE ID de Google
                     if data and data.get('id') == original_path:
+                        # Escalamos manteniendo aspecto
                         scaled = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         item.setIcon(QIcon(scaled))
+
+                        # --- ¡ESTA ES LA LÍNEA QUE FALTABA! ---
+                        # Ajusta la celda al tamaño real de la imagen (ej: 128x90)
+                        # eliminando el espacio vacío sobrante.
+                        item.setSizeHint(scaled.size())
+                        # --------------------------------------
+
                         item.setText("")
                         item.setData(Qt.UserRole + 1, "loaded")
-                        return # Encontrado, salimos
+                        return
 
         # ---------------------------------------------------------
         # 4. BLOQUE PARA PERSONAS
         # ---------------------------------------------------------
         def update_in_container(container_widget):
-            if not container_widget:
-                return
+            if not container_widget: return
             for label in container_widget.findChildren(ZoomableClickableLabel):
                 if label.property("original_path") == original_path and label.property("loaded") is not True:
                     label.setPixmap(pixmap.scaled(THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -4208,16 +4221,30 @@ class VisageVaultApp(QMainWindow):
                 folder_id = dialog.selected_folder_id
                 folder_name = dialog.selected_folder_name
 
+                # 1. PARADA TOTAL: Frenar descargas antiguas
+                self._stop_cloud_operations()
+
+                # 2. LIMPIEZA VISUAL Y DE MEMORIA
+                self.drive_photos_by_date = {}
+                self.cloud_photo_count = 0
+                self.cloud_date_tree.clear()
+                # Limpiar widgets de fotos anteriores
+                while self.cloud_container_layout.count() > 0:
+                    item = self.cloud_container_layout.takeAt(0)
+                    if item.widget(): item.widget().deleteLater()
+
+                # Añadir un loading visual temporal
+                self.cloud_container_layout.addWidget(QLabel("Cargando nueva carpeta..."))
+
                 # Guardar configuración
                 config_manager.set_drive_folder_id(folder_id)
                 self.btn_change_folder.setVisible(True)
                 self.btn_change_folder.setText(f"Carpeta: {folder_name} (Cambiar)")
 
-                self._set_status(f"Escaneando carpeta: {folder_name}...")
+                self._set_status(f"Cambiando a carpeta: {folder_name}...")
 
-                # --- CORRECCIÓN CRÍTICA: LLAMADA DIRECTA ---
+                # 3. INICIAR NUEVO ESCANEO
                 self._scan_drive_content(folder_id)
-                # -------------------------------------------
 
             dialog.deleteLater()
 
@@ -4225,15 +4252,20 @@ class VisageVaultApp(QMainWindow):
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Error", f"Error al abrir navegador de Drive: {e}")
 
-    def _load_drive_from_db(self):
-        """Carga las fotos de Drive desde la BD local (Carga Instantánea)."""
-        self._set_status("Cargando caché de Drive...")
+    def _load_drive_from_db(self, root_folder_id):
+        """Carga solo las fotos que pertenecen a la carpeta seleccionada."""
+        self._set_status("Cargando caché local...")
 
-        db_photos = self.db.get_all_drive_photos()
+        db_photos = self.db.get_all_drive_photos(root_folder_id)
+
         if not db_photos:
+            # Si está vacía, limpiamos todo por si acaso
+            self.drive_photos_by_date = {}
+            self.drive_loaded_ids = set() # <--- LIMPIEZA
+            self.cloud_photo_count = 0
+            self._display_cloud_photos() # Limpia la pantalla
             return
 
-        # Convertir formato de BD (snake_case) a formato Drive (camelCase) para reutilizar código
         formatted_photos = []
         for row in db_photos:
             formatted_photos.append({
@@ -4245,20 +4277,27 @@ class VisageVaultApp(QMainWindow):
                 'webContentLink': row['web_content_link']
             })
 
-        # Reutilizamos la lógica de clasificación
-        self.drive_photos_by_date = {} # Reiniciar memoria
+        self.drive_photos_by_date = {}
+        self.drive_loaded_ids = set() # <--- LIMPIEZA ANTES DE RELLENAR
         self.cloud_photo_count = 0
 
-        # Usamos una versión interna de _add_drive_items que NO guarda en BD (para no buclear)
         self._classify_drive_items_in_memory(formatted_photos)
-
-        # Pintar inmediatamente
         self._display_cloud_photos()
-        self._set_status(f"Cargadas {self.cloud_photo_count} fotos desde caché.")
+        self._set_status(f"Caché cargado: {self.cloud_photo_count} fotos.")
 
     def _classify_drive_items_in_memory(self, items):
-        """Clasifica en el diccionario de fechas sin tocar la BD."""
+        """Clasifica en el diccionario de fechas EVITANDO DUPLICADOS."""
         for f in items:
+            file_id = f.get('id')
+
+            # --- FILTRO ANTI-DUPLICADOS ---
+            if file_id in self.drive_loaded_ids:
+                continue # ¡Ya tenemos esta foto! La saltamos.
+
+            # Si es nueva, la registramos
+            self.drive_loaded_ids.add(file_id)
+            # ------------------------------
+
             created_time = f.get('createdTime', '')
             year = "Sin Fecha"
             month = "00"
@@ -4278,20 +4317,23 @@ class VisageVaultApp(QMainWindow):
             self.cloud_photo_count += 1
 
     def _scan_drive_content(self, folder_id):
-        """Inicia el escaneo de Drive (Carga BD + Sincronización)."""
+        """Inicia el escaneo de Drive (Carga BD Filtrada + Sincronización)."""
 
-        # 1. CARGA INSTANTÁNEA: Si tenemos datos, los mostramos YA.
-        self._load_drive_from_db()
+        # Guardamos cuál es la carpeta raíz actual
+        self.current_drive_folder_id = folder_id
+
+        # 1. CARGA INSTANTÁNEA (SOLO DE ESTA CARPETA)
+        self._load_drive_from_db(folder_id)
 
         self._set_status("Sincronizando cambios con la nube...")
 
-        # 2. Configurar Hilo de Escaneo (Igual que antes)
+        # 2. Configurar Hilo
         self.drive_scan_thread = QThread()
-        self.drive_scan_worker = DriveScanWorker(folder_id)
+        self.drive_scan_worker = DriveScanWorker(folder_id) # Sin parent
         self.drive_scan_worker.moveToThread(self.drive_scan_thread)
 
         self.drive_scan_thread.started.connect(self.drive_scan_worker.run)
-        self.drive_scan_worker.items_found.connect(self._add_drive_items) # Este guardará en BD
+        self.drive_scan_worker.items_found.connect(self._add_drive_items)
         self.drive_scan_worker.progress.connect(self._set_status)
         self.drive_scan_worker.finished.connect(self._on_drive_scan_finished)
 
@@ -4325,23 +4367,18 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(list)
     def _add_drive_items(self, items):
-        """Recibe fotos nuevas del escáner, las guarda en BD y actualiza la vista."""
-
-        # 1. GUARDAR EN BASE DE DATOS (Persistencia)
+        """Guarda fotos nuevas vinculándolas a la carpeta actual."""
         try:
-            self.db.bulk_upsert_drive_photos(items)
+            # Pasamos el ID de la carpeta actual para que se guarde en la BD
+            self.db.bulk_upsert_drive_photos(items, root_folder_id=self.current_drive_folder_id)
         except Exception as e:
             print(f"Error guardando en BD Drive: {e}")
 
-        # 2. Actualizar memoria y UI
-        # Usamos la función auxiliar que creamos antes para no repetir código
         self._classify_drive_items_in_memory(items)
-
-        # Solo actualizamos el texto, no repintamos todo para no parpadear
         self._set_status(f"Sincronizando... {self.cloud_photo_count} fotos procesadas.")
 
     def _display_cloud_photos(self):
-        """Dibuja la interfaz de Nube idéntica a la de Fotos (Estilo Nativo)."""
+        """Dibuja la interfaz de Nube EXACTAMENTE igual que Fotos (Estilo nativo)."""
 
         # Limpiar layout anterior
         while self.cloud_container_layout.count() > 0:
@@ -4359,8 +4396,8 @@ class VisageVaultApp(QMainWindow):
             year_label = QLabel(f"Año {year}")
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
 
-            # Lista temporal para widgets del año
-            widgets_added_for_year = [year_label]
+            widgets_to_add_for_year = [year_label]
+            self.cloud_group_widgets[str(year)] = year_label
 
             sorted_months = sorted(self.drive_photos_by_date[year].keys(), reverse=True)
 
@@ -4371,41 +4408,37 @@ class VisageVaultApp(QMainWindow):
                 try:
                     month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
                 except:
-                    month_name = "Desconocido" if month == "00" else month
+                    month_name = "Desconocido"
 
                 month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(photos)})"])
                 month_item.setData(0, Qt.UserRole, f"{year}-{month}")
 
                 month_label = QLabel(month_name)
                 month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
-                widgets_added_for_year.append(month_label)
+                widgets_to_add_for_year.append(month_label)
                 self.cloud_group_widgets[f"{year}-{month}"] = month_label
 
                 # --- LISTA DE FOTOS (Configuración IDÉNTICA a _display_photos) ---
                 list_widget = PreviewListWidget()
                 list_widget.setMovement(QListWidget.Static)
                 list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-                # Mismo espaciado que en local para consistencia
-                list_widget.setSpacing(20)
+                list_widget.setSpacing(20) # Mismo espaciado que Fotos
 
-                # Configuración visual
+                # Configuración visual: SIN CSS MANUAL para usar el tema del sistema
                 list_widget.setViewMode(QListWidget.IconMode)
-                list_widget.setResizeMode(QListWidget.Adjust)
+                list_widget.setResizeMode(QListWidget.Adjust) # Adjust permite redimensionar celdas
                 list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 list_widget.setFrameShape(QFrame.NoFrame)
 
-                # --- QUITAMOS EL setStyleSheet ---
-                # Al quitarlo, usará el tema de tu sistema (Turquesa) y se verá igual que la otra pestaña.
-
                 list_widget.previewRequested.connect(self._on_drive_preview_requested)
 
-                # Tamaño de icono y celda
-                icon_size = 128 # O self.current_thumbnail_size si quieres zoom también aquí
+                # Usamos 128px de base
+                icon_size = 128
                 list_widget.setIconSize(QSize(icon_size, icon_size))
 
-                item_w = icon_size + 8
-                item_h = icon_size + 8
+                # Tamaño inicial cuadrado (mientras carga)
+                item_dim = icon_size + 8
 
                 for f in photos:
                     item = QListWidgetItem("Cargando...")
@@ -4422,30 +4455,22 @@ class VisageVaultApp(QMainWindow):
                     item.setData(Qt.UserRole + 1, "not_loaded")
                     item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
 
-                    # Esto asegura que la celda mida lo justo y necesario
-                    item.setSizeHint(QSize(item_w, item_h))
+                    # Tamaño inicial (se ajustará luego en _update_thumbnail)
+                    item.setSizeHint(QSize(item_dim, item_dim))
 
                     list_widget.addItem(item)
 
-                # --- CÁLCULO DE ALTURA ---
+                # Cálculo de altura para el ScrollArea
                 viewport_width = self.cloud_scroll_area.viewport().width() - 30
-                thumb_total_width = item_w + list_widget.spacing()
-
+                thumb_total_width = item_dim + list_widget.spacing()
                 num_cols = max(1, viewport_width // thumb_total_width)
                 rows = (len(photos) + num_cols - 1) // num_cols
-
-                total_height = (rows * item_h) + (rows * list_widget.spacing())
+                total_height = (rows * item_dim) + (rows * list_widget.spacing()) + 20
 
                 list_widget.setFixedHeight(total_height)
+                widgets_to_add_for_year.append(list_widget)
 
-                widgets_added_for_year.append(list_widget)
-
-            # Añadir al layout principal
-            self.cloud_container_layout.addWidget(year_label)
-            self.cloud_group_widgets[str(year)] = year_label
-
-            for i, w in enumerate(widgets_added_for_year):
-                if i == 0: continue
+            for w in widgets_to_add_for_year:
                 self.cloud_container_layout.addWidget(w)
 
             year_item.setExpanded(True)
@@ -4543,6 +4568,37 @@ class VisageVaultApp(QMainWindow):
                             # Usamos el NetworkThumbnailLoader
                             worker = NetworkThumbnailLoader(thumb_link, file_id, self.thumb_signals)
                             self.threadpool.start(worker)
+
+    def _stop_cloud_operations(self):
+        """Detiene de forma SEGURA cualquier descarga o escaneo."""
+        self._set_status("Deteniendo operaciones actuales...")
+
+        # 1. Vaciar cola de descargas de miniaturas
+        self.threadpool.clear()
+
+        # 2. Detener escáner de carpetas si existe
+        if self.drive_scan_thread:
+            try:
+                # Intentamos acceder al objeto. Si ya fue borrado por C++,
+                # esto lanzará un RuntimeError que capturamos abajo.
+                if self.drive_scan_thread.isRunning():
+
+                    if self.drive_scan_worker:
+                        try:
+                            self.drive_scan_worker.is_running = False
+                            # Desconectar señales para evitar actualizaciones fantasma
+                            self.drive_scan_worker.items_found.disconnect()
+                        except Exception:
+                            pass # Ya estaba desconectado o borrado
+
+                    self.drive_scan_thread.quit()
+                    self.drive_scan_thread.wait(1000)
+
+            except RuntimeError:
+                # El objeto C++ ya fue borrado (deleteLater), pero la variable Python seguía ahí.
+                # No pasa nada, simplemente lo ignoramos.
+                print("Aviso: El hilo anterior ya estaba eliminado.")
+                self.drive_scan_thread = None
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""

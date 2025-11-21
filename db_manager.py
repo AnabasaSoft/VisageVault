@@ -92,11 +92,11 @@ class VisageVaultDB:
     def _check_migrations(self):
         """
         Verifica si la base de datos existente necesita actualizaciones de estructura
-        (por ejemplo, si el usuario viene de una versión anterior sin 'is_hidden').
+        (por ejemplo, si el usuario viene de una versión anterior).
         """
         try:
             with self.conn:
-                # --- Migración FOTOS ---
+                # --- Migración FOTOS (Añadir is_hidden) ---
                 cursor = self.conn.execute("PRAGMA table_info(photos)")
                 columns_photos = [col['name'] for col in cursor.fetchall()]
 
@@ -104,13 +104,25 @@ class VisageVaultDB:
                     print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a photos.")
                     self.conn.execute("ALTER TABLE photos ADD COLUMN is_hidden INTEGER DEFAULT 0")
 
-                # --- Migración VÍDEOS ---
+                # --- Migración VÍDEOS (Añadir is_hidden) ---
                 cursor = self.conn.execute("PRAGMA table_info(videos)")
                 columns_videos = [col['name'] for col in cursor.fetchall()]
 
                 if 'is_hidden' not in columns_videos:
                     print("INFO: Migrando base de datos... Añadiendo columna 'is_hidden' a videos.")
                     self.conn.execute("ALTER TABLE videos ADD COLUMN is_hidden INTEGER DEFAULT 0")
+
+                # --- Migración DRIVE (Añadir root_folder_id) ---
+                # Primero verificamos si la tabla drive_photos existe (puede que sea una instalación nueva)
+                cursor = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='drive_photos'")
+                if cursor.fetchone():
+                    cursor = self.conn.execute("PRAGMA table_info(drive_photos)")
+                    columns_drive = [col['name'] for col in cursor.fetchall()]
+
+                    if 'root_folder_id' not in columns_drive:
+                        print("INFO: Migrando BD Drive... Añadiendo columna 'root_folder_id' a drive_photos.")
+                        self.conn.execute("ALTER TABLE drive_photos ADD COLUMN root_folder_id TEXT")
+
         except Exception as e:
             print(f"ERROR en migraciones de BD: {e}")
 
@@ -358,38 +370,43 @@ class VisageVaultDB:
         """, (person_id,))
         return cursor.fetchall()
 
-    def get_all_drive_photos(self):
-        """Recupera todas las fotos de Drive guardadas para carga instantánea."""
-        cursor = self.conn.execute("SELECT * FROM drive_photos")
-        # Convertimos a lista de dicts para que sea compatible con el resto del código
+    def get_all_drive_photos(self, root_folder_id=None):
+        """Recupera fotos de Drive, opcionalmente filtradas por carpeta raíz."""
+        if root_folder_id:
+            # Si nos pasan un ID, filtramos solo las fotos de esa carpeta
+            cursor = self.conn.execute("SELECT * FROM drive_photos WHERE root_folder_id = ?", (root_folder_id,))
+        else:
+            # Si no (comportamiento antiguo), devolvemos todo
+            cursor = self.conn.execute("SELECT * FROM drive_photos")
+
         return [dict(row) for row in cursor.fetchall()]
 
-    def bulk_upsert_drive_photos(self, photos_list):
-        """Guarda o actualiza fotos de Drive masivamente."""
+    def bulk_upsert_drive_photos(self, photos_list, root_folder_id=None):
+        """Guarda fotos de Drive vinculadas a una carpeta raíz."""
         if not photos_list: return
 
-        # Preparamos los datos para SQLite
         data_to_insert = []
         for p in photos_list:
-            # Extraer parent_id si existe (Drive lo da como lista)
+            # Extraer padre (Drive lo da como lista, cogemos el primero o string vacío)
             parent = p.get('parents', [''])[0] if p.get('parents') else ''
 
             data_to_insert.append((
                 p.get('id'),
                 p.get('name'),
-                p.get('createdTime'), # Ojo: Drive usa 'createdTime'
+                p.get('createdTime'),
                 p.get('mimeType'),
                 p.get('thumbnailLink'),
                 p.get('webContentLink'),
-                parent
+                parent,
+                root_folder_id # <--- Guardamos el ID de la carpeta origen
             ))
 
         with self.conn:
             self.conn.executemany("""
-                INSERT INTO drive_photos (id, name, created_time, mime_type, thumbnail_link, web_content_link, parent_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO drive_photos (id, name, created_time, mime_type, thumbnail_link, web_content_link, parent_id, root_folder_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 thumbnail_link=excluded.thumbnail_link,
-                web_content_link=excluded.web_content_link
+                root_folder_id=excluded.root_folder_id
             """, data_to_insert)
