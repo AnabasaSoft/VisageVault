@@ -180,13 +180,14 @@ class DriveManager:
             status, done = downloader.next_chunk()
 
     def list_images_recursively(self, folder_id):
-        """Generador recursivo con trazas de depuración."""
+        """
+        Generador recursivo que busca imágenes en todas las subcarpetas.
+        INCLUYE UN FRENO (time.sleep) para evitar bloquear la interfaz por exceso de velocidad.
+        """
         if not self.service:
             self.authenticate()
 
-        # print(f"🔍 Escaneando carpeta ID: {folder_id}...")
-
-        # 1. BUSCAR IMÁGENES AQUÍ
+        # --- PARTE 1: BUSCAR IMÁGENES EN LA CARPETA ACTUAL ---
         page_token = None
         while True:
             query = f"'{folder_id}' in parents and mimeType contains 'image/' and trashed = false"
@@ -203,17 +204,16 @@ class DriveManager:
 
             files = results.get('files', [])
             if files:
-                # print(f"   📸 Encontradas {len(files)} imágenes en esta carpeta.")
+                # Devuelve este lote de imágenes al Worker para que las guarde
                 yield files
 
             page_token = results.get('nextPageToken')
             if not page_token:
                 break
 
-        # 2. BUSCAR SUBCARPETAS (Para entrar en ellas)
+        # --- PARTE 2: BUSCAR SUBCARPETAS (RECURSIÓN) ---
         page_token = None
         while True:
-            # Buscamos carpetas normales
             query = f"'{folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             try:
                 results = self.service.files().list(
@@ -227,11 +227,19 @@ class DriveManager:
                 break
 
             subfolders = results.get('files', [])
+
+            # === AQUÍ ESTÁ EL FRENO DE EMERGENCIA ===
             if subfolders:
-                print(f"   📂 Encontradas {len(subfolders)} subcarpetas. Entrando...")
+                # Importamos time aquí por seguridad si no está arriba
+                import time
+
+                # Pequeña pausa (0.1 segundos) antes de procesar las subcarpetas.
+                # Esto evita que el script entre en 100 carpetas por segundo y sature la CPU.
+                time.sleep(0.1)
+            # ========================================
 
             for sub in subfolders:
-                # Recursión: Entramos en la subcarpeta
+                # Llamada recursiva: Entramos en la subcarpeta
                 yield from self.list_images_recursively(sub['id'])
 
             page_token = results.get('nextPageToken')

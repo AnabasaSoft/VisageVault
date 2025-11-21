@@ -23,6 +23,11 @@ class VisageVaultDB:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # Permite acceder a columnas por nombre
 
+        # --- OPTIMIZACIÓN CLAVE: WAL MODE ---
+        # Permite lecturas y escrituras concurrentes sin bloqueo total
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;") # Un poco menos seguro ante cortes de luz, pero mucho más rápido
+
         # Solo el hilo principal debe gestionar la estructura de la BD
         if not is_worker:
             self._create_tables()

@@ -31,6 +31,7 @@ import datetime
 import locale
 import warnings
 import sqlite3
+import time
 
 import threading # Necesario para evitar que la UI se congele
 from drive_auth import DriveAuthenticator
@@ -431,43 +432,208 @@ class DriveLoginWorker(QObject):
             self.finished.emit()
 
 class DriveScanWorker(QObject):
-    """Worker dedicado a escanear Google Drive y enviar resultados a la UI."""
-    items_found = Signal(list)
+    """
+    Worker 'Silencioso' y Optimizado.
+    1. Escanea Drive.
+    2. Guarda en DB localmente (WAL mode).
+    3. Solo avisa del progreso numérico para no congelar la UI.
+    """
     progress = Signal(str)
     finished = Signal(int)
 
-    def __init__(self, folder_id):
+    def __init__(self, folder_id, db_path):
         super().__init__()
         self.folder_id = folder_id
+        self.db_path = db_path
         self.is_running = True
 
     @Slot()
     def run(self):
-        # Instanciamos DriveManager AQUÍ, dentro del hilo, para que sus sockets sean locales al hilo.
-        # Si lo creamos fuera y lo usamos aquí, falla.
+        # --- CONFIGURACIÓN DE LA CONEXIÓN DB ---
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
+        # 1. Corrección para evitar bloqueos
+        local_db.conn.execute("PRAGMA journal_mode=WAL;")
+        # 2. Corrección para evitar errores de tuplas vs diccionarios
+        local_db.conn.row_factory = sqlite3.Row
+
         try:
             from drive_manager import DriveManager
-            # IMPORTANTE: No pasarle 'parent' ni nada de Qt
             local_manager = DriveManager()
 
-            # No emitimos logs de Qt aquí, solo señales
-            # self.progress.emit("Iniciando...")
-
             count = 0
-            # Iterar sobre el generador
+            buffer = []
+            BATCH_SIZE = 100
+
+            # Usamos time.time() para controlar la frecuencia de actualización
+            last_update_time = time.time()
+
+            # Llamamos a la función recursiva (asegúrate de haber puesto el time.sleep en drive_manager.py)
             for batch_of_images in local_manager.list_images_recursively(self.folder_id):
                 if not self.is_running:
                     break
 
-                count += len(batch_of_images)
-                self.items_found.emit(batch_of_images)
-                self.progress.emit(f"Escaneando... {count} fotos encontradas.")
+                buffer.extend(batch_of_images)
 
+                if len(buffer) >= BATCH_SIZE:
+                    self._save_to_db(local_db, buffer)
+                    count += len(buffer)
+                    buffer = []
+
+                    # Actualizar UI solo cada 1 segundo para evitar congelamiento
+                    if time.time() - last_update_time > 1.0:
+                        self.progress.emit(f"Indexando nube... {count} fotos guardadas.")
+                        last_update_time = time.time()
+
+                    # Pequeña pausa para ceder CPU
+                    time.sleep(0.05)
+
+            # Guardar lo restante al final
+            if buffer:
+                self._save_to_db(local_db, buffer)
+                count += len(buffer)
+
+            self.progress.emit(f"Finalizado. Total: {count} fotos.")
             self.finished.emit(count)
 
         except Exception as e:
-            print(f"Error en worker: {e}") # Print seguro a consola
+            print(f"❌ ERROR FATAL EN WORKER DRIVE: {e}")
+            import traceback
+            traceback.print_exc()
             self.finished.emit(0)
+        finally:
+            try: local_db.conn.close()
+            except: pass
+
+    def _save_to_db(self, db_instance, items):
+        """Guarda el lote en la base de datos de forma segura."""
+        try:
+            db_instance.bulk_upsert_drive_photos(items, root_folder_id=self.folder_id)
+        except Exception as e:
+            print(f"Error guardando en DB Drive: {e}")
+
+class FaceScanWorker(QObject):
+    def __init__(self, db_path: str):
+        super().__init__()
+        self.db_path = db_path
+        self.signals = FaceScanSignals()
+        self.is_running = True
+
+    @Slot()
+    def run(self):
+        # Configuración de la DB en el hilo
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
+        # --- CORRECCIÓN CRÍTICA ---
+        local_db.conn.row_factory = sqlite3.Row  # <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
+        # --------------------------
+
+        local_db.conn.execute("PRAGMA journal_mode=WAL;")
+
+        try:
+            self.signals.scan_progress.emit("Buscando fotos sin escanear...")
+
+            # Ahora esto funcionará porque row_factory convierte las tuplas en objetos accesibles por nombre
+            unscanned_photos = local_db.get_unscanned_photos()
+
+            total = len(unscanned_photos)
+            if total == 0:
+                self.signals.scan_progress.emit("No hay fotos nuevas para analizar.")
+                self.signals.scan_percentage.emit(100)
+                self.signals.scan_finished.emit()
+                return
+
+            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
+
+            # Extensiones RAW
+            RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
+
+            for i, row in enumerate(unscanned_photos):
+                if not self.is_running: break
+
+                # AQUÍ DABA EL ERROR ANTES: row['id'] fallaba sin row_factory
+                photo_id = row['id']
+                photo_path = row['filepath']
+
+                # Actualizar barra de progreso con menos frecuencia (cada 5 fotos)
+                if i % 5 == 0:
+                    percentage = (i + 1) * 100 // total
+                    self.signals.scan_percentage.emit(percentage)
+                    self.signals.scan_progress.emit(f"Analizando caras ({i+1}/{total})...")
+                    time.sleep(0.001)
+
+                try:
+                    image = None
+                    file_suffix = Path(photo_path).suffix.lower()
+
+                    # 1. Cargar Imagen (Soporte RAW + Standard)
+                    if file_suffix in RAW_EXTENSIONS:
+                        try:
+                            with rawpy.imread(photo_path) as raw:
+                                image = raw.postprocess()
+                        except Exception:
+                            local_db.mark_photo_as_scanned(photo_id)
+                            continue
+                    else:
+                        image = face_recognition.load_image_file(photo_path)
+
+                    if image is None:
+                        local_db.mark_photo_as_scanned(photo_id)
+                        continue
+
+                    # 2. Optimización: Redimensionar si es gigante
+                    h, w = image.shape[:2]
+                    max_width = 1000
+                    scale_ratio = 1.0
+
+                    if w > max_width:
+                        scale_ratio = max_width / float(w)
+                        new_h = int(h * scale_ratio)
+                        image = cv2.resize(image, (max_width, new_h))
+
+                    # 3. Detectar caras
+                    locations = face_recognition.face_locations(image)
+
+                    if locations:
+                        encodings = face_recognition.face_encodings(image, locations)
+
+                        for loc, enc in zip(locations, encodings):
+                            # Restaurar coordenadas originales si hubo redimensionado
+                            if scale_ratio != 1.0:
+                                top, right, bottom, left = loc
+                                top = int(top / scale_ratio)
+                                right = int(right / scale_ratio)
+                                bottom = int(bottom / scale_ratio)
+                                left = int(left / scale_ratio)
+                                loc = (top, right, bottom, left)
+
+                            location_str = str(loc)
+                            encoding_blob = pickle.dumps(enc)
+
+                            # Guardar cara encontrada
+                            face_db_id = local_db.add_face(photo_id, encoding_blob, location_str)
+                            self.signals.face_found.emit(face_db_id, photo_path, location_str)
+
+                    # Marcar foto como procesada
+                    local_db.mark_photo_as_scanned(photo_id)
+
+                except Exception as e:
+                    print(f"Error procesando caras en {photo_path}: {e}")
+                    local_db.mark_photo_as_scanned(photo_id)
+
+            self.signals.scan_progress.emit("Escaneo de caras finalizado.")
+            self.signals.scan_finished.emit()
+
+        except Exception as e:
+            print(f"Error crítico worker caras: {e}")
+            self.signals.scan_progress.emit(f"Error: {e}")
+            self.signals.scan_finished.emit()
+        finally:
+            local_db.conn.close()
 
 # =================================================================
 # CLASE OPTIMIZADA: CARGA DE CARAS CON CACHÉ DE DISCO
@@ -1460,34 +1626,48 @@ class FaceScanWorker(QObject):
         self.db_path = db_path
         self.signals = FaceScanSignals()
         self.is_running = True
+
     @Slot()
     def run(self):
         local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
         local_db.db_path = self.db_path
         local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
+        # Intentamos poner esto por si acaso, pero usaremos índices numéricos para asegurar
         local_db.conn.row_factory = sqlite3.Row
+        local_db.conn.execute("PRAGMA journal_mode=WAL;")
 
         try:
             self.signals.scan_progress.emit("Buscando fotos sin escanear...")
             unscanned_photos = local_db.get_unscanned_photos()
+
             total = len(unscanned_photos)
             if total == 0:
-                self.signals.scan_progress.emit("No hay fotos nuevas que escanear.")
+                self.signals.scan_progress.emit("No hay fotos nuevas para analizar.")
                 self.signals.scan_percentage.emit(100)
                 self.signals.scan_finished.emit()
                 return
-            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
 
+            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
             RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
 
             for i, row in enumerate(unscanned_photos):
-                if not self.is_running:
-                    break
-                photo_id = row['id']
-                photo_path = row['filepath']
-                self.signals.scan_progress.emit(f"Procesando ({i+1}/{total}): {Path(photo_path).name}")
-                percentage = (i + 1) * 100 // total
-                self.signals.scan_percentage.emit(percentage)
+                if not self.is_running: break
+
+                # --- CAMBIO BLINDADO AQUÍ ---
+                # Usamos índices numéricos. Esto funciona SIEMPRE (tupla o Row)
+                # La consulta SQL es "SELECT id, filepath...", así que:
+                # 0 = id
+                # 1 = filepath
+                photo_id = row[0]
+                photo_path = row[1]
+                # ----------------------------
+
+                if i % 5 == 0:
+                    percentage = (i + 1) * 100 // total
+                    self.signals.scan_percentage.emit(percentage)
+                    self.signals.scan_progress.emit(f"Analizando caras ({i+1}/{total})...")
+                    time.sleep(0.001)
 
                 try:
                     image = None
@@ -1497,8 +1677,7 @@ class FaceScanWorker(QObject):
                         try:
                             with rawpy.imread(photo_path) as raw:
                                 image = raw.postprocess()
-                        except Exception as raw_e:
-                            print(f"Error de Rawpy: {raw_e}")
+                        except Exception:
                             local_db.mark_photo_as_scanned(photo_id)
                             continue
                     else:
@@ -1508,28 +1687,50 @@ class FaceScanWorker(QObject):
                         local_db.mark_photo_as_scanned(photo_id)
                         continue
 
+                    # Redimensionar para velocidad
+                    h, w = image.shape[:2]
+                    max_width = 1000
+                    scale_ratio = 1.0
+                    if w > max_width:
+                        scale_ratio = max_width / float(w)
+                        new_h = int(h * scale_ratio)
+                        image = cv2.resize(image, (max_width, new_h))
+
                     locations = face_recognition.face_locations(image)
-                    if not locations:
-                        local_db.mark_photo_as_scanned(photo_id)
-                        continue
-                    encodings = face_recognition.face_encodings(image, locations)
-                    for loc, enc in zip(locations, encodings):
-                        location_str = str(loc)
-                        encoding_blob = pickle.dumps(enc)
-                        face_id = local_db.add_face(photo_id, encoding_blob, location_str)
-                        self.signals.face_found.emit(face_id, photo_path, location_str)
+
+                    if locations:
+                        encodings = face_recognition.face_encodings(image, locations)
+                        for loc, enc in zip(locations, encodings):
+                            if scale_ratio != 1.0:
+                                top, right, bottom, left = loc
+                                top = int(top / scale_ratio)
+                                right = int(right / scale_ratio)
+                                bottom = int(bottom / scale_ratio)
+                                left = int(left / scale_ratio)
+                                loc = (top, right, bottom, left)
+
+                            location_str = str(loc)
+                            encoding_blob = pickle.dumps(enc)
+                            face_db_id = local_db.add_face(photo_id, encoding_blob, location_str)
+                            self.signals.face_found.emit(face_db_id, photo_path, location_str)
+
                     local_db.mark_photo_as_scanned(photo_id)
+
                 except Exception as e:
                     print(f"Error procesando caras en {photo_path}: {e}")
                     local_db.mark_photo_as_scanned(photo_id)
+
             self.signals.scan_progress.emit("Escaneo de caras finalizado.")
             self.signals.scan_finished.emit()
+
         except Exception as e:
-            print(f"Error crítico en el hilo de escaneo de caras: {e}")
-            self.signals.scan_progress.emit(f"Error: {e}")
+            print(f"Error crítico worker caras: {e}")
+            import traceback
+            traceback.print_exc()
             self.signals.scan_finished.emit()
         finally:
-            local_db.conn.close()
+            try: local_db.conn.close()
+            except: pass
 
 # =================================================================
 # CLASE: DIÁLOGO DE AYUDA Y ACERCA DE
@@ -4317,27 +4518,26 @@ class VisageVaultApp(QMainWindow):
             self.cloud_photo_count += 1
 
     def _scan_drive_content(self, folder_id):
-        """Inicia el escaneo de Drive (Carga BD Filtrada + Sincronización)."""
-
-        # Guardamos cuál es la carpeta raíz actual
+        """Inicia el escaneo de Drive."""
         self.current_drive_folder_id = folder_id
 
-        # 1. CARGA INSTANTÁNEA (SOLO DE ESTA CARPETA)
+        # 1. Carga inicial de lo que ya tengamos (para que no se vea vacío)
         self._load_drive_from_db(folder_id)
 
-        self._set_status("Sincronizando cambios con la nube...")
+        self._set_status("Iniciando indexación en la nube...")
 
-        # 2. Configurar Hilo
         self.drive_scan_thread = QThread()
-        self.drive_scan_worker = DriveScanWorker(folder_id) # Sin parent
+        self.drive_scan_worker = DriveScanWorker(folder_id, self.db.db_path)
         self.drive_scan_worker.moveToThread(self.drive_scan_thread)
 
         self.drive_scan_thread.started.connect(self.drive_scan_worker.run)
-        self.drive_scan_worker.items_found.connect(self._add_drive_items)
+
+        # CAMBIO: Ya no conectamos items_found porque lo hemos quitado
+        # self.drive_scan_worker.items_found.connect(...) <--- ELIMINADO
+
         self.drive_scan_worker.progress.connect(self._set_status)
         self.drive_scan_worker.finished.connect(self._on_drive_scan_finished)
 
-        # Limpieza
         self.drive_scan_worker.finished.connect(self.drive_scan_thread.quit)
         self.drive_scan_worker.finished.connect(self.drive_scan_worker.deleteLater)
         self.drive_scan_thread.finished.connect(self.drive_scan_thread.deleteLater)
@@ -4346,33 +4546,28 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(int)
     def _on_drive_scan_finished(self, total_count):
-        """Se llama cuando termina todo el escaneo. AQUÍ pintamos la interfaz."""
+        """Se llama cuando termina el escaneo."""
+        self._set_status(f"Indexación completada ({total_count} nuevos). Recargando vista...")
 
-        self._set_status(f"Procesando visualización de {self.cloud_photo_count} fotos...")
+        # Volvemos a cargar desde la DB local para refrescar la pantalla con lo nuevo
+        self._load_drive_from_db(self.current_drive_folder_id)
 
-        # Truco para evitar parpadeo blanco mientras se generan los widgets
-        self.cloud_scroll_area.setUpdatesEnabled(False)
-
-        # Pintar todas las fotos de golpe
+        # Forzar actualización visual
         self._display_cloud_photos()
-
-        # Reactivar la visualización
-        self.cloud_scroll_area.setUpdatesEnabled(True)
 
         if self.cloud_photo_count == 0:
              from PySide6.QtWidgets import QMessageBox
-             QMessageBox.information(self, "Aviso", "No se encontraron imágenes.")
+             QMessageBox.information(self, "Aviso", "No se encontraron imágenes en esa carpeta.")
 
-        self._set_status(f"Escaneo finalizado. {self.cloud_photo_count} fotos listas.")
+        self._set_status(f"Listo. {self.cloud_photo_count} fotos disponibles.")
 
     @Slot(list)
     def _add_drive_items(self, items):
-        """Guarda fotos nuevas vinculándolas a la carpeta actual."""
-        try:
-            # Pasamos el ID de la carpeta actual para que se guarde en la BD
-            self.db.bulk_upsert_drive_photos(items, root_folder_id=self.current_drive_folder_id)
-        except Exception as e:
-            print(f"Error guardando en BD Drive: {e}")
+        """
+        Solo actualiza la estructura en memoria (RAM).
+        La inserción en BD ya la hizo el worker.
+        """
+        # ELIMINADO: self.db.bulk_upsert_drive_photos(...) <- Esto congelaba la UI
 
         self._classify_drive_items_in_memory(items)
         self._set_status(f"Sincronizando... {self.cloud_photo_count} fotos procesadas.")
