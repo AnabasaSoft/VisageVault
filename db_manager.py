@@ -94,6 +94,17 @@ class VisageVaultDB:
                 )
             """)
 
+            # 6. Tabla de CAJA FUERTE
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS safe_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_path TEXT,     -- Ruta original para restaurar
+                    encrypted_path TEXT,    -- Dónde está ahora (visagevault_safe/...)
+                    media_type TEXT,        -- 'photo' o 'video'
+                    original_date TEXT      -- Para re-ordenar al restaurar
+                )
+            """)
+
     def _check_migrations(self):
         """
         Verifica si la base de datos existente necesita actualizaciones de estructura
@@ -438,3 +449,18 @@ class VisageVaultDB:
         """
         with self.conn:
             self.conn.execute("UPDATE drive_photos SET created_time = ? WHERE id = ?", (new_iso_date, file_id))
+
+    def add_to_safe(self, original_path, encrypted_path, media_type, date_str):
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO safe_files (original_path, encrypted_path, media_type, original_date)
+                VALUES (?, ?, ?, ?)
+            """, (original_path, encrypted_path, media_type, date_str))
+
+    def get_safe_files(self):
+        cursor = self.conn.execute("SELECT * FROM safe_files")
+        return cursor.fetchall()
+
+    def remove_from_safe(self, encrypted_path):
+        with self.conn:
+            self.conn.execute("DELETE FROM safe_files WHERE encrypted_path = ?", (encrypted_path,))

@@ -1,5 +1,6 @@
 # config_manager.py
 import json
+import hashlib
 from pathlib import Path
 
 CONFIG_FILE = Path("visagevault_config.json")
@@ -53,3 +54,23 @@ def set_drive_folder_id(folder_id):
     config = load_config()
     config['drive_folder_id'] = folder_id
     save_config(config)
+
+def get_safe_password_hash():
+    """Obtiene el hash SHA-256 de la contraseña de la caja fuerte."""
+    config = load_config()
+    return config.get('safe_password_hash')
+
+def set_safe_password_hash(password):
+    """Guarda el hash de la contraseña (NO la contraseña en texto plano)."""
+    config = load_config()
+    hash_obj = hashlib.sha256(password.encode('utf-8'))
+    config['safe_password_hash'] = hash_obj.hexdigest()
+    save_config(config)
+
+def verify_safe_password(password):
+    """Verifica si la contraseña introducida coincide con la guardada."""
+    stored_hash = get_safe_password_hash()
+    if not stored_hash: return False
+
+    input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
+    return input_hash == stored_hash
