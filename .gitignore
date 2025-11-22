@@ -31,9 +31,14 @@ AppDir/
 *.desktop
 *.zip
 *.tar.gz
+
+# ==================================
+# Archivos de configuración
+# ==================================
 client_secrets.json
 user_token.pickle
 credentials.json
+visagevault.key
 
 # ==================================
 # Datos de Runtime de VisageVault

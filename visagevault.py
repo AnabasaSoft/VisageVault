@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.5.2
+# VERSIÓN: 1.6
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -1869,6 +1869,270 @@ class PhotoDirWatcher(QObject):
             self.signal.emit()
 
 # =================================================================
+# NUEVAS CLASES PARA BÚSQUEDA DE DUPLICADOS (Insertar antes de VisageVaultApp)
+# =================================================================
+
+class DuplicateFinderWorker(QObject):
+    """
+    Busca duplicados visuales usando dHash con PIL.
+    Detecta la misma imagen aunque tenga diferente resolución.
+    """
+    progress = Signal(str)
+    finished = Signal(dict)  # { 'hash_string': [ruta1, ruta2], ... }
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db_path = db_path
+        self.is_running = True
+
+    def _calculate_dhash(self, image_path, hash_size=8):
+        """
+        Calcula una huella digital visual de la imagen.
+        Resistente a cambios de tamaño.
+        """
+        try:
+            # Abrir imagen con PIL
+            with Image.open(image_path) as img:
+                # 1. Convertir a escala de grises
+                img = img.convert("L")
+
+                # 2. Redimensionar a (hash_size + 1) x hash_size (ej: 9x8)
+                # Usamos LANCZOS para mejor calidad en la reducción
+                try:
+                    resample = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample = Image.LANCZOS
+
+                img = img.resize((hash_size + 1, hash_size), resample)
+
+                pixels = list(img.getdata())
+
+                # 3. Comparar píxeles adyacentes
+                difference = []
+                for row in range(hash_size):
+                    for col in range(hash_size):
+                        pixel_left = pixels[row * (hash_size + 1) + col]
+                        pixel_right = pixels[row * (hash_size + 1) + col + 1]
+                        difference.append(pixel_left > pixel_right)
+
+                # 4. Convertir a hex
+                decimal_value = 0
+                for index, value in enumerate(difference):
+                    if value:
+                        decimal_value += 2**index
+
+                return hex(decimal_value)
+        except Exception:
+            # Si PIL falla (ej: archivo corrupto o RAW no soportado), lo ignoramos
+            return None
+
+    @Slot()
+    def run(self):
+        # Conexión DB local para el hilo
+        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
+        local_db.db_path = self.db_path
+        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        local_db.conn.row_factory = sqlite3.Row
+
+        try:
+            self.progress.emit("Cargando lista de fotos...")
+            cursor = local_db.conn.execute("SELECT filepath FROM photos WHERE is_hidden = 0")
+            all_photos = [row['filepath'] for row in cursor.fetchall()]
+
+            total = len(all_photos)
+            self.progress.emit(f"Analizando {total} fotos visualmente...")
+
+            hashes = {}
+            processed = 0
+
+            for path in all_photos:
+                if not self.is_running: break
+                if not os.path.exists(path): continue
+
+                # Calculamos el hash visual
+                dhash = self._calculate_dhash(path)
+
+                if dhash:
+                    if dhash not in hashes:
+                        hashes[dhash] = []
+                    hashes[dhash].append(path)
+
+                processed += 1
+                if processed % 20 == 0:
+                    self.progress.emit(f"Analizando... ({processed}/{total})")
+
+            # Filtrar solo los que tienen más de 1 archivo (duplicados)
+            duplicates = {h: paths for h, paths in hashes.items() if len(paths) > 1}
+
+            self.finished.emit(duplicates)
+
+        except Exception as e:
+            print(f"Error en búsqueda duplicados: {e}")
+            self.finished.emit({})
+        finally:
+            local_db.conn.close()
+
+
+class DuplicateDialog(QDialog):
+    """Diálogo para ver y gestionar los duplicados encontrados."""
+    def __init__(self, duplicates_dict, db_manager, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Gestor de Fotos Duplicadas")
+        self.resize(1000, 700)
+        self.duplicates = duplicates_dict
+        self.db = db_manager
+        self.deleted_paths = set() # Registro de lo borrado
+
+        self._setup_ui()
+        self._load_list()
+
+    def _setup_ui(self):
+        main_layout = QHBoxLayout(self)
+
+        # IZQUIERDA: Lista de conflictos
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.addWidget(QLabel("Grupos de Duplicados:"))
+        self.list_widget = QListWidget()
+        self.list_widget.currentRowChanged.connect(self._on_group_selected)
+        left_layout.addWidget(self.list_widget)
+        main_layout.addWidget(left_panel, 1)
+
+        # DERECHA: Vista previa
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+
+        info = QLabel("Comparativa (Borra la de menor calidad):")
+        info.setStyleSheet("font-weight: bold; font-size: 14px; color: #3daee9;")
+        right_layout.addWidget(info)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.preview_container = QWidget()
+        self.preview_layout = QHBoxLayout(self.preview_container)
+        self.preview_layout.setAlignment(Qt.AlignLeft)
+        self.scroll_area.setWidget(self.preview_container)
+        right_layout.addWidget(self.scroll_area)
+
+        btn_close = QPushButton("Cerrar")
+        btn_close.clicked.connect(self.accept)
+        right_layout.addWidget(btn_close, 0, Qt.AlignRight)
+
+        main_layout.addWidget(right_panel, 3)
+
+    def _load_list(self):
+        self.list_widget.clear()
+        for h, paths in self.duplicates.items():
+            # Filtrar si ya borramos alguna
+            valid_paths = [p for p in paths if p not in self.deleted_paths and os.path.exists(p)]
+            if len(valid_paths) > 1:
+                name = Path(valid_paths[0]).name
+                item = QListWidgetItem(f"{name} ({len(valid_paths)} copias)")
+                item.setData(Qt.UserRole, valid_paths)
+                self.list_widget.addItem(item)
+
+    def _on_group_selected(self, row):
+        if row < 0: return
+        # Limpiar vista previa anterior
+        while self.preview_layout.count() > 0:
+            item = self.preview_layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+        item = self.list_widget.item(row)
+        paths = item.data(Qt.UserRole)
+        valid_paths = [p for p in paths if p not in self.deleted_paths and os.path.exists(p)]
+
+        if len(valid_paths) < 2:
+            self.list_widget.takeItem(row) # Ya no es duplicado
+            return
+
+        for path in valid_paths:
+            self._add_preview_card(path)
+
+    def _add_preview_card(self, path):
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setStyleSheet("background-color: #2b2b2b; border-radius: 8px; margin: 5px;")
+        layout = QVBoxLayout(card)
+
+        # Imagen
+        lbl = ZoomableClickableLabel(path)
+        lbl.setFixedSize(280, 280)
+        lbl.is_thumbnail_view = True # Desactivamos el zoom complejo para esta vista
+
+        # Datos técnicos
+        w, h, size_mb = 0, 0, 0
+        try:
+            size_mb = os.path.getsize(path) / (1024*1024)
+            pix = QPixmap(path)
+
+            if not pix.isNull():
+                lbl.setOriginalPixmap(pix) # Guardamos referencia interna
+
+                # --- CORRECCIÓN IMPORTANTE ---
+                # Asignamos explícitamente el pixmap escalado para que se vea
+                lbl.setPixmap(pix.scaled(lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                # -----------------------------
+
+                w, h = pix.width(), pix.height()
+            else:
+                lbl.setText("Sin vista previa")
+        except:
+            pass
+
+        layout.addWidget(lbl)
+
+        # Info (Resolución, Peso, Nombre)
+        info_layout = QVBoxLayout()
+        res_lbl = QLabel(f"📏 {w} x {h} px")
+        res_lbl.setStyleSheet("color: #4dbef9; font-weight: bold;")
+        res_lbl.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(res_lbl)
+
+        size_lbl = QLabel(f"💾 {size_mb:.2f} MB")
+        size_lbl.setStyleSheet("color: #aaaaaa;")
+        size_lbl.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(size_lbl)
+
+        name_lbl = QLabel(Path(path).name)
+        name_lbl.setWordWrap(True)
+        name_lbl.setAlignment(Qt.AlignCenter)
+        # Limitamos el largo del nombre para que no descuadre
+        name_lbl.setStyleSheet("font-size: 10px;")
+        info_layout.addWidget(name_lbl)
+
+        layout.addLayout(info_layout)
+
+        # Botón Borrar
+        btn_del = QPushButton("🗑️ Borrar ésta")
+        btn_del.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
+        btn_del.clicked.connect(lambda: self._delete_file(path, card))
+        layout.addWidget(btn_del)
+
+        self.preview_layout.addWidget(card)
+
+    def _delete_file(self, path, card_widget):
+        reply = QMessageBox.question(self, "Confirmar", f"¿Borrar definitivamente?\n{Path(path).name}", QMessageBox.Yes | QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                # 1. Borrar de DB
+                self.db.delete_photo_permanently(path)
+                # 2. Borrar de Disco
+                if os.path.exists(path):
+                    os.remove(path)
+
+                self.deleted_paths.add(path)
+                card_widget.deleteLater()
+
+                # Refrescar lista automáticamente tras 200ms
+                QTimer.singleShot(200, lambda: self._on_group_selected(self.list_widget.currentRow()))
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"No se pudo borrar: {e}")
+
+    def get_deleted_items(self):
+        return list(self.deleted_paths)
+
+# =================================================================
 # VENTANA PRINCIPAL DE LA APLICACIÓN (VisageVaultApp)
 # =================================================================
 class VisageVaultApp(QMainWindow):
@@ -2002,11 +2266,50 @@ class VisageVaultApp(QMainWindow):
         photo_right_panel_widget = QWidget()
         photo_right_panel_layout = QVBoxLayout(photo_right_panel_widget)
 
-        # Controles superiores (Botón y Path)
+        # --- Controles superiores con el nuevo botón ---
         top_controls = QVBoxLayout()
+
+        # Fila de botones
+        btn_row = QHBoxLayout()
+
         self.select_dir_button = QPushButton("Cambiar Directorio")
         self.select_dir_button.clicked.connect(self._open_directory_dialog)
-        top_controls.addWidget(self.select_dir_button)
+        btn_row.addWidget(self.select_dir_button)
+
+        # >>> BOTÓN NUEVO <<<
+        self.btn_duplicates = QPushButton("Buscar Duplicados")
+        self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_duplicates.clicked.connect(self._start_duplicate_search) # Conectamos a la función
+        btn_row.addWidget(self.btn_duplicates)
+
+        top_controls.addLayout(btn_row)
+
+        self.path_label = QLabel("Ruta: No configurada")
+        self.path_label.setWordWrap(True)
+        top_controls.addWidget(self.path_label)
+
+        # Controles superiores (Botones y Path)
+        top_controls = QVBoxLayout()
+
+        # --- NUEVO: Layout horizontal para botones ---
+        botones_layout = QHBoxLayout()
+
+        # Botón 1: Cambiar Directorio
+        self.select_dir_button = QPushButton("Cambiar Directorio")
+        self.select_dir_button.clicked.connect(self._open_directory_dialog)
+        botones_layout.addWidget(self.select_dir_button)
+
+        # Botón 2: Buscar Duplicados (NUEVO)
+        self.btn_duplicates = QPushButton("Buscar Duplicados")
+        # Usamos un icono de lupa o recarga estándar de Qt
+        self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_duplicates.clicked.connect(self._start_duplicate_search)
+        botones_layout.addWidget(self.btn_duplicates)
+
+        # Añadimos la fila de botones al panel
+        top_controls.addLayout(botones_layout)
+        # ---------------------------------------------
+
         self.path_label = QLabel("Ruta: No configurada")
         self.path_label.setWordWrap(True)
         top_controls.addWidget(self.path_label)
@@ -5222,6 +5525,67 @@ class VisageVaultApp(QMainWindow):
         self.cloud_scroll_area.setUpdatesEnabled(True)
 
         self._set_status(f"Mostrando {self.cloud_photo_count} fotos de esta carpeta.")
+
+    # ========================================================
+    # GESTIÓN DE DUPLICADOS
+    # ========================================================
+    @Slot()
+    def _start_duplicate_search(self):
+        """Inicia el worker de búsqueda."""
+        if not self.photos_by_year_month:
+            QMessageBox.information(self, "Aviso", "Primero carga una carpeta con fotos.")
+            return
+
+        self.btn_duplicates.setEnabled(False)
+        self.btn_duplicates.setText("Analizando...")
+        self._set_status("Iniciando búsqueda visual de duplicados...")
+
+        # Crear hilo y worker
+        self.dup_thread = QThread()
+        self.dup_worker = DuplicateFinderWorker(self.db.db_path)
+        self.dup_worker.moveToThread(self.dup_thread)
+
+        self.dup_thread.started.connect(self.dup_worker.run)
+        self.dup_worker.progress.connect(self._set_status)
+        self.dup_worker.finished.connect(self._on_duplicate_search_finished)
+
+        # Limpieza automática
+        self.dup_worker.finished.connect(self.dup_thread.quit)
+        self.dup_worker.finished.connect(self.dup_worker.deleteLater)
+        self.dup_thread.finished.connect(self.dup_thread.deleteLater)
+
+        self.dup_thread.start()
+
+    @Slot(dict)
+    def _on_duplicate_search_finished(self, duplicates):
+        """Recibe los resultados y abre el diálogo."""
+        self.btn_duplicates.setEnabled(True)
+        self.btn_duplicates.setText("Buscar Duplicados")
+        self._set_status("Búsqueda finalizada.")
+
+        if not duplicates:
+            QMessageBox.information(self, "Resultado", "¡Genial! No se encontraron duplicados visuales.")
+            return
+
+        # Calcular total de fotos duplicadas
+        total_dupes = sum(len(v) for v in duplicates.values())
+        self._set_status(f"Encontrados {len(duplicates)} grupos ({total_dupes} fotos).")
+
+        # Abrir diálogo
+        dialog = DuplicateDialog(duplicates, self.db, self)
+        dialog.exec()
+
+        # Al cerrar, verificar si se borró algo para refrescar la galería
+        deleted_files = dialog.get_deleted_items()
+        if deleted_files:
+            self._set_status(f"Se eliminaron {len(deleted_files)} fotos. Actualizando vista...")
+
+            # Eliminamos las fotos borradas de la memoria de la app
+            for path in deleted_files:
+                self._remove_from_memory_struct(path, self.photos_by_year_month)
+
+            # Redibujamos la pantalla de fotos
+            self._display_photos()
 
 def run_visagevault():
     """Función para iniciar la aplicación gráfica."""

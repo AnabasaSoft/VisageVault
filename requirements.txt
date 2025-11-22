@@ -9,3 +9,4 @@ numpy
 opencv-python-headless
 rawpy
 watchdog
+cryptography
