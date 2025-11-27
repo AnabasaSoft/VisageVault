@@ -74,3 +74,125 @@ def verify_safe_password(password):
 
     input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
     return input_hash == stored_hash
+import json
+import os
+import shutil
+
+# Nombre del archivo de configuración
+CONFIG_FILENAME = "visagevault_config.json"
+
+def get_config_path():
+    """
+    Calcula la ruta del archivo de configuración siguiendo estándares.
+    Prioridad:
+    1. Carpeta local (si es portable/desarrollo).
+    2. ~/.config/visagevault/ (si está instalado en Linux).
+    """
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1. MODO PORTABLE / DESARROLLO (Windows o ejecución local)
+    # Si tenemos permiso de escritura en la carpeta del script, usamos esa.
+    if os.access(base_dir, os.W_OK):
+        return os.path.join(base_dir, CONFIG_FILENAME)
+
+    # 2. MODO INSTALADO (Linux / AUR / /usr/share)
+    # Usamos el estándar XDG: ~/.config/visagevault/
+    user_home = os.path.expanduser("~")
+    config_dir = os.path.join(user_home, ".config", "visagevault")
+
+    # Crear la carpeta si no existe
+    if not os.path.exists(config_dir):
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+        except OSError:
+            # Fallback extremo: volver a home si falla crear .config
+            return os.path.join(user_home, CONFIG_FILENAME)
+
+    target_config = os.path.join(config_dir, CONFIG_FILENAME)
+
+    # --- MIGRACIÓN AUTOMÁTICA ---
+    # Si existe el archivo viejo en la raíz (~/visagevault_config.json)
+    # y no existe el nuevo, lo movemos para no perder datos.
+    old_config_path = os.path.join(user_home, CONFIG_FILENAME)
+    if os.path.exists(old_config_path) and not os.path.exists(target_config):
+        try:
+            shutil.move(old_config_path, target_config)
+            print(f"Configuración migrada de {old_config_path} a {target_config}")
+        except Exception as e:
+            print(f"Error migrando configuración: {e}")
+
+    return target_config
+
+def load_config():
+    config_path = get_config_path()
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+def save_config(config_data):
+    config_path = get_config_path()
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config_data, f, indent=4)
+    except IOError as e:
+        print(f"Error guardando configuración en {config_path}: {e}")
+
+# --- GETTERS Y SETTERS ESPECÍFICOS ---
+
+def get_photo_directory():
+    config = load_config()
+    return config.get('photo_directory', "")
+
+def set_photo_directory(path):
+    config = load_config()
+    config['photo_directory'] = path
+    save_config(config)
+
+def get_thumbnail_size():
+    config = load_config()
+    # Tamaño por defecto 128 si no existe
+    return config.get('thumbnail_size', 128)
+
+def set_thumbnail_size(size):
+    config = load_config()
+    config['thumbnail_size'] = size
+    save_config(config)
+
+def get_drive_folder_id():
+    config = load_config()
+    return config.get('drive_folder_id', None)
+
+def set_drive_folder_id(folder_id):
+    config = load_config()
+    config['drive_folder_id'] = folder_id
+    save_config(config)
+
+# --- SEGURIDAD CAJA FUERTE ---
+
+def get_safe_password_hash():
+    config = load_config()
+    return config.get('safe_password_hash', None)
+
+def set_safe_password_hash(password_plain):
+    import hashlib
+    # Guardamos solo el hash SHA256, nunca la contraseña plana
+    hash_object = hashlib.sha256(password_plain.encode())
+    hex_dig = hash_object.hexdigest()
+
+    config = load_config()
+    config['safe_password_hash'] = hex_dig
+    save_config(config)
+
+def verify_safe_password(password_plain):
+    import hashlib
+    stored_hash = get_safe_password_hash()
+    if not stored_hash: return False
+
+    hash_object = hashlib.sha256(password_plain.encode())
+    hex_dig = hash_object.hexdigest()
+
+    return hex_dig == stored_hash

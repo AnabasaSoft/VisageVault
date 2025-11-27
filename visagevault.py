@@ -1,6 +1,6 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.6.13
+# VERSIÓN: 1.6.14
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -676,7 +676,7 @@ class FaceScanWorker(QObject):
             local_db.conn.close()
 
 # =================================================================
-# CLASE OPTIMIZADA: CARGA DE CARAS CON CACHÉ DE DISCO
+# CLASE: FaceLoader (CORREGIDA PARA RUTAS LINUX)
 # =================================================================
 class FaceLoader(QRunnable):
     def __init__(self, signals: FaceLoaderSignals, face_id: int, photo_path: str, location_str: str):
@@ -685,12 +685,22 @@ class FaceLoader(QRunnable):
         self.face_id = face_id
         self.photo_path = photo_path
         self.location_str = location_str
+
+        # --- CORRECCIÓN DE RUTA ---
+        # Detectar si estamos en modo sistema (Linux instalado) o portable
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        # visagevault_cache/face_cache
-        self.cache_dir = os.path.join(base_dir, "visagevault_cache", "face_cache")
+
+        if os.access(base_dir, os.W_OK):
+            # Modo Desarrollo / Windows
+            self.cache_dir = os.path.join(base_dir, "visagevault_cache", "face_cache")
+        else:
+            # Modo Linux Instalado (AUR) -> Usar ~/.cache
+            user_home = os.path.expanduser("~")
+            self.cache_dir = os.path.join(user_home, ".cache", "visagevault", "face_cache")
+        # --------------------------
 
         if not os.path.exists(self.cache_dir):
-            try: os.makedirs(self.cache_dir)
+            try: os.makedirs(self.cache_dir, exist_ok=True)
             except: pass
 
         self.cache_path = os.path.join(self.cache_dir, f"face_{self.face_id}.jpg")

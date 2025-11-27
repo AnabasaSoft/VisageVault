@@ -62,11 +62,11 @@ class DriveAuthenticator:
         return build('drive', 'v3', credentials=self.creds)
 
     def _perform_login(self):
-        # Comprobación de seguridad por si olvidamos inyectar las claves
-        if "BUILD_TIME" in self.CLIENT_CONFIG["installed"]["client_id"]:
-            raise ValueError("Error: Las credenciales de Google no se inyectaron durante la compilación.")
+        """Login usando el diccionario incrustado en lugar de un archivo."""
 
-        flow = InstalledAppFlow.from_client_config(self.CLIENT_CONFIG, self.SCOPES)
+        flow = InstalledAppFlow.from_client_config(
+            self.CLIENT_CONFIG, self.SCOPES
+        )
         self.creds = flow.run_local_server(port=0)
 
     def has_credentials(self):
