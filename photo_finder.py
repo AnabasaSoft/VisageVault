@@ -20,10 +20,12 @@ VIDEO_EXTENSIONS = (
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg'
 )
 
-def find_photos(directory_path: str) -> list[str]:
+def find_photos(directory_path: str, should_stop=None) -> list[str]:
     """
     Busca archivos de imagen en un directorio dado (recursivamente).
     Devuelve las rutas como una lista de strings.
+    should_stop: función opcional; si devuelve True se interrumpe la búsqueda
+    (el resultado queda incompleto y no debe usarse para borrar nada).
     """
     target_dir = Path(directory_path)
     if not target_dir.is_dir():
@@ -38,14 +40,18 @@ def find_photos(directory_path: str) -> list[str]:
 
         count += 1
         if count % 100 == 0:
-             time.sleep(0.001)
+            if should_stop and should_stop():
+                break
+            time.sleep(0.001)
 
     return photo_files
 
-def find_videos(directory_path: str) -> list[str]:
+def find_videos(directory_path: str, should_stop=None) -> list[str]:
     """
     Busca archivos de vídeo en un directorio dado (recursivamente).
     Devuelve las rutas como una lista de strings.
+    should_stop: función opcional; si devuelve True se interrumpe la búsqueda
+    (el resultado queda incompleto y no debe usarse para borrar nada).
     """
     target_dir = Path(directory_path)
     if not target_dir.is_dir():
@@ -61,7 +67,9 @@ def find_videos(directory_path: str) -> list[str]:
 
         count += 1
         if count % 100 == 0:
-             time.sleep(0.001)
+            if should_stop and should_stop():
+                break
+            time.sleep(0.001)
 
     return video_files
 

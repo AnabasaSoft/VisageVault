@@ -1792,7 +1792,7 @@ class PhotoFinderWorker(QObject):
                 available = False
                 self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
                 return
-            photo_paths_on_disk = find_photos(self.directory_path)
+            photo_paths_on_disk = find_photos(self.directory_path, should_stop=lambda: not self.is_running)
             photo_paths_on_disk_set = set(photo_paths_on_disk)
 
             photos_to_upsert_in_db = []
@@ -1821,6 +1821,11 @@ class PhotoFinderWorker(QObject):
                 if month not in photos_by_year_month[year]:
                     photos_by_year_month[year][month] = []
                 photos_by_year_month[year][month].append(path)
+
+            if not self.is_running:
+                # Escaneo interrumpido (cierre de la app): la lista está incompleta,
+                # no se borra ni se guarda nada en la BD
+                return
 
             self.progress.emit("Buscando fotos eliminadas...")
             known_paths, missing_paths = find_missing_paths(db_dates.keys(), photo_paths_on_disk_set, self.directory_path)
@@ -1880,7 +1885,7 @@ class VideoFinderWorker(QObject):
                 available = False
                 self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
                 return
-            video_paths_on_disk = find_videos(self.directory_path)
+            video_paths_on_disk = find_videos(self.directory_path, should_stop=lambda: not self.is_running)
             video_paths_on_disk_set = set(video_paths_on_disk)
 
             videos_to_upsert_in_db = []
@@ -1907,6 +1912,11 @@ class VideoFinderWorker(QObject):
                 if month not in videos_by_year_month[year]:
                     videos_by_year_month[year][month] = []
                 videos_by_year_month[year][month].append(path)
+
+            if not self.is_running:
+                # Escaneo interrumpido (cierre de la app): la lista está incompleta,
+                # no se borra ni se guarda nada en la BD
+                return
 
             self.progress.emit("Buscando vídeos eliminados...")
             known_paths, missing_paths = find_missing_paths(db_dates.keys(), video_paths_on_disk_set, self.directory_path)
@@ -5365,66 +5375,101 @@ class VisageVaultApp(QMainWindow):
         if placeholder:
             placeholder.setText("Error")
 
+    # Tiempo máximo de espera al cerrar para que las tareas en curso terminen
+    SHUTDOWN_TIMEOUT_S = 15
+
+    def _background_tasks(self):
+        """Pares (hilo, worker) de las tareas en segundo plano que pueden estar activas."""
+        tasks = [
+            (self.photo_thread, self.photo_worker),
+            (self.video_thread, self.video_worker),
+            (self.face_scan_thread, self.face_scan_worker),
+            (self.drive_scan_thread, self.drive_scan_worker),
+            (getattr(self, 'safe_thread', None), getattr(self, 'safe_worker', None)),
+            (getattr(self, 'dup_thread', None), getattr(self, 'dup_worker', None)),
+            (getattr(self, 'drive_login_thread', None), None),
+        ]
+        return tasks + list(self.active_folder_threads)
+
+    @staticmethod
+    def _is_thread_running(thread):
+        try:
+            return thread is not None and thread.isRunning()
+        except RuntimeError:
+            return False  # El objeto C++ ya fue destruido (deleteLater)
+
     def closeEvent(self, event):
-        """Limpia de forma segura y robusta todos los hilos antes de salir."""
+        """
+        Cierra de forma segura: pide a cada tarea que se detenga y espera a que
+        lo haga. Nunca usa QThread.terminate(), que puede matar un hilo a mitad
+        de una escritura en SQLite o con el GIL de Python tomado.
+        """
         print("Cerrando aplicación... Por favor, espere.")
-        self._set_status("Cerrando... limpiando recursos.")
+        self._set_status("Cerrando: esperando a que terminen las tareas en curso...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
 
         # 1. Guardar configuración
         try:
             self._save_photo_splitter_state()
             self._save_video_splitter_state()
             config_manager.set_thumbnail_size(self.current_thumbnail_size)
-        except Exception: pass
+        except Exception as e:
+            print(f"Error guardando configuración al cerrar: {e}")
 
-        # 2. Parar vigilante
+        # 2. Parar vigilante y descartar miniaturas pendientes
         if self.file_watcher:
             self.file_watcher.stop()
-
-        # 3. Limpiar cola de miniaturas
         self.threadpool.clear()
 
-        # 4. DETENER WORKERS DE ESCANEO (FOTOS Y VÍDEOS)
-        # Corrección: Si no paran a tiempo, usamos terminate() para evitar el core dump.
-        for thread, worker_name in [(self.photo_thread, 'photo_worker'), (self.video_thread, 'video_worker')]:
-            if thread and thread.isRunning():
-                worker = getattr(self, worker_name, None)
-                if worker:
-                    worker.is_running = False # Señal suave
+        # 3. Pedir a todas las tareas que se detengan (parada cooperativa)
+        running = []
+        for thread, worker in self._background_tasks():
+            if not self._is_thread_running(thread):
+                continue
+            try:
+                if hasattr(worker, 'stop'):
+                    worker.stop()           # Escáner de caras: cancela la cola de IA
+                elif worker is not None:
+                    worker.is_running = False
+            except RuntimeError:
+                pass
+            thread.quit()  # Sale del bucle de eventos del hilo en cuanto termine run()
+            running.append(thread)
 
-                thread.quit()
+        # 4. Esperar a que terminen (como mucho SHUTDOWN_TIMEOUT_S en total)
+        deadline = time.monotonic() + self.SHUTDOWN_TIMEOUT_S
+        stuck = []
+        login_thread = getattr(self, 'drive_login_thread', None)
+        for thread in running:
+            if thread is login_thread:
+                # Bloqueado esperando al navegador: no se puede detener, no esperamos
+                stuck.append(thread)
+                continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            try:
+                if not thread.wait(remaining_ms):
+                    stuck.append(thread)
+            except RuntimeError:
+                pass
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        pool_done = self.threadpool.waitForDone(remaining_ms)
 
-                # Esperamos 1.5s a que cierre bien. Si no, forzamos.
-                if not thread.wait(1500):
-                    print(f"⚠️ {worker_name} tardando demasiado. Forzando detención...")
-                    thread.terminate() # Mata el hilo del sistema
-                    thread.wait()      # Asegura que está muerto antes de seguir
+        QApplication.restoreOverrideCursor()
 
-        # 5. DETENER HILO DE CARAS (EL MÁS PESADO)
-        if self.face_scan_thread and self.face_scan_thread.isRunning():
-            print("Deteniendo escáner de caras...")
-            if self.face_scan_worker:
-                # Parada lógica (cancela futuros de IA)
-                self.face_scan_worker.stop()
-                try: self.face_scan_worker.signals.scan_finished.disconnect()
-                except: pass
-
-            self.face_scan_thread.quit()
-
-            # Esperamos 2s. Si Face Recognition está bloqueado en C++, no responderá al quit().
-            if not self.face_scan_thread.wait(2000):
-                print("🛑 El motor de IA no responde. Matando proceso...")
-                self.face_scan_thread.terminate() # Obligatorio para evitar 'QThread Destroyed...'
-                self.face_scan_thread.wait()      # Confirmar muerte
-
-        # 6. CAJA FUERTE
-        if hasattr(self, 'safe_thread') and self.safe_thread and self.safe_thread.isRunning():
-             if hasattr(self, 'safe_worker'): self.safe_worker.is_running = False
-             self.safe_thread.quit()
-             self.safe_thread.wait(1000)
-
-        # 7. DRIVE
-        self._stop_cloud_operations()
+        if stuck or not pool_done:
+            # Una tarea sigue bloqueada (p. ej. un disco de red colgado o el
+            # navegador del login de Google abierto). Matar solo ese hilo puede
+            # dejar el proceso en un estado inconsistente; terminar el proceso
+            # entero es seguro para SQLite: las transacciones son atómicas.
+            print(f"⚠️ {len(stuck)} tarea(s) no respondieron a tiempo. Saliendo igualmente.")
+            for conn in (self.db.conn, self.db.meta_conn):
+                try:
+                    if conn: conn.close()
+                except Exception:
+                    pass
+            sys.stdout.flush()
+            os._exit(0)
 
         print("Limpieza finalizada. Adiós.")
         event.accept()
