@@ -1841,10 +1841,11 @@ class PhotoFinderWorker(QObject):
     progress = Signal(str)
 
     # Recibimos db_path (texto) en lugar de db_manager (objeto)
-    def __init__(self, directory_path: str, db_path: str):
+    def __init__(self, directory_path: str, db_path: str, scan_id=None):
         super().__init__()
         self.directory_path = directory_path
         self.db_path = db_path
+        self.scan_id = scan_id  # Compartir el recorrido del disco con el otro escáner
         self.is_running = True
 
     @Slot()
@@ -1869,7 +1870,7 @@ class PhotoFinderWorker(QObject):
                 available = False
                 self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
                 return
-            photo_paths_on_disk = find_photos(self.directory_path, should_stop=lambda: not self.is_running)
+            photo_paths_on_disk = find_photos(self.directory_path, should_stop=lambda: not self.is_running, scan_id=self.scan_id)
             photo_paths_on_disk_set = set(photo_paths_on_disk)
 
             photos_to_upsert_in_db = []
@@ -1936,10 +1937,11 @@ class VideoFinderWorker(QObject):
     finished = Signal(object, list)
     progress = Signal(str)
 
-    def __init__(self, directory_path: str, db_path: str):
+    def __init__(self, directory_path: str, db_path: str, scan_id=None):
         super().__init__()
         self.directory_path = directory_path
         self.db_path = db_path
+        self.scan_id = scan_id  # Compartir el recorrido del disco con el otro escáner
         self.is_running = True
 
     @Slot()
@@ -1962,7 +1964,7 @@ class VideoFinderWorker(QObject):
                 available = False
                 self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
                 return
-            video_paths_on_disk = find_videos(self.directory_path, should_stop=lambda: not self.is_running)
+            video_paths_on_disk = find_videos(self.directory_path, should_stop=lambda: not self.is_running, scan_id=self.scan_id)
             video_paths_on_disk_set = set(video_paths_on_disk)
 
             videos_to_upsert_in_db = []
@@ -3409,8 +3411,9 @@ class VisageVaultApp(QMainWindow):
         self.file_watcher.directory_changed.connect(self._on_directory_changed)
         self.file_watcher.start()
 
-        self._start_photo_search(directory)
-        self._start_video_search(directory)
+        scan_id = self._next_scan_id()
+        self._start_photo_search(directory, scan_id)
+        self._start_video_search(directory, scan_id)
 
     @Slot()
     def _on_directory_changed(self):
@@ -3429,18 +3432,24 @@ class VisageVaultApp(QMainWindow):
             # Relanzamos los escaneos.
             # Nota: Tus workers actuales son inteligentes (usan fechas de la BD),
             # pero para detectar archivos NUEVOS o BORRADOS necesitan recorrer el disco.
-            self._start_photo_search(self.current_directory)
-            self._start_video_search(self.current_directory)
+            scan_id = self._next_scan_id()
+            self._start_photo_search(self.current_directory, scan_id)
+            self._start_video_search(self.current_directory, scan_id)
             # El escaneo de caras se lanzará solo al terminar el de fotos
 
-    def _start_photo_search(self, directory):
+    def _next_scan_id(self):
+        """Identificador de una tanda de escaneo (fotos + vídeos comparten recorrido)."""
+        self._scan_counter = getattr(self, "_scan_counter", 0) + 1
+        return self._scan_counter
+
+    def _start_photo_search(self, directory, scan_id=None):
         """Configura y lanza el trabajador de escaneo de FOTOS."""
         if self.photo_thread and self.photo_thread.isRunning():
             self._set_status("El escaneo de fotos anterior sigue en curso.")
             return
 
         self.photo_thread = QThread()
-        self.photo_worker = PhotoFinderWorker(directory, self.db.db_path)
+        self.photo_worker = PhotoFinderWorker(directory, self.db.db_path, scan_id)
         self.photo_worker.moveToThread(self.photo_thread)
 
         self.photo_thread.started.connect(self.photo_worker.run)
@@ -3455,14 +3464,14 @@ class VisageVaultApp(QMainWindow):
         self.photo_thread.start()
 
     # --- NUEVA FUNCIÓN ---
-    def _start_video_search(self, directory):
+    def _start_video_search(self, directory, scan_id=None):
         """Configura y lanza el trabajador de escaneo de VÍDEOS."""
         if self.video_thread and self.video_thread.isRunning():
             self._set_status("El escaneo de vídeos anterior sigue en curso.")
             return
 
         self.video_thread = QThread()
-        self.video_worker = VideoFinderWorker(directory, self.db.db_path)
+        self.video_worker = VideoFinderWorker(directory, self.db.db_path, scan_id)
         self.video_worker.moveToThread(self.video_thread)
 
         self.video_thread.started.connect(self.video_worker.run)
