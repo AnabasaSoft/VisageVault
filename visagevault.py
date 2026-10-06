@@ -1793,6 +1793,8 @@ class VideoFinderWorker(QObject):
                     if not year:
                         year, month = get_video_date(path)
 
+                    videos_to_upsert_in_db.append((path, year, month))
+
                 if year not in videos_by_year_month:
                     videos_by_year_month[year] = {}
                 if month not in videos_by_year_month[year]:
