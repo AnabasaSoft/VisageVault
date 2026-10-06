@@ -98,7 +98,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import shutil
 import hashlib
-from functools import lru_cache
+from collections import OrderedDict
 
 # =================================================================
 # EXTRACTOR DE FECHA POR NOMBRE DE ARCHIVO
@@ -185,13 +185,34 @@ def needs_removal_confirmation(n_missing, n_known):
         return True  # Ha desaparecido todo
     return n_missing >= 50 or n_missing > n_known * 0.25
 
-# --- FUNCIÓN GLOBAL DE CACHÉ EN RAM ---
-# Guarda las últimas 500 imágenes en memoria para que el scroll sea instantáneo
-@lru_cache(maxsize=500)
-def get_cached_pixmap(filepath: str) -> QPixmap:
+# --- CACHÉ GLOBAL DE MINIATURAS EN RAM ---
+# Las miniaturas se cargan en hilos secundarios (QRunnable). QPixmap solo puede
+# usarse en el hilo de la interfaz, así que los workers trabajan con QImage
+# (seguro entre hilos) y la conversión a QPixmap se hace al recibir la señal.
+_IMAGE_CACHE_SIZE = 500
+_image_cache = OrderedDict()
+_image_cache_lock = threading.Lock()
+
+def get_cached_image(filepath: str) -> QImage:
+    """Carga una miniatura de disco con caché LRU en RAM. No cachea fallos."""
+    with _image_cache_lock:
+        image = _image_cache.get(filepath)
+        if image is not None:
+            _image_cache.move_to_end(filepath)
+            return image
+
+    image = QImage()
     if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-        return QPixmap(filepath)
-    return QPixmap()
+        image.load(filepath)
+    if image.isNull():
+        return image
+
+    with _image_cache_lock:
+        _image_cache[filepath] = image
+        _image_cache.move_to_end(filepath)
+        while len(_image_cache) > _IMAGE_CACHE_SIZE:
+            _image_cache.popitem(last=False)
+    return image
 
 def resource_path(relative_path):
     """Obtiene la ruta absoluta al recurso tanto en PyInstaller como en desarrollo."""
@@ -216,7 +237,7 @@ PRELOAD_MARGIN_PX = 500
 # =================================================================
 class ThumbnailLoaderSignals(QObject):
     """Contenedor de señales para la clase QRunnable."""
-    thumbnail_loaded = Signal(str, QPixmap) # original_path, pixmap
+    thumbnail_loaded = Signal(str, QImage) # original_path, imagen (se convierte a QPixmap en la UI)
     load_failed = Signal(str)
 
 # =================================================================
@@ -236,9 +257,9 @@ class ThumbnailLoader(QRunnable):
         if thumbnail_path:
             try:
                 # 2. Cargar usando CACHÉ DE RAM (¡Mucho más rápido!)
-                pixmap = get_cached_pixmap(thumbnail_path)
-                if not pixmap.isNull():
-                    self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                image = get_cached_image(thumbnail_path)
+                if not image.isNull():
+                    self.signals.thumbnail_loaded.emit(self.original_filepath, image)
                 else:
                     self.signals.load_failed.emit(self.original_filepath)
             except Exception:
@@ -261,9 +282,9 @@ class VideoThumbnailLoader(QRunnable):
         if thumbnail_path:
             try:
                 # Usar Caché RAM
-                pixmap = get_cached_pixmap(thumbnail_path)
-                if not pixmap.isNull():
-                    self.signals.thumbnail_loaded.emit(self.original_filepath, pixmap)
+                image = get_cached_image(thumbnail_path)
+                if not image.isNull():
+                    self.signals.thumbnail_loaded.emit(self.original_filepath, image)
                 else:
                     self.signals.load_failed.emit(self.original_filepath)
             except Exception:
@@ -289,9 +310,9 @@ class NetworkThumbnailLoader(QRunnable):
 
         # 1. INTENTO CACHÉ DISCO + RAM
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-            pixmap = get_cached_pixmap(cache_path) # <--- RAM CACHE
-            if not pixmap.isNull():
-                self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
+            image = get_cached_image(cache_path) # <--- RAM CACHE
+            if not image.isNull():
+                self.signals.thumbnail_loaded.emit(self.file_id, image)
                 return
 
         # 2. DESCARGA
@@ -304,9 +325,9 @@ class NetworkThumbnailLoader(QRunnable):
                     f.write(response.content)
 
                 # Cargar en memoria y cachear
-                pixmap = get_cached_pixmap(cache_path) # <--- Se guarda en LRU Cache al leer
-                if not pixmap.isNull():
-                    self.signals.thumbnail_loaded.emit(self.file_id, pixmap)
+                image = get_cached_image(cache_path) # <--- Se guarda en LRU Cache al leer
+                if not image.isNull():
+                    self.signals.thumbnail_loaded.emit(self.file_id, image)
         except Exception:
             pass
 
@@ -464,7 +485,7 @@ class DriveFolderDialog(QDialog):
 # SEÑALES Y WORKER PARA CARGAR Y RECORTAR CARAS (Sin cambios)
 # =================================================================
 class FaceLoaderSignals(QObject):
-    face_loaded = Signal(int, QPixmap, str)
+    face_loaded = Signal(int, QImage, str)
     face_load_failed = Signal(int)
 
 # =================================================================
@@ -742,13 +763,13 @@ class FaceLoader(QRunnable):
     @Slot()
     def run(self):
         try:
-            pixmap = QPixmap()
+            image = QImage()  # QPixmap no puede usarse fuera del hilo de la UI
 
             # 1. INTENTO DE CARGA RÁPIDA (CACHÉ)
             if os.path.exists(self.cache_path):
-                if pixmap.load(self.cache_path):
+                if image.load(self.cache_path):
                     try:
-                        self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+                        self.signals.face_loaded.emit(self.face_id, image, self.photo_path)
                     except RuntimeError:
                         pass # Ignorar si la app se cerró mientras cargábamos
                     return
@@ -787,19 +808,19 @@ class FaceLoader(QRunnable):
             except Exception as e:
                 print(f"No se pudo guardar caché para cara {self.face_id}: {e}")
 
-            # 4. Convertir a QPixmap
+            # 4. Convertir a QImage
             buffer = QBuffer()
             buffer.open(QIODevice.OpenModeFlag.ReadWrite)
             face_image_pil.save(buffer, "PNG")
-            pixmap.loadFromData(buffer.data())
+            image.loadFromData(buffer.data())
             buffer.close()
 
-            if pixmap.isNull():
-                raise Exception("QPixmap nulo después de la conversión.")
+            if image.isNull():
+                raise Exception("Imagen nula después de la conversión.")
 
             # --- PROTECCIÓN CONTRA CIERRE ---
             try:
-                self.signals.face_loaded.emit(self.face_id, pixmap, self.photo_path)
+                self.signals.face_loaded.emit(self.face_id, image, self.photo_path)
             except RuntimeError:
                 pass # App cerrada, no hacer nada
 
@@ -1596,8 +1617,9 @@ class FaceClusterDialog(QDialog):
                 self.accept()
         except Exception as e:
             print(f"Error al guardar el cluster: {e}")
-    @Slot(int, QPixmap, str)
-    def _on_dialog_face_loaded(self, face_id: int, pixmap: QPixmap, photo_path: str):
+    @Slot(int, QImage, str)
+    def _on_dialog_face_loaded(self, face_id: int, image: QImage, photo_path: str):
+        pixmap = QPixmap.fromImage(image)  # Conversión en el hilo de la UI
         for i in range(self.face_grid_layout.count()):
             widget = self.face_grid_layout.itemAt(i).widget()
             if widget and hasattr(widget, 'property') and widget.property("face_id") == face_id:
@@ -4544,8 +4566,9 @@ class VisageVaultApp(QMainWindow):
                     loader = ThumbnailLoader(original_path, self.thumb_signals)
                     self.threadpool.start(loader)
 
-    @Slot(str, QPixmap)
-    def _update_thumbnail(self, original_path, pixmap):
+    @Slot(str, QImage)
+    def _update_thumbnail(self, original_path, image):
+        pixmap = QPixmap.fromImage(image)  # Conversión en el hilo de la UI
         # ---------------------------------------------------------
         # 1. BLOQUE PARA FOTOS LOCALES
         # ---------------------------------------------------------
@@ -5326,8 +5349,9 @@ class VisageVaultApp(QMainWindow):
         self.face_scan_thread = None
         self.face_scan_worker = None
 
-    @Slot(int, QPixmap, str)
-    def _handle_face_loaded(self, face_id: int, pixmap: QPixmap, photo_path: str):
+    @Slot(int, QImage, str)
+    def _handle_face_loaded(self, face_id: int, image: QImage, photo_path: str):
+        pixmap = QPixmap.fromImage(image)  # Conversión en el hilo de la UI
         placeholder = None
         for i in range(self.unknown_faces_layout.count()):
             widget = self.unknown_faces_layout.itemAt(i).widget()
