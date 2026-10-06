@@ -4889,9 +4889,12 @@ class VisageVaultApp(QMainWindow):
         QTimer.singleShot(0, self._load_main_visible_thumbnails)
         QTimer.singleShot(0, self._load_visible_video_thumbnails)
 
-    def _gallery_lists(self):
-        """(lista, área de scroll) de todas las listas de miniaturas de Fotos y Vídeos."""
-        for area in (self.scroll_area, self.video_scroll_area):
+    def _gallery_lists(self, include_cloud=False):
+        """(lista, área de scroll) de las listas de miniaturas de Fotos y Vídeos (y Nube)."""
+        areas = [self.scroll_area, self.video_scroll_area]
+        if include_cloud:
+            areas.append(self.cloud_scroll_area)
+        for area in areas:
             container = area.widget()
             if not container:
                 continue
@@ -4917,7 +4920,7 @@ class VisageVaultApp(QMainWindow):
     def _apply_thumbnail_size(self):
         """Aplica el zoom a las listas existentes sin reconstruir la galería."""
         size = self.current_thumbnail_size
-        for list_widget, _area in self._gallery_lists():
+        for list_widget, _area in self._gallery_lists(include_cloud=True):
             list_widget.setIconSize(QSize(size, size))
             cell = size + (list_widget.property("thumb_padding") or 10)
             for i in range(list_widget.count()):
@@ -4927,8 +4930,15 @@ class VisageVaultApp(QMainWindow):
                 if item.data(Qt.UserRole + 1) == "loaded":
                     item.setData(Qt.UserRole + 1, "not_loaded")
         self._relayout_galleries()
+        # La Nube ajusta su altura al contenido real (miniaturas de proporciones variables)
+        cloud_widget = self.cloud_scroll_area.widget()
+        if cloud_widget:
+            for list_widget in cloud_widget.findChildren(PreviewListWidget):
+                QTimer.singleShot(0, list_widget.adjust_height_to_content)
         QTimer.singleShot(0, self._load_main_visible_thumbnails)
         QTimer.singleShot(0, self._load_visible_video_thumbnails)
+        # Las de la Nube salen de la caché en disco/RAM: no se vuelven a descargar
+        QTimer.singleShot(0, self._load_visible_cloud_thumbnails)
 
     @Slot(str)
     def _open_photo_detail(self, original_path):
