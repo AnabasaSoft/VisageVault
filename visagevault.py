@@ -77,7 +77,7 @@ from PySide6.QtGui import (
 )
 
 # --- MODIFICADO: Importar las funciones de foto Y vídeo ---
-from photo_finder import find_photos, find_videos
+from photo_finder import find_photos, find_videos, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 import config_manager
 from metadata_reader import get_photo_date, get_video_date
 from thumbnail_generator import (
@@ -2172,30 +2172,38 @@ class PhotoDirWatcher(QObject):
             self.observer.join()
 
     class ChangeHandler(FileSystemEventHandler):
+        # Solo cambios que alteran la biblioteca. Se ignoran "opened",
+        # "closed_no_write" y "modified": leer fotos (miniaturas, caras...)
+        # o retocar metadatos no debe lanzar un re-escaneo completo.
+        # "closed" (cierre tras escribir) cubre el final de una copia.
+        RELEVANT_EVENTS = ("created", "deleted", "moved", "closed")
+        MEDIA_EXTENSIONS = tuple(IMAGE_EXTENSIONS + VIDEO_EXTENSIONS)
+
         def __init__(self, signal):
             self.signal = signal
-            self.last_emit_time = 0
+            self.ignored_dirs = tuple(
+                os.path.join(os.path.normpath(d), "") for d in (paths.cache_dir(), paths.safe_dir())
+            )
+
+        def _is_relevant_path(self, path, is_directory):
+            if not path:
+                return False
+            path = os.fsdecode(path)
+            if os.path.basename(path).startswith('.') or path.startswith(self.ignored_dirs):
+                return False
+            # Mover o borrar una carpeta entera no genera eventos de sus archivos
+            return is_directory or path.lower().endswith(self.MEDIA_EXTENSIONS)
 
         def on_any_event(self, event):
-            # Ignorar directorios y archivos temporales o de caché
-            if event.is_directory:
+            if event.event_type not in self.RELEVANT_EVENTS:
                 return
+            if event.is_directory and event.event_type == "created":
+                return  # Sus archivos generarán sus propios eventos
 
-            filename = os.path.basename(event.src_path)
-            if filename.startswith('.') or "face_cache" in event.src_path:
-                return
-
-            # Comprobar extensiones relevantes (Fotos y Vídeos)
-            valid_exts = (
-                '.jpg', '.jpeg', '.png', '.tiff', '.webp', '.heic', '.nef', '.cr2', '.dng', '.raw', # Fotos
-                '.mp4', '.avi', '.mkv', '.mov' # Vídeos
-            )
-            if not filename.lower().endswith(valid_exts):
-                return
-
-            # Debounce: Evitar emitir 100 señales si copias 100 fotos de golpe
-            # Emitimos la señal y dejamos que la App gestione el refresco con un Timer
-            self.signal.emit()
+            candidate_paths = (event.src_path, getattr(event, "dest_path", ""))
+            if any(self._is_relevant_path(p, event.is_directory) for p in candidate_paths):
+                # La app agrupa los eventos con un temporizador (refresh_timer)
+                self.signal.emit()
 
 # =================================================================
 # DIÁLOGOS DE SEGURIDAD
