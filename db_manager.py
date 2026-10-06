@@ -26,6 +26,9 @@ class VisageVaultDB:
             base_dir = os.path.dirname(os.path.abspath(__file__))
             self.db_path = os.path.join(base_dir, "visagevault.db")
 
+        # La MetaDB vive siempre junto a la BD principal
+        self.meta_db_path = os.path.join(os.path.dirname(self.db_path), "visagevault_meta.db")
+
         # --- 3. CREACIÓN DE DIRECTORIOS ---
         try:
             # Aseguramos que la carpeta donde va la DB existe (vital para ~/.local/share/...)
@@ -35,13 +38,35 @@ class VisageVaultDB:
         except Exception as e:
             print(f"Error crítico creando directorio de DB: {e}")
 
-        # --- 4. CONEXIÓN ---
-        # Solo conectamos si todo lo anterior fue bien
+        # --- 4. CONEXIÓN E INICIALIZACIÓN ---
+        # Los workers abren su propia conexión y no tocan el esquema
         if not self.is_worker:
+            self._init_meta_db()
             try:
-                self._connect_main_db()
+                self._init_db()
             except Exception as e:
                 print(f"Error inicializando DB: {e}")
+
+    def _init_db(self):
+        """Conecta, verifica la salud de la BD y prepara el esquema.
+        Si la BD está corrupta, ejecuta el protocolo de autoreparación."""
+        try:
+            self._connect_main_db()
+            healthy = self._check_integrity()
+        except sqlite3.DatabaseError as e:
+            # Ej: "file is not a database" al activar WAL sobre un fichero dañado
+            print(f"❌ ERROR CRÍTICO EN BD: {e}")
+            healthy = False
+
+        if not healthy:
+            print("🔄 Iniciando protocolo de AUTOREPARACIÓN...")
+            self._perform_hard_reset()
+            return
+
+        self._create_tables()
+        self._check_migrations()
+        # Respaldo inicial de fechas/ocultos (solo si la MetaDB está vacía)
+        self._sync_main_to_meta()
 
     def _connect_main_db(self):
         """Conexión estándar con optimizaciones."""
@@ -82,9 +107,19 @@ class VisageVaultDB:
             cursor = self.meta_conn.execute("SELECT * FROM file_metadata WHERE filepath = ?", (filepath,))
             row = cursor.fetchone()
 
-            current_year = row[1] if row else None
-            current_month = row[2] if row else None
-            current_hidden = row[3] if row else 0
+            if row:
+                current_year, current_month, current_hidden = row[1], row[2], row[3]
+            else:
+                # Sin respaldo previo: partimos de lo que haya en la BD principal
+                # para no guardar una fecha NULL (p. ej. al solo ocultar)
+                current_year, current_month, current_hidden = None, None, 0
+                for table in ("photos", "videos"):
+                    main_row = self.conn.execute(
+                        f"SELECT year, month, is_hidden FROM {table} WHERE filepath = ?", (filepath,)
+                    ).fetchone()
+                    if main_row:
+                        current_year, current_month, current_hidden = main_row
+                        break
 
             # Aplicar nuevos valores si se proporcionan
             new_year = year if year is not None else current_year
@@ -134,8 +169,8 @@ class VisageVaultDB:
     def _check_integrity(self):
         """Verifica si la BD es utilizable."""
         try:
-            # 1. Check de integridad de SQLite
-            cursor = self.conn.execute("PRAGMA integrity_check;")
+            # 1. Check de integridad de SQLite (quick_check: se ejecuta en cada arranque)
+            cursor = self.conn.execute("PRAGMA quick_check;")
             result = cursor.fetchone()
             if result[0] != "ok":
                 return False

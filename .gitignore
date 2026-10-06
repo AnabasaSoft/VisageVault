@@ -61,3 +61,8 @@ visagevault.key
 # Demás archivos
 # ==================================
 user_token.pickle
+
+.claude/
+.serena/
+*.md
+!README.md
