@@ -3002,6 +3002,10 @@ class VisageVaultApp(QMainWindow):
 
         # --- PRECARGA INTELIGENTE ---
         # 1. Configuración inicial
+        # Diálogos de arranque: se aplazan mientras se ve el splash (si no, quedan tapados)
+        self._splash_open = False
+        self._after_splash_callbacks = []
+
         QTimer.singleShot(100, self._initial_check)
         QTimer.singleShot(500, self._check_auto_login)
 
@@ -3409,18 +3413,31 @@ class VisageVaultApp(QMainWindow):
     # Lógica de Inicio y Configuración
     # ----------------------------------------------------
 
+    def _after_splash(self, callback):
+        """Ejecuta callback cuando se haya cerrado el splash (o ya, si no hay)."""
+        if self._splash_open:
+            self._after_splash_callbacks.append(callback)
+        else:
+            callback()
+
+    def on_splash_closed(self):
+        self._splash_open = False
+        callbacks, self._after_splash_callbacks = self._after_splash_callbacks, []
+        for callback in callbacks:
+            callback()
+
     def _initial_check(self):
         """Comprueba la configuración al arrancar la app."""
 
         # --- NUEVA COMPROBACIÓN DE AUTOREPARACIÓN ---
         if self.db.was_reset:
-            QMessageBox.warning(
+            self._after_splash(lambda: QMessageBox.warning(
                 self,
                 "Autoreparación Realizada",
                 "Se detectó un problema en la base de datos y ha sido reiniciada.\n\n"
                 "✅ TUS DATOS ESTÁN A SALVO: Hemos restaurado tus fechas personalizadas y archivos ocultos.\n"
                 "ℹ️ El escáner de caras y miniaturas se ejecutará de nuevo para reconstruir el caché."
-            )
+            ))
         # --------------------------------------------
 
         directory = config_manager.get_photo_directory()
@@ -3430,7 +3447,7 @@ class VisageVaultApp(QMainWindow):
             self._start_media_scan(directory)
         else:
             self._set_status("No se encontró un directorio válido. Por favor, selecciona uno.")
-            self._open_directory_dialog(force_select=True)
+            self._after_splash(lambda: self._open_directory_dialog(force_select=True))
 
     def _open_directory_dialog(self, force_select=False):
         """Abre el selector de directorios y gestiona la carga."""
@@ -6169,7 +6186,7 @@ class VisageVaultApp(QMainWindow):
                 # Lanzamos escaneo directo (ya optimizado)
                 self._scan_drive_content(folder_id)
             else:
-                self._select_drive_folder()
+                self._after_splash(self._select_drive_folder)
 
         except Exception as e:
             print(f"Error post-login: {e}")
@@ -7470,49 +7487,37 @@ class VisageVaultApp(QMainWindow):
                 other_list.clearSelection()
                 other_list.blockSignals(False)
 
+SPLASH_MIN_MS = 2000  # Tiempo mínimo que se ve el splash (incluye lo que tarda en abrir la ventana)
+
 def run_visagevault():
-    """Función para iniciar la aplicación con Splash Screen corregido (PySide6)."""
+    """Inicia la aplicación con splash. Nunca bloquea la interfaz."""
     app = QApplication(sys.argv)
 
-    # --- 1. INSTANCIAR LA APP PRIMERO ---
-    window = VisageVaultApp()
-
-    # --- 2. PREPARAR IMAGEN ---
+    # 1. Splash PRIMERO: se ve mientras se construye la ventana (BD, interfaz...)
     pixmap = QPixmap(resource_path("AnabasaSoft.png"))
-
     if pixmap.isNull():
         pixmap = QPixmap(resource_path("visagevault.png")).scaled(
             600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
-
-    # --- 3. CONFIGURAR SPLASH SCREEN (CORRECCIÓN) ---
-    # ERROR ANTERIOR: QSplashScreen(window, pixmap) -> No permitido en PySide6
-    # SOLUCIÓN: Instanciar solo con pixmap y asignar padre después.
     splash = QSplashScreen(pixmap)
+    splash.show()
+    app.processEvents()  # Pintarlo ya
+    shown_at = time.monotonic()
 
-    # Asignamos la ventana principal como padre explícitamente.
-    # Los flags son vitales:
-    # - Qt.Window: Para que sea una ventana flotante y no se incruste dentro de la app.
-    # - Qt.FramelessWindowHint: Para quitar los bordes.
-    # - Qt.WindowStaysOnTopHint: Para reforzar que esté encima.
-    splash.setParent(window, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+    # 2. Ventana principal. Los diálogos de arranque esperan a que se cierre
+    #    el splash; el escaneo y la carga de datos empiezan ya, detrás.
+    window = VisageVaultApp()
+    window._splash_open = True
+    window.showMaximized()
 
-    # Bloqueo Modal: Impide clics en la ventana 'padre' (window)
-    splash.setWindowModality(Qt.ApplicationModal)
+    # 3. Cerrar el splash sin bloquear (antes: bucle anidado de 2 s con splash modal)
+    def close_splash():
+        splash.finish(window)
+        window.on_splash_closed()
 
-    # --- 4. MOSTRAR EN ORDEN ---
-    window.showMaximized() # Mostramos la App
-    splash.show()          # Mostramos el Splash (al ser hijo, aparecerá encima)
+    elapsed_ms = int((time.monotonic() - shown_at) * 1000)
+    QTimer.singleShot(max(0, SPLASH_MIN_MS - elapsed_ms), close_splash)
 
-    app.processEvents()    # Asegurar renderizado inmediato
-
-    # --- 5. ESPERAR 2 SEGUNDOS ---
-    loop = QEventLoop()
-    QTimer.singleShot(2000, loop.quit)
-    loop.exec()
-
-    # --- 6. TERMINAR ---
-    splash.finish(window)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
