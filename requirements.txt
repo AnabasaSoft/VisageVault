@@ -10,4 +10,8 @@ numpy
 opencv-python-headless
 rawpy
 watchdog
+requests
+google-auth
+google-auth-oauthlib
+google-api-python-client
 
