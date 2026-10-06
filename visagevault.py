@@ -357,6 +357,16 @@ class NetworkThumbnailLoader(QRunnable):
 # =================================================================
 # ACTUALIZACIONES
 # =================================================================
+class DriveDownloadSignals(QObject):
+    """
+    La vista previa de Drive se descarga en un hilo de Python. QTimer.singleShot
+    desde ese hilo nunca se ejecuta (no tiene bucle de eventos de Qt); una señal
+    sí llega al hilo de la interfaz.
+    """
+    finished = Signal(str)  # ruta local descargada
+    failed = Signal(str)    # mensaje para la barra de estado
+
+
 class UpdateCheckSignals(QObject):
     """La consulta a GitHub se hace en un hilo; el resultado vuelve por señal."""
     # (release {"tag", "url"} o None, error o None, automática, botón, ventana padre)
@@ -3057,6 +3067,9 @@ class VisageVaultApp(QMainWindow):
         self.safe_thumb_signals = SafeThumbnailSignals()
         self.safe_thumb_signals.loaded.connect(self._on_safe_thumbnail_loaded)
         self.safe_thumb_signals.failed.connect(self._on_safe_thumbnail_failed)
+        self.drive_download_signals = DriveDownloadSignals()
+        self.drive_download_signals.finished.connect(self._finish_cloud_preview)
+        self.drive_download_signals.failed.connect(self._set_status)
         self.update_signals = UpdateCheckSignals()
         self.update_signals.finished.connect(self._on_update_check_finished)
         self.safe_generation = 0     # Descarta resultados de cargas anteriores o tras bloquear
@@ -4987,15 +5000,18 @@ class VisageVaultApp(QMainWindow):
             os.replace(part_path, local_path)
 
             # Volver al hilo principal para abrir la ventana
-            QTimer.singleShot(0, lambda: self._finish_cloud_preview(local_path))
+            self.drive_download_signals.finished.emit(local_path)
+        except DriveAuthError as e:
+            self.drive_download_signals.failed.emit(str(e))
         except Exception as e:
             print(f"Error descarga preview: {e}")
-            QTimer.singleShot(0, lambda: self._set_status("Error al descargar imagen."))
+            self.drive_download_signals.failed.emit("Error al descargar imagen.")
         finally:
             if os.path.exists(part_path):
                 try: os.remove(part_path)
                 except OSError: pass
 
+    @Slot(str)
     def _finish_cloud_preview(self, local_path):
         """Se ejecuta en el hilo principal cuando la descarga termina."""
         self._set_status("Imagen descargada. Abriendo visor...")
