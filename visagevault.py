@@ -3537,24 +3537,10 @@ class VisageVaultApp(QMainWindow):
                     list_widget.addItem(item)
                     self.photo_list_widget_items[photo_path] = item
 
-                # --- CÁLCULO DE ALTURA PARA ELIMINAR EL "GAP" ---
-                # Usamos el ancho disponible menos un margen de seguridad
-                viewport_width = self.scroll_area.viewport().width() - 30
-                if viewport_width < 100: viewport_width = 800
-
-                # Ancho real de cada celda incluyendo el spacing del widget
-                effective_item_width = item_w + list_widget.spacing()
-
-                # Calcular columnas
-                num_cols = max(1, viewport_width // effective_item_width)
-
-                # Calcular filas
-                rows = (len(visible_photos) + num_cols - 1) // num_cols
-
-                # Altura total = (Filas * AlturaItem) + (Filas * Espacio) + Margen extra pequeño
-                total_height = (rows * item_h) + ((rows + 1) * list_widget.spacing())
-
-                list_widget.setFixedHeight(total_height)
+                # Altura fija para mostrar todas las filas sin "huecos" (se recalcula al redimensionar)
+                list_widget.setProperty("thumb_padding", 10)
+                list_widget.setProperty("fixed_grid", True)
+                self._fit_grid_height(list_widget, self.scroll_area)
                 widgets_added_for_year.append(list_widget)
 
             if month_added_count > 0:
@@ -3674,13 +3660,9 @@ class VisageVaultApp(QMainWindow):
                     list_widget.addItem(item)
                     self.video_list_widget_items[video_path] = item
 
-                viewport_width = self.video_scroll_area.viewport().width() - 30
-                thumb_width = item_w + list_widget.spacing()
-                num_cols = max(1, viewport_width // thumb_width)
-
-                rows = (len(visible_videos) + num_cols - 1) // num_cols
-                total_height = (rows * item_h) + (rows * list_widget.spacing())
-                list_widget.setFixedHeight(total_height)
+                list_widget.setProperty("thumb_padding", 8)
+                list_widget.setProperty("fixed_grid", True)
+                self._fit_grid_height(list_widget, self.video_scroll_area)
 
                 widgets_added_for_year.append(list_widget)
 
@@ -4823,18 +4805,53 @@ class VisageVaultApp(QMainWindow):
 
     @Slot()
     def _handle_resize_timeout(self):
-        # Si no hay fotos O vídeos cargados, no hagas nada
-        if not self.photos_by_year_month and not self.videos_by_year_month:
-            return
-
-        # print(f"Redibujando layout para el nuevo ancho.")
-        # Re-dibujar AMBAS pestañas
-        if self.photos_by_year_month:
-            self._display_photos()
-        if self.videos_by_year_month:
-            self._display_videos()
+        """Recoloca las galerías al nuevo ancho sin reconstruirlas."""
+        self._relayout_galleries()
         self._reflow_faces()
-        # Ajustar geometría de la nube sin recargar las imágenes
+        # Con más ancho pueden quedar a la vista miniaturas aún sin cargar
+        QTimer.singleShot(0, self._load_main_visible_thumbnails)
+        QTimer.singleShot(0, self._load_visible_video_thumbnails)
+
+    def _gallery_lists(self):
+        """(lista, área de scroll) de todas las listas de miniaturas de Fotos y Vídeos."""
+        for area in (self.scroll_area, self.video_scroll_area):
+            container = area.widget()
+            if not container:
+                continue
+            for list_widget in container.findChildren(PreviewListWidget):
+                yield list_widget, area
+
+    def _fit_grid_height(self, list_widget, scroll_area):
+        """Altura fija para que la lista muestre todas sus filas sin scroll propio."""
+        item_size = self.current_thumbnail_size + (list_widget.property("thumb_padding") or 10)
+        spacing = list_widget.spacing()
+        viewport_width = scroll_area.viewport().width() - 30
+        if viewport_width < 100:
+            viewport_width = 800  # Pestaña aún oculta: se recalcula al redimensionar
+        num_cols = max(1, viewport_width // (item_size + spacing))
+        rows = (list_widget.count() + num_cols - 1) // num_cols
+        list_widget.setFixedHeight(rows * item_size + (rows + 1) * spacing)
+
+    def _relayout_galleries(self):
+        for list_widget, area in self._gallery_lists():
+            if list_widget.property("fixed_grid"):
+                self._fit_grid_height(list_widget, area)
+
+    def _apply_thumbnail_size(self):
+        """Aplica el zoom a las listas existentes sin reconstruir la galería."""
+        size = self.current_thumbnail_size
+        for list_widget, _area in self._gallery_lists():
+            list_widget.setIconSize(QSize(size, size))
+            cell = size + (list_widget.property("thumb_padding") or 10)
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                item.setSizeHint(QSize(cell, cell))
+                # Las ya cargadas se reescalan al volver a pedirlas (salen de la caché en RAM)
+                if item.data(Qt.UserRole + 1) == "loaded":
+                    item.setData(Qt.UserRole + 1, "not_loaded")
+        self._relayout_galleries()
+        QTimer.singleShot(0, self._load_main_visible_thumbnails)
+        QTimer.singleShot(0, self._load_visible_video_thumbnails)
 
     @Slot(str)
     def _open_photo_detail(self, original_path):
@@ -5561,11 +5578,8 @@ class VisageVaultApp(QMainWindow):
                 self.current_thumbnail_size = new_size
                 config_manager.set_thumbnail_size(new_size)
 
-                # 5. Redibujar las vistas (igual que al redimensionar)
-                if self.photos_by_year_month:
-                    self._display_photos()
-                if self.videos_by_year_month:
-                    self._display_videos()
+                # 5. Aplicar a las listas existentes (sin reconstruir la galería)
+                self._apply_thumbnail_size()
 
             event.accept() # Marcar el evento como manejado
 
@@ -5731,6 +5745,7 @@ class VisageVaultApp(QMainWindow):
         list_widget.setResizeMode(QListWidget.Adjust)
 
         list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
+        list_widget.setProperty("thumb_padding", 8)
         item_w = self.current_thumbnail_size + 8
         item_h = self.current_thumbnail_size + 8
 
@@ -5782,6 +5797,7 @@ class VisageVaultApp(QMainWindow):
         list_widget.setResizeMode(QListWidget.Adjust)
 
         list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
+        list_widget.setProperty("thumb_padding", 8)
         item_w = self.current_thumbnail_size + 8
         item_h = self.current_thumbnail_size + 8
 
