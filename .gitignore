@@ -32,6 +32,8 @@ AppDir/
 *.zip
 *.tar.gz
 actualiza.sh
+compila.sh
+pack_linux.sh
 
 # ==================================
 # Archivos de configuración
