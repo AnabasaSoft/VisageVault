@@ -6741,68 +6741,6 @@ class VisageVaultApp(QMainWindow):
 
         self.safe_container_layout.addStretch(1)
 
-    def _safe_context_menu(self, pos, encrypted_path):
-        menu = QMenu(self)
-        action_restore = menu.addAction("Restaurar a Galería (Desencriptar)")
-        action = menu.exec(QCursor.pos())
-
-        if action == action_restore:
-            self._restore_from_safe(encrypted_path)
-
-    def _restore_from_safe(self, encrypted_path):
-        """Restaura un archivo y recupera su fecha personalizada en el sistema."""
-        # 1. Buscar info en DB
-        cursor = self.db.conn.execute("SELECT * FROM safe_files WHERE encrypted_path = ?", (encrypted_path,))
-        row = cursor.fetchone()
-        if not row: return
-
-        original_path = row['original_path']
-        media_type = row['media_type']
-        # Recuperamos la fecha que tenía antes de entrar (YYYY-MM)
-        saved_date = row['original_date']
-
-        try:
-            # 2. Desencriptar el archivo principal (Esto crea un archivo con fecha de HOY)
-            CryptoManager.process_file(encrypted_path, original_path, self.current_safe_password)
-
-            # 3. Si es vídeo, limpiar también su thumbnail encriptado si existe
-            if media_type == 'video':
-                thumb_enc_path = encrypted_path + ".thumb"
-                if os.path.exists(thumb_enc_path):
-                    try: os.remove(thumb_enc_path)
-                    except: pass
-
-            # 4. Restaurar fechas en la BASE DE DATOS
-            year = saved_date[:4]
-            month = saved_date[5:7]
-
-            if media_type == 'video':
-                self.db.update_video_date(original_path, year, month)
-            else:
-                self.db.update_photo_date(original_path, year, month)
-
-            # --- 5. CORRECCIÓN CRÍTICA: RESTAURAR FECHA EN EL ARCHIVO FÍSICO ---
-            # Esto obliga al archivo en el disco a tener la fecha antigua, no la de hoy.
-            self._update_file_metadata_on_disk(original_path, year, month)
-            # -------------------------------------------------------------------
-
-            # 6. Limpiar DB y archivo encriptado
-            self.db.remove_from_safe(encrypted_path)
-            if os.path.exists(encrypted_path):
-                os.remove(encrypted_path)
-
-            # 7. Notificar y refrescar
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(self, "Éxito", "Archivo restaurado a su ubicación original.")
-
-            self._load_safe_content()
-            self._perform_auto_refresh()
-
-        except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Error", f"Error al restaurar: {e}")
-            print(f"Error restaurando: {e}")
-
     def _move_to_safe_box(self, items, is_video):
         """Prepara y lanza el hilo de encriptación en segundo plano."""
         # 1. Gestionar contraseña
@@ -6887,84 +6825,103 @@ class VisageVaultApp(QMainWindow):
         action = menu.exec(list_widget.mapToGlobal(pos))
 
         if action == action_restore:
-            # Obtenemos los seleccionados
-            selected_items = list_widget.selectedItems()
-            count = 0
-            for sel in selected_items:
-                data = sel.data(Qt.UserRole)
-                self._restore_from_safe(data['encrypted_path']) # Reutilizamos tu función de restaurar
-                count += 1
+            # Copiamos las rutas ANTES de restaurar: refrescar la vista destruye los items
+            encrypted_paths = [sel.data(Qt.UserRole)['encrypted_path'] for sel in list_widget.selectedItems()]
+            self._restore_files_from_safe(encrypted_paths)
 
-            if count > 0:
-                self._load_safe_content() # Recargar UI
-                # También refrescamos la galería principal por si acaso
-                self._perform_auto_refresh()
+    def _restore_files_from_safe(self, encrypted_paths):
+        """Restaura varios archivos y refresca las vistas UNA sola vez al final."""
+        if not encrypted_paths: return
 
-    def _restore_from_safe(self, encrypted_path):
-        """Restaura un archivo y recupera su fecha personalizada en la BD y el sistema."""
-        # 1. Buscar info en DB
-        cursor = self.db.conn.execute("SELECT * FROM safe_files WHERE encrypted_path = ?", (encrypted_path,))
-        row = cursor.fetchone()
-        if not row: return
-
-        original_path = row['original_path']
-        media_type = row['media_type']
-        # Recuperamos la fecha guardada (YYYY-MM)
-        saved_date = row['original_date']
-
-        # Separar año y mes
-        if saved_date and "-" in saved_date:
-            year = saved_date.split("-")[0]
-            month = saved_date.split("-")[1]
-        else:
-            year, month = "0000", "00"
-
+        restored = 0
+        errors = []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            # 2. Desencriptar el archivo principal
-            CryptoManager.process_file(encrypted_path, original_path, self.current_safe_password)
+            for i, encrypted_path in enumerate(encrypted_paths):
+                self._set_status(f"Restaurando ({i+1}/{len(encrypted_paths)})...")
+                QApplication.processEvents()
+                try:
+                    self._restore_from_safe(encrypted_path)
+                    restored += 1
+                except Exception as e:
+                    print(f"Error restaurando {encrypted_path}: {e}")
+                    errors.append(str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
 
-            # 3. Limpiar thumbnail encriptado si existe (para vídeos)
-            if media_type == 'video':
-                thumb_enc_path = encrypted_path + ".thumb"
-                if os.path.exists(thumb_enc_path):
-                    try: os.remove(thumb_enc_path)
-                    except: pass
-
-            # --- 4. CORRECCIÓN: INSERTAR EN LA BASE DE DATOS (NO ACTUALIZAR) ---
-            # Como la foto se borró al entrar, ahora debemos CREARLA de nuevo con la fecha correcta.
-            with self.db.conn:
-                if media_type == 'video':
-                    self.db.conn.execute("""
-                        INSERT OR REPLACE INTO videos (filepath, year, month, is_hidden)
-                        VALUES (?, ?, ?, 0)
-                    """, (original_path, year, month))
-                else:
-                    # Insertamos y ponemos scanned_for_faces=0 para que vuelva a buscar caras
-                    self.db.conn.execute("""
-                        INSERT OR REPLACE INTO photos (filepath, year, month, scanned_for_faces, is_hidden)
-                        VALUES (?, ?, ?, 0, 0)
-                    """, (original_path, year, month))
-            # -------------------------------------------------------------------
-
-            # 5. Restaurar fecha física del archivo (para que coincida)
-            self._update_file_metadata_on_disk(original_path, year, month)
-
-            # 6. Limpiar DB Safe y archivo encriptado
-            self.db.remove_from_safe(encrypted_path)
-            if os.path.exists(encrypted_path):
-                os.remove(encrypted_path)
-
-            # 7. Notificar y refrescar
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.information(self, "Éxito", "Archivo restaurado a su ubicación original.")
-
-            self._load_safe_content()
+        self._load_safe_content()
+        if restored:
             self._perform_auto_refresh()
 
+        self._set_status(f"{restored} archivo(s) restaurado(s) de la caja fuerte.")
+        if errors:
+            QMessageBox.warning(
+                self, "Restauración incompleta",
+                f"Restaurados: {restored} de {len(encrypted_paths)}.\n\nErrores:\n" + "\n".join(errors[:10])
+            )
+        else:
+            QMessageBox.information(self, "Éxito", f"{restored} archivo(s) restaurado(s) a su ubicación original.")
+
+    def _restore_from_safe(self, encrypted_path):
+        """
+        Restaura UN archivo y recupera su fecha en la BD y en el sistema.
+        No toca la interfaz; lanza una excepción si algo falla.
+        """
+        row = self.db.conn.execute("SELECT * FROM safe_files WHERE encrypted_path = ?", (encrypted_path,)).fetchone()
+        if not row:
+            raise RuntimeError(f"{Path(encrypted_path).name}: no figura en la caja fuerte")
+
+        original_path = row['original_path']
+        name = Path(original_path).name
+        media_type = row['media_type']
+
+        # Fecha guardada (YYYY-MM)
+        saved_date = row['original_date']
+        if saved_date and "-" in saved_date:
+            year, month = saved_date.split("-", 1)
+        else:
+            year, month = NO_DATE_YEAR, NO_DATE_MONTH
+        if not _is_known_year(year):
+            year, month = NO_DATE_YEAR, NO_DATE_MONTH
+
+        # No sobrescribir un archivo nuevo que ocupe ya la ruta original
+        if os.path.exists(original_path):
+            raise RuntimeError(f"{name}: ya existe un archivo en {original_path}")
+
+        # 1. Desencriptar a un temporal y renombrar: un fallo no deja un archivo a medias
+        temp_path = original_path + ".restoring"
+        try:
+            CryptoManager.process_file(encrypted_path, temp_path, self.current_safe_password)
+            os.replace(temp_path, original_path)
         except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Error", f"Error al restaurar: {e}")
-            print(f"Error restaurando: {e}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise RuntimeError(f"{name}: {e}") from e
+
+        # 2. Volver a darlo de alta en la BD (se borró al entrar en la caja fuerte)
+        with self.db.conn:
+            if media_type == 'video':
+                self.db.conn.execute("""
+                    INSERT OR REPLACE INTO videos (filepath, year, month, is_hidden)
+                    VALUES (?, ?, ?, 0)
+                """, (original_path, year, month))
+            else:
+                # scanned_for_faces=0 para que vuelva a buscar caras
+                self.db.conn.execute("""
+                    INSERT OR REPLACE INTO photos (filepath, year, month, scanned_for_faces, is_hidden)
+                    VALUES (?, ?, ?, 0, 0)
+                """, (original_path, year, month))
+
+        # 3. Restaurar la fecha física del archivo (si se conoce)
+        if _is_known_year(year):
+            self._update_file_metadata_on_disk(original_path, year, month)
+
+        # 4. Limpiar la caja fuerte (registro, archivo cifrado y miniatura de vídeo)
+        self.db.remove_from_safe(encrypted_path)
+        for leftover in (encrypted_path, encrypted_path + ".thumb"):
+            if os.path.exists(leftover):
+                try: os.remove(leftover)
+                except OSError as e: print(f"No se pudo borrar {leftover}: {e}")
 
     @Slot(str, bool)
     def _on_safe_item_processed(self, original_path, is_video):

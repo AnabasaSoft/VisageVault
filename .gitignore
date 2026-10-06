@@ -31,6 +31,7 @@ AppDir/
 *.desktop
 *.zip
 *.tar.gz
+actualiza.sh
 
 # ==================================
 # Archivos de configuración
