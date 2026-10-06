@@ -2810,6 +2810,10 @@ class VisageVaultApp(QMainWindow):
         # --- Hilos y Señales ---
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(os.cpu_count() or 4)
+        # Pool aparte para la agrupación de caras: el de miniaturas se vacía
+        # con clear() al cambiar de pestaña y la cancelaría
+        self.cluster_pool = QThreadPool()
+        self.cluster_pool.setMaxThreadCount(1)
 
         # Usamos la MISMA señal para todas las miniaturas (fotos, vídeos, caras)
         self.thumb_signals = ThumbnailLoaderSignals()
@@ -4979,10 +4983,17 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(int)
     def _on_tab_changed(self, index):
-        self.threadpool.clear()
+        # Prioridad a la pestaña nueva: se descartan las cargas pendientes de la anterior
+        self._cancel_pending_loads()
         tab_name = self.tab_widget.tabText(index)
 
-        if tab_name == "Personas":
+        if tab_name == "Fotos":
+            QTimer.singleShot(0, self._load_main_visible_thumbnails)
+
+        elif tab_name == "Vídeos":
+            QTimer.singleShot(0, self._load_visible_video_thumbnails)
+
+        elif tab_name == "Personas":
             self._set_status("Mostrando caras...")
 
             if self.face_loading_label:
@@ -5000,6 +5011,12 @@ class VisageVaultApp(QMainWindow):
             else:
                  self._load_existing_faces_async()
 
+            # Reintentar lo que se canceló al salir de la pestaña
+            if self.left_people_stack.currentIndex() == 1:
+                QTimer.singleShot(0, self._load_person_visible_thumbnails)
+            else:
+                self._reload_pending_faces()
+
             if self.face_scan_thread and self.face_scan_thread.isRunning():
                  self._set_status("Mostrando caras. Escaneo sigue en segundo plano...")
 
@@ -5009,6 +5026,46 @@ class VisageVaultApp(QMainWindow):
 
         elif tab_name == "Nube":
             QTimer.singleShot(100, self._load_visible_cloud_thumbnails)
+
+    def _cancel_pending_loads(self):
+        """
+        Vacía la cola de cargas en segundo plano y deja lo cancelado marcado
+        para reintentarlo. Las cargas que ya estaban en marcha terminan igual;
+        si alguna se repite, el resultado es el mismo.
+        """
+        self.threadpool.clear()
+
+        list_items = list(self.photo_list_widget_items.values()) + list(self.video_list_widget_items.values())
+        cloud_widget = self.cloud_scroll_area.widget()
+        if cloud_widget:
+            for list_widget in cloud_widget.findChildren(PreviewListWidget):
+                list_items += [list_widget.item(i) for i in range(list_widget.count())]
+        for item in list_items:
+            try:
+                if item.data(Qt.UserRole + 1) == "loading":
+                    item.setData(Qt.UserRole + 1, "not_loaded")
+            except RuntimeError:
+                pass  # Item ya destruido al redibujar
+
+        person_widget = self.person_photo_scroll_area.widget()
+        if person_widget:
+            for label in person_widget.findChildren(ZoomableClickableLabel):
+                if label.property("original_path") and label.property("loaded") is None:
+                    label.setProperty("loaded", False)
+
+    def _reload_pending_faces(self):
+        """Vuelve a lanzar la carga de las caras que se quedaron sin imagen."""
+        for i in range(self.unknown_faces_layout.count()):
+            widget = self.unknown_faces_layout.itemAt(i).widget()
+            if not widget or widget.property("face_id") is None:
+                continue
+            if widget.property("face_loaded") or widget.property("face_failed"):
+                continue
+            source_path = widget.property("source_path")
+            location = widget.property("location")
+            if source_path and location:
+                self.threadpool.start(FaceLoader(
+                    self.face_loader_signals, widget.property("face_id"), source_path, location))
 
     def _load_people_list(self):
         self.people_tree_widget.clear()
@@ -5074,6 +5131,8 @@ class VisageVaultApp(QMainWindow):
 
             face_widget.setProperty("face_id", face_id)
             face_widget.setProperty("is_deleted_view", is_deleted_view)
+            face_widget.setProperty("source_path", face_row['filepath'])
+            face_widget.setProperty("location", face_row['location'])
             face_widget.rightClicked.connect(self._on_face_right_clicked)
             face_widget.clicked.connect(self._on_face_clicked)
 
@@ -5279,6 +5338,8 @@ class VisageVaultApp(QMainWindow):
         face_widget.setProperty("face_id", face_id)
         face_widget.setProperty("photo_path", photo_path)
         face_widget.setProperty("is_deleted_view", False)
+        face_widget.setProperty("source_path", photo_path)
+        face_widget.setProperty("location", location_str)
 
         face_widget.clicked.connect(self._on_face_clicked)
         face_widget.rightClicked.connect(self._on_face_right_clicked)
@@ -5349,12 +5410,14 @@ class VisageVaultApp(QMainWindow):
             placeholder.setPixmap(pixmap)
             placeholder.setText("")
             placeholder.setProperty("photo_path", photo_path)
+            placeholder.setProperty("face_loaded", True)
         else:
             if self.unknown_faces_group.title() != "Caras Sin Asignar":
                 return
             face_widget = CircularFaceLabel(pixmap)
             face_widget.setProperty("face_id", face_id)
             face_widget.setProperty("photo_path", photo_path)
+            face_widget.setProperty("face_loaded", True)
             face_widget.setProperty("is_deleted_view", False)
             face_widget.clicked.connect(self._on_face_clicked)
             face_widget.rightClicked.connect(self._on_face_right_clicked)
@@ -5374,6 +5437,7 @@ class VisageVaultApp(QMainWindow):
                 break
         if placeholder:
             placeholder.setText("Error")
+            placeholder.setProperty("face_failed", True)
 
     # Tiempo máximo de espera al cerrar para que las tareas en curso terminen
     SHUTDOWN_TIMEOUT_S = 15
@@ -5452,8 +5516,10 @@ class VisageVaultApp(QMainWindow):
                     stuck.append(thread)
             except RuntimeError:
                 pass
-        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-        pool_done = self.threadpool.waitForDone(remaining_ms)
+        pool_done = True
+        for pool in (self.threadpool, self.cluster_pool):
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            pool_done = pool.waitForDone(remaining_ms) and pool_done
 
         QApplication.restoreOverrideCursor()
 
@@ -5517,7 +5583,7 @@ class VisageVaultApp(QMainWindow):
         self.cluster_faces_button.setEnabled(False)
         self._set_status("Iniciando búsqueda de duplicados...")
         worker = ClusterWorker(self.cluster_signals, self.db.db_path)
-        self.threadpool.start(worker)
+        self.cluster_pool.start(worker)
 
     @Slot(list)
     def _handle_clusters_found(self, clusters: list):
@@ -6318,8 +6384,8 @@ class VisageVaultApp(QMainWindow):
         """Detiene de forma SEGURA cualquier descarga o escaneo."""
         self._set_status("Deteniendo operaciones actuales...")
 
-        # 1. Vaciar cola de descargas de miniaturas
-        self.threadpool.clear()
+        # 1. Vaciar cola de descargas de miniaturas (y reintentar las locales canceladas)
+        self._cancel_pending_loads()
 
         # 2. Detener escáner de carpetas si existe
         if self.drive_scan_thread:
