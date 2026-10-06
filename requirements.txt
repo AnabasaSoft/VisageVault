@@ -10,6 +10,7 @@ numpy
 opencv-python-headless
 rawpy
 watchdog
+Send2Trash
 requests
 google-auth
 google-auth-oauthlib

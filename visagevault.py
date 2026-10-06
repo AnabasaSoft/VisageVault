@@ -94,6 +94,7 @@ import db_manager
 from db_manager import VisageVaultDB
 import face_recognition
 from PIL import Image, ImageOps
+from send2trash import send2trash
 import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
@@ -832,6 +833,44 @@ def drive_cache_path(file_id, name):
     if not _SAFE_EXTENSION.match(extension):
         extension = ""
     return os.path.join(paths.cache_subdir("drive_cache"), f"{file_id}{extension}")
+
+def send_files_to_trash(parent, file_paths):
+    """
+    Mueve los archivos a la papelera del sistema. Si alguno no se puede
+    (p. ej. en una unidad de red o un disco sin papelera), pregunta antes de
+    borrarlo definitivamente. Devuelve las rutas que ya no están en su sitio.
+    """
+    removed, failed = [], []
+    for path in file_paths:
+        if not os.path.exists(path):
+            removed.append(path)
+            continue
+        try:
+            send2trash(path)
+            removed.append(path)
+        except Exception as e:
+            print(f"No se pudo mover a la papelera {path}: {e}")
+            failed.append(path)
+
+    if failed:
+        names = "\n".join(Path(p).name for p in failed[:10]) + ("\n..." if len(failed) > 10 else "")
+        answer = QMessageBox.question(
+            parent,
+            "Papelera no disponible",
+            f"No se pudieron mover a la papelera {len(failed)} archivo(s) "
+            f"(p. ej. en una unidad de red o un disco sin papelera):\n\n{names}\n\n"
+            "¿Eliminarlos DEFINITIVAMENTE? Esta acción no se puede deshacer.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            for path in failed:
+                try:
+                    os.remove(path)
+                    removed.append(path)
+                except OSError as e:
+                    print(f"Error eliminando {path}: {e}")
+    return removed
 
 def get_face_cache_path(face_id) -> str:
     """Ruta del recorte de una cara en la caché de disco."""
@@ -2237,7 +2276,7 @@ class HelpDialog(QDialog):
         <ul>
             <li>Cambiar su fecha (y actualizar el archivo).</li>
             <li>Ocultarlo de la vista principal.</li>
-            <li>Eliminarlo permanentemente.</li>
+            <li>Moverlo a la papelera.</li>
         </ul>
         </p>
 
@@ -2673,7 +2712,7 @@ class DuplicateDialog(QDialog):
         layout.addLayout(info_layout)
 
         # Botón Borrar
-        btn_del = QPushButton("🗑️ Borrar ésta")
+        btn_del = QPushButton("🗑️ A la papelera")
         btn_del.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
         btn_del.clicked.connect(lambda: self._delete_file(path, card))
         layout.addWidget(btn_del)
@@ -2681,14 +2720,14 @@ class DuplicateDialog(QDialog):
         self.preview_layout.addWidget(card)
 
     def _delete_file(self, path, card_widget):
-        reply = QMessageBox.question(self, "Confirmar", f"¿Borrar definitivamente?\n{Path(path).name}", QMessageBox.Yes | QMessageBox.No)
+        reply = QMessageBox.question(self, "Confirmar", f"¿Mover a la papelera?\n{Path(path).name}", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             try:
-                # 1. Borrar de DB
+                # 1. Papelera (primero el disco: si falla, la BD queda intacta)
+                if path not in send_files_to_trash(self, [path]):
+                    return
+                # 2. Quitar de la BD
                 self.db.delete_photo_permanently(path)
-                # 2. Borrar de Disco
-                if os.path.exists(path):
-                    os.remove(path)
 
                 self.deleted_paths.add(path)
                 card_widget.deleteLater()
@@ -3932,7 +3971,7 @@ class VisageVaultApp(QMainWindow):
             action_restore = menu.addAction("Restaurar a la galería")
             action_restore.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
 
-            action_delete = menu.addAction("Eliminar del disco (Permanente)")
+            action_delete = menu.addAction("Mover a la papelera")
             action_delete.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
 
             action = menu.exec(list_widget.mapToGlobal(pos))
@@ -3969,7 +4008,7 @@ class VisageVaultApp(QMainWindow):
             # 4. Ocultar y Eliminar
             action_hide = menu.addAction("Ocultar de la vista")
 
-            action_delete = menu.addAction("Eliminar del disco (Permanente)")
+            action_delete = menu.addAction("Mover a la papelera")
             action_delete.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
 
             # Ejecutar menú
@@ -4192,12 +4231,12 @@ class VisageVaultApp(QMainWindow):
                 self.scroll_area.setUpdatesEnabled(True)
 
     def _delete_selected_media(self, items, is_video, from_hidden_view=False):
-        """Elimina físicamente los archivos y de la BD."""
+        """Mueve los archivos a la papelera del sistema y los quita de la BD."""
         count = len(items)
         confirm = QMessageBox.question(
             self,
-            "Confirmar eliminación",
-            f"¿Estás seguro de que quieres eliminar {count} archivo(s) de tu DISCO DURO?\nEsta acción no se puede deshacer.",
+            "Mover a la papelera",
+            f"¿Mover {count} archivo(s) a la papelera?\nPodrás recuperarlos desde la papelera del sistema.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
@@ -4207,13 +4246,10 @@ class VisageVaultApp(QMainWindow):
         paths_to_delete = [item.data(Qt.UserRole) for item in items]
         deleted_count = 0
 
-        for path in paths_to_delete:
+        # 1. Papelera (los que no se puedan mover ni el usuario quiera borrar se quedan)
+        for path in send_files_to_trash(self, paths_to_delete):
             try:
-                # 1. Borrar del disco
-                if os.path.exists(path):
-                    os.remove(path)
-
-                # 2. Borrar de la BD
+                # 2. Quitar de la BD
                 if is_video:
                     self.db.delete_video_permanently(path)
                     # Solo borrar de memoria si NO estaba oculta (si estaba oculta, ya no estaba en memoria)
@@ -4229,7 +4265,7 @@ class VisageVaultApp(QMainWindow):
                 print(f"Error eliminando {path}: {e}")
                 self._set_status(f"Error eliminando: {Path(path).name}")
 
-        self._set_status(f"{deleted_count} archivos eliminados permanentemente.")
+        self._set_status(f"{deleted_count} archivo(s) movido(s) a la papelera.")
 
         # Refrescar la vista correspondiente
         if from_hidden_view:
