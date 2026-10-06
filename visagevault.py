@@ -39,6 +39,7 @@ import requests # Para bajar thumbnails
 from drive_manager import DriveManager
 import config_manager # Para guardar la carpeta elegida
 import safe_crypto
+import redeye
 from safe_crypto import CryptoManager
 
 # --- Silenciar solo el aviso de pkg_resources ---
@@ -3865,85 +3866,28 @@ class VisageVaultApp(QMainWindow):
                 self._move_to_safe_box(selected_items, is_video)
 
     def _remove_red_eye_from_image(self, image_path):
-        """Detecta y corrige ojos rojos automáticamente usando OpenCV."""
+        """Corrige los ojos rojos (ver redeye.py). True si se ha modificado la foto."""
         try:
-            # 1. Leer imagen
-            img = cv2.imread(image_path)
-            if img is None:
-                return False
-
-            img_out = img.copy()
-
-            # 2. Cargar clasificador de ojos pre-entrenado (Haar Cascade)
-            # OpenCV suele incluirlo en cv2.data.haarcascades
-            eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
-            eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
-
-            if eye_cascade.empty():
-                print("Error: No se encontró el clasificador de ojos XML.")
-                return False
-
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # 3. Detectar ojos
-            eyes = eye_cascade.detectMultiScale(gray, 1.3, 5)
-
-            if len(eyes) == 0:
-                return False # No se detectaron ojos
-
-            changed = False
-
-            for (x, y, w, h) in eyes:
-                # Extraer la región de interés (ROI) del ojo
-                eye_roi = img_out[y:y+h, x:x+w]
-
-                # Separar canales: Blue, Green, Red
-                b = eye_roi[:, :, 0]
-                g = eye_roi[:, :, 1]
-                r = eye_roi[:, :, 2]
-
-                # 4. Crear máscara de "ojo rojo"
-                # La rojez suele ser mucho mayor que el verde y el azul combinados
-                bg_sum = cv2.add(b, g)
-                mask = (r > 150) & (r > bg_sum) # Umbral simple
-                mask = mask.astype(np.uint8) * 255
-
-                # Refinar la máscara (llenar huecos)
-                mask = cv2.dilate(mask, None, iterations=1)
-
-                # Si hay píxeles rojos detectados
-                if np.sum(mask) > 0:
-                    changed = True
-                    # 5. Corregir: Reemplazar el canal rojo con el promedio de verde y azul
-                    mean_bg = cv2.addWeighted(b, 0.5, g, 0.5, 0)
-
-                    # Aplicar solo donde diga la máscara
-                    eye_roi_fixed = eye_roi.copy()
-                    # Usamos bitwise para mezclar
-                    # Donde la mascara es blanca, usamos el promedio cian (mean_bg)
-                    # Donde es negra, dejamos el original
-
-                    # Forma numpy rápida:
-                    # Convertir máscara a booleano para indexar
-                    mask_bool = mask.astype(bool)
-                    eye_roi_fixed[:, :, 2][mask_bool] = mean_bg[mask_bool]
-
-                    # Volver a poner el ROI corregido en la imagen principal
-                    img_out[y:y+h, x:x+w] = eye_roi_fixed
-
-            if changed:
-                # Guardar resultado sobrescribiendo (o podrías guardar copia)
-                cv2.imwrite(image_path, img_out)
-
-                # Actualizar fecha de modificación para que se refresquen metadatos si es necesario
-                os.utime(image_path, None)
-                return True
-
-            return False
-
+            return redeye.remove_red_eyes(image_path)
         except Exception as e:
             print(f"Error corrigiendo ojos rojos en {image_path}: {e}")
             return False
+
+    def _invalidate_photo_caches(self, photo_path):
+        """Borra la miniatura (disco y RAM) y los recortes de caras de una foto modificada."""
+        thumb_file = get_thumbnail_path(photo_path)
+        evict_cached_image(thumb_file)
+        leftovers = [str(thumb_file)]
+        row = self.db.conn.execute("SELECT id FROM photos WHERE filepath = ?", (photo_path,)).fetchone()
+        if row:
+            face_rows = self.db.conn.execute("SELECT id FROM faces WHERE photo_id = ?", (row['id'],))
+            leftovers += [get_face_cache_path(r['id']) for r in face_rows]
+        for path in leftovers:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as e:
+                print(f"No se pudo borrar {path}: {e}")
 
     def _restore_selected_media(self, items, is_video):
         """Restaura los elementos seleccionados a la vista principal."""
@@ -5781,21 +5725,15 @@ class VisageVaultApp(QMainWindow):
 
             if self._remove_red_eye_from_image(path):
                 successes += 1
-
-                # Borrar miniatura antigua de la caché para obligar a regenerarla
-                # (Asumiendo que importaste hashlib y THUMBNAIL_DIR de thumbnail_generator o copiaste la lógica)
-                # Una forma rápida sin importar es borrarla si sabemos la ruta,
-                # o simplemente recargar el loader que la regenerará si detecta cambio (depende de tu implementación).
-                # Aquí simplemente recargamos la vista.
+                # La caché va por ruta: hay que borrarla para que se regenere
+                self._invalidate_photo_caches(path)
 
             processed += 1
 
         self._set_status(f"Proceso finalizado. {successes} fotos corregidas de {processed}.")
 
         if successes > 0:
-            # Refrescar la vista actual para ver cambios (o regenerar thumbnails)
-            # Lo ideal sería invalidar la caché de thumbnails de estas fotos específicas
-            # Como solución simple, recargamos la vista:
+            # Redibujar para regenerar las miniaturas invalidadas
             self._display_photos()
 
     @Slot()
