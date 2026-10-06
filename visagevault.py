@@ -190,8 +190,9 @@ def needs_removal_confirmation(n_missing, n_known):
 # Las miniaturas se cargan en hilos secundarios (QRunnable). QPixmap solo puede
 # usarse en el hilo de la interfaz, así que los workers trabajan con QImage
 # (seguro entre hilos) y la conversión a QPixmap se hace al recibir la señal.
-_IMAGE_CACHE_SIZE = 500
+_IMAGE_CACHE_MAX_BYTES = 96 * 1024 * 1024  # ~500 miniaturas de 256 px
 _image_cache = OrderedDict()
+_image_cache_bytes = 0
 _image_cache_lock = threading.Lock()
 
 def get_cached_image(filepath: str) -> QImage:
@@ -208,11 +209,16 @@ def get_cached_image(filepath: str) -> QImage:
     if image.isNull():
         return image
 
+    global _image_cache_bytes
     with _image_cache_lock:
+        previous = _image_cache.pop(filepath, None)
+        if previous is not None:
+            _image_cache_bytes -= previous.sizeInBytes()
         _image_cache[filepath] = image
-        _image_cache.move_to_end(filepath)
-        while len(_image_cache) > _IMAGE_CACHE_SIZE:
-            _image_cache.popitem(last=False)
+        _image_cache_bytes += image.sizeInBytes()
+        while _image_cache_bytes > _IMAGE_CACHE_MAX_BYTES and len(_image_cache) > 1:
+            _, evicted = _image_cache.popitem(last=False)
+            _image_cache_bytes -= evicted.sizeInBytes()
     return image
 
 def resource_path(relative_path):
@@ -833,8 +839,11 @@ def get_face_cache_path(face_id) -> str:
 
 def evict_cached_image(filepath: str):
     """Quita una miniatura de la caché en RAM."""
+    global _image_cache_bytes
     with _image_cache_lock:
-        _image_cache.pop(str(filepath), None)
+        evicted = _image_cache.pop(str(filepath), None)
+        if evicted is not None:
+            _image_cache_bytes -= evicted.sizeInBytes()
 
 class FaceLoader(QRunnable):
     def __init__(self, signals: FaceLoaderSignals, face_id: int, photo_path: str, location_str: str):

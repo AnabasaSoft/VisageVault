@@ -1,17 +1,34 @@
 # thumbnail_generator.py
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pathlib import Path
 import os
 import hashlib
+import shutil
+import threading
 import cv2
 import rawpy
 import paths
 
-THUMBNAIL_SIZE = (128, 128)
+THUMBNAIL_SIZE = (128, 128)       # Tamaño de visualización por defecto (pestaña Personas)
+CACHE_THUMBNAIL_SIZE = (256, 256)  # Tamaño guardado en caché: el zoom máximo, para que no se pixele
+
+# Carpeta versionada: si cambia el formato de las miniaturas (tamaño, orientación...)
+# se usa una nueva y la anterior se borra, para que todas se regeneren.
+CACHE_SUBDIR = "local_snapshot_cache_v2"
+OLD_CACHE_SUBDIRS = ("local_snapshot_cache",)
+_old_cache_cleaned = False
+_old_cache_lock = threading.Lock()
 
 def get_cache_dir():
     """Carpeta de caché de miniaturas locales."""
-    return Path(paths.cache_subdir("local_snapshot_cache"))
+    global _old_cache_cleaned
+    if not _old_cache_cleaned:
+        with _old_cache_lock:
+            if not _old_cache_cleaned:
+                for old in OLD_CACHE_SUBDIRS:
+                    shutil.rmtree(os.path.join(paths.cache_dir(), old), ignore_errors=True)
+                _old_cache_cleaned = True
+    return Path(paths.cache_subdir(CACHE_SUBDIR))
 
 def get_thumbnail_path(original_filepath: str) -> Path:
     """Genera la ruta donde se guardará la miniatura."""
@@ -33,8 +50,11 @@ def generate_image_thumbnail(original_filepath: str) -> str | None:
         img_to_process = None
         try:
             img_pil = Image.open(original_filepath)
+            # JPEG: decodificar ya reducido (mucho más rápido en fotos grandes)
+            img_pil.draft("RGB", (CACHE_THUMBNAIL_SIZE[0] * 2, CACHE_THUMBNAIL_SIZE[1] * 2))
             img_pil.load()
-            img_to_process = img_pil
+            # Aplicar la orientación EXIF (fotos hechas en vertical)
+            img_to_process = ImageOps.exif_transpose(img_pil)
         except (UnidentifiedImageError, IOError):
             try:
                 with rawpy.imread(str(original_filepath)) as raw:
@@ -55,8 +75,8 @@ def generate_image_thumbnail(original_filepath: str) -> str | None:
             img_to_process = img_to_process.convert('RGB')
 
         # Redimensionar antes de guardar para ahorrar espacio
-        img_to_process.thumbnail(THUMBNAIL_SIZE)
-        img_to_process.save(thumbnail_path, "JPEG", quality=80)
+        img_to_process.thumbnail(CACHE_THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
+        img_to_process.save(thumbnail_path, "JPEG", quality=85)
         img_to_process.close()
 
         return str(thumbnail_path)
@@ -83,10 +103,10 @@ def generate_video_thumbnail(original_filepath: str) -> str | None:
 
         h, w = frame.shape[:2]
         if h > w:
-            new_h = THUMBNAIL_SIZE[1]
+            new_h = CACHE_THUMBNAIL_SIZE[1]
             new_w = int(w * (new_h / h))
         else:
-            new_w = THUMBNAIL_SIZE[0]
+            new_w = CACHE_THUMBNAIL_SIZE[0]
             new_h = int(h * (new_w / w))
 
         resized_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
