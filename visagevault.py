@@ -1369,20 +1369,6 @@ class PhotoDetailDialog(QDialog):
         self.resize(1000, 800)
 
         self._setup_ui()
-        style_sheet = """
-            QTreeWidget::item:selected {
-                background-color: #3daee9;
-                color: white;
-            }
-            QTreeWidget::item:selected:!active {
-                background-color: #3daee9; /* Mismo color aunque pierda el foco */
-                color: white;
-            }
-        """
-        self.date_tree_widget.setStyleSheet(style_sheet)
-        self.video_date_tree_widget.setStyleSheet(style_sheet)
-        self.cloud_date_tree.setStyleSheet(style_sheet) # <--- NUEVO
-
         self._load_photo()
         self._load_current_date() # Renombrado de _load_metadata
 
