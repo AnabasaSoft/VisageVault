@@ -3,6 +3,7 @@ import pickle
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+import paths
 
 class DriveAuthenticator:
     SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -28,14 +29,7 @@ class DriveAuthenticator:
         self.token_file = self._get_token_path()
 
     def _get_token_path(self):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        filename = "token.json"
-        # Si no podemos escribir aquí (instalación en /usr/share), vamos a ~/.local
-        if not os.access(base_dir, os.W_OK):
-            user_dir = os.path.join(os.path.expanduser("~"), ".local", "share", "visagevault")
-            os.makedirs(user_dir, exist_ok=True)
-            return os.path.join(user_dir, filename)
-        return os.path.join(base_dir, filename)
+        return os.path.join(paths.data_dir(), "token.json")
 
     def get_service(self, silent=False):
         if os.path.exists(self.token_file):

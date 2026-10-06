@@ -5,25 +5,13 @@ import os
 import hashlib
 import cv2
 import rawpy
+import paths
 
 THUMBNAIL_SIZE = (128, 128)
 
 def get_cache_dir():
-    """
-    Determina la ruta de caché correcta según el sistema.
-    """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # 1. MODO PORTABLE / DEV (Si podemos escribir junto al script)
-    if os.access(base_dir, os.W_OK):
-        path = Path(base_dir) / "visagevault_cache" / "local_snapshot_cache"
-    else:
-        # 2. MODO INSTALADO (Linux / AUR) -> ~/.cache/visagevault
-        user_home = Path.home()
-        path = user_home / ".cache" / "visagevault" / "local_snapshot_cache"
-
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """Carpeta de caché de miniaturas locales."""
+    return Path(paths.cache_subdir("local_snapshot_cache"))
 
 def get_thumbnail_path(original_filepath: str) -> Path:
     """Genera la ruta donde se guardará la miniatura."""

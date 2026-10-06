@@ -8,6 +8,7 @@ import pickle
 import shutil
 import datetime
 from pathlib import Path
+import paths
 
 class VisageVaultDB:
     def __init__(self, db_path=None, is_worker=False):
@@ -19,12 +20,7 @@ class VisageVaultDB:
         self.is_worker = is_worker
 
         # --- 2. CONFIGURACIÓN DE RUTA ---
-        if db_path:
-            self.db_path = db_path
-        else:
-            # Modo Dev/Windows
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            self.db_path = os.path.join(base_dir, "visagevault.db")
+        self.db_path = db_path or paths.db_path()
 
         # La MetaDB vive siempre junto a la BD principal
         self.meta_db_path = os.path.join(os.path.dirname(self.db_path), "visagevault_meta.db")
@@ -621,6 +617,42 @@ class VisageVaultDB:
     def get_safe_files(self):
         cursor = self.conn.execute("SELECT * FROM safe_files")
         return cursor.fetchall()
+
+    def relocate_safe_files(self, safe_dir):
+        """
+        Las versiones antiguas guardaban 'visagevault_safe/x.enc' relativo al
+        directorio de trabajo. Convierte esas rutas en absolutas dentro de
+        safe_dir, moviendo allí los ficheros si estaban en otro sitio.
+        """
+        try:
+            rows = self.conn.execute("SELECT id, encrypted_path FROM safe_files").fetchall()
+        except Exception as e:
+            print(f"Error leyendo caja fuerte: {e}")
+            return
+
+        for row in rows:
+            old_path = row['encrypted_path']
+            if not old_path or os.path.isabs(old_path):
+                continue
+
+            new_path = os.path.join(safe_dir, os.path.basename(old_path))
+            src_path = os.path.abspath(old_path)  # Relativa al CWD actual
+            try:
+                for suffix in ("", ".thumb"):
+                    if os.path.exists(src_path + suffix) and not os.path.exists(new_path + suffix):
+                        shutil.move(src_path + suffix, new_path + suffix)
+            except OSError as e:
+                print(f"Error moviendo {old_path} a la caja fuerte: {e}")
+                continue
+
+            if not os.path.exists(new_path):
+                # Se reintentará en el próximo arranque (quizá desde otro directorio)
+                print(f"Aviso: no se encuentra el archivo cifrado {old_path}")
+                continue
+
+            with self.conn:
+                self.conn.execute("UPDATE safe_files SET encrypted_path = ? WHERE id = ?",
+                                  (new_path, row['id']))
 
     def remove_from_safe(self, encrypted_path):
         with self.conn:

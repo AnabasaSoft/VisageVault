@@ -77,38 +77,26 @@ def verify_safe_password(password):
 import json
 import os
 import shutil
+import paths
 
 # Nombre del archivo de configuración
 CONFIG_FILENAME = "visagevault_config.json"
 
 def get_config_path():
     """
-    Calcula la ruta del archivo de configuración siguiendo estándares.
-    Prioridad:
-    1. Carpeta local (si es portable/desarrollo).
-    2. ~/.config/visagevault/ (si está instalado en Linux).
+    Calcula la ruta del archivo de configuración (ver paths.config_dir):
+    junto al programa en modo portable/desarrollo, o en la carpeta de
+    configuración del usuario si está instalado.
     """
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-
-    # 1. MODO PORTABLE / DESARROLLO (Windows o ejecución local)
-    # Si tenemos permiso de escritura en la carpeta del script, usamos esa.
-    if os.access(base_dir, os.W_OK):
-        return os.path.join(base_dir, CONFIG_FILENAME)
-
-    # 2. MODO INSTALADO (Linux / AUR / /usr/share)
-    # Usamos el estándar XDG: ~/.config/visagevault/
     user_home = os.path.expanduser("~")
-    config_dir = os.path.join(user_home, ".config", "visagevault")
+    try:
+        target_config = os.path.join(paths.config_dir(), CONFIG_FILENAME)
+    except OSError:
+        # Fallback extremo: volver a home si no se puede crear la carpeta
+        return os.path.join(user_home, CONFIG_FILENAME)
 
-    # Crear la carpeta si no existe
-    if not os.path.exists(config_dir):
-        try:
-            os.makedirs(config_dir, exist_ok=True)
-        except OSError:
-            # Fallback extremo: volver a home si falla crear .config
-            return os.path.join(user_home, CONFIG_FILENAME)
-
-    target_config = os.path.join(config_dir, CONFIG_FILENAME)
+    if paths.is_portable():
+        return target_config
 
     # --- MIGRACIÓN AUTOMÁTICA ---
     # Si existe el archivo viejo en la raíz (~/visagevault_config.json)

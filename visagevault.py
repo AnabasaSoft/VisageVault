@@ -79,8 +79,9 @@ from photo_finder import find_photos, find_videos
 import config_manager
 from metadata_reader import get_photo_date, get_video_date
 from thumbnail_generator import (
-    generate_image_thumbnail, generate_video_thumbnail, THUMBNAIL_SIZE
+    generate_image_thumbnail, generate_video_thumbnail, get_thumbnail_path, THUMBNAIL_SIZE
 )
+import paths
 # --- FIN DE MODIFICACIÓN ---
 
 import metadata_reader
@@ -227,11 +228,7 @@ class NetworkThumbnailLoader(QRunnable):
         self.file_id = file_id
         self.signals = signals
 
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.cache_dir = os.path.join(base_dir, "visagevault_cache", "drive_snapshot_cache")
-        if not os.path.exists(self.cache_dir):
-            try: os.makedirs(self.cache_dir)
-            except: pass
+        self.cache_dir = paths.cache_subdir("drive_snapshot_cache")
 
     @Slot()
     def run(self):
@@ -686,23 +683,7 @@ class FaceLoader(QRunnable):
         self.photo_path = photo_path
         self.location_str = location_str
 
-        # --- CORRECCIÓN DE RUTA ---
-        # Detectar si estamos en modo sistema (Linux instalado) o portable
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        if os.access(base_dir, os.W_OK):
-            # Modo Desarrollo / Windows
-            self.cache_dir = os.path.join(base_dir, "visagevault_cache", "face_cache")
-        else:
-            # Modo Linux Instalado (AUR) -> Usar ~/.cache
-            user_home = os.path.expanduser("~")
-            self.cache_dir = os.path.join(user_home, ".cache", "visagevault", "face_cache")
-        # --------------------------
-
-        if not os.path.exists(self.cache_dir):
-            try: os.makedirs(self.cache_dir, exist_ok=True)
-            except: pass
-
+        self.cache_dir = paths.cache_subdir("face_cache")
         self.cache_path = os.path.join(self.cache_dir, f"face_{self.face_id}.jpg")
 
     @Slot()
@@ -2159,8 +2140,6 @@ class CryptoManager:
     Procesa archivos grandes (vídeos) en fracciones de segundo.
     """
 
-    SAFE_DIR = Path("visagevault_safe")
-
     @staticmethod
     def get_key_from_password(password):
         if not password: return b'default_key'
@@ -2593,9 +2572,7 @@ class MoveToSafeWorker(QObject):
         local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         local_db.conn.row_factory = sqlite3.Row
 
-        safe_dir = Path("visagevault_safe")
-        safe_dir.mkdir(exist_ok=True)
-        cache_dir = Path("visagevault_cache") / "local_snapshot_cache"
+        safe_dir = Path(paths.safe_dir())
 
         total = len(self.items_data)
 
@@ -2664,8 +2641,7 @@ class MoveToSafeWorker(QObject):
 
                 # Borrar miniatura de caché pública si existe
                 try:
-                    thumb_hash = hashlib.sha256(str(original_path).encode('utf-8')).hexdigest()
-                    thumb_file = cache_dir / f"{thumb_hash}.jpg"
+                    thumb_file = get_thumbnail_path(str(original_path))
                     if thumb_file.exists(): os.remove(thumb_file)
                 except: pass
 
@@ -2697,41 +2673,17 @@ class VisageVaultApp(QMainWindow):
         else:
             print(f"Advertencia: No se pudo encontrar el icono en {icon_path}")
 
-        # --- CORRECCIÓN DE RUTAS (SOPORTE LINUX/AUR) ---
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-
-        # Detectamos si tenemos permiso para escribir en la carpeta del programa (Modo Portable/Dev)
-        if os.access(base_dir, os.W_OK):
-            # Estamos desarrollando o es un .exe portable
-            self.data_dir = base_dir
-            self.cache_dir = os.path.join(base_dir, "visagevault_cache")
-        else:
-            # Estamos instalados en /usr/share (Modo Sistema/AUR)
-            # Usamos los estándares XDG de Linux
-            user_home = os.path.expanduser("~")
-
-            # Para base de datos y config: ~/.local/share/visagevault
-            self.data_dir = os.path.join(user_home, ".local", "share", "visagevault")
-
-            # Para caché (imágenes): ~/.cache/visagevault
-            self.cache_dir = os.path.join(user_home, ".cache", "visagevault")
-
-        # Crear directorios si no existen
-        os.makedirs(self.data_dir, exist_ok=True)
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-        # Asignar a la variable que usas en el resto del código
+        # --- RUTAS DE DATOS Y CACHÉ (ver paths.py) ---
+        self.data_dir = paths.data_dir()
+        self.cache_dir = paths.cache_dir()
         self.root_cache = self.cache_dir
 
         # Subcarpetas de caché
-        os.makedirs(os.path.join(self.root_cache, "face_cache"), exist_ok=True)
-        os.makedirs(os.path.join(self.root_cache, "drive_cache"), exist_ok=True)
-        os.makedirs(os.path.join(self.root_cache, "drive_snapshot_cache"), exist_ok=True)
+        for subdir in ("face_cache", "drive_cache", "drive_snapshot_cache"):
+            paths.cache_subdir(subdir)
 
-        # --- IMPORTANTE: INICIALIZAR DB EN LA RUTA CORRECTA ---
-        # Si no especificamos ruta, intentará crearla en /usr/share y fallará también
-        db_path = os.path.join(self.data_dir, "visagevault.db")
-        self.db = VisageVaultDB(db_path) # Asegúrate que tu clase DB acepte rutas absolutas
+        self.db = VisageVaultDB(paths.db_path())
+        self.db.relocate_safe_files(paths.safe_dir())
 
         self.refresh_timer = QTimer()
         self.refresh_timer.setSingleShot(True)
@@ -4636,13 +4588,7 @@ class VisageVaultApp(QMainWindow):
 
         self._set_status(f"Vista previa: Bajando {name}...")
 
-        # --- NUEVA RUTA UNIFICADA ---
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        # visagevault_cache/drive_cache
-        temp_dir = os.path.join(base_dir, "visagevault_cache", "drive_cache")
-        # ----------------------------
-
-        if not os.path.exists(temp_dir): os.makedirs(temp_dir)
+        temp_dir = paths.cache_subdir("drive_cache")
         local_path = os.path.join(temp_dir, name)
 
         # Comprobar Caché
@@ -7201,11 +7147,7 @@ def run_visagevault():
     window = VisageVaultApp()
 
     # --- 2. PREPARAR IMAGEN ---
-    splash_path = "AnabasaSoft.png"
-    if not os.path.exists(splash_path):
-        splash_path = resource_path("AnabasaSoft.png")
-
-    pixmap = QPixmap(splash_path)
+    pixmap = QPixmap(resource_path("AnabasaSoft.png"))
 
     if pixmap.isNull():
         pixmap = QPixmap(resource_path("visagevault.png")).scaled(
