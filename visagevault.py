@@ -132,6 +132,35 @@ def parse_date_from_filename(filepath):
 
     return None, None
 
+# =================================================================
+# AGRUPACIÓN POR FECHA: VALORES DESCONOCIDOS
+# =================================================================
+NO_DATE_YEAR = "Sin Fecha"
+NO_DATE_MONTH = "00"
+
+def _is_known_year(year):
+    return isinstance(year, str) and len(year) == 4 and year.isdigit() and year != "0000"
+
+def _is_known_month(month):
+    return isinstance(month, str) and month.isdigit() and 1 <= int(month) <= 12
+
+def sort_years(years, reverse=True):
+    """Años conocidos ordenados; 'Sin Fecha' y valores raros siempre al final."""
+    years = list(years)
+    known = sorted((y for y in years if _is_known_year(y)), reverse=reverse)
+    unknown = sorted((y for y in years if not _is_known_year(y)), key=str)
+    return known + unknown
+
+def sort_months(months, reverse=False):
+    """Meses conocidos ordenados; 'Mes desconocido' (00) siempre al final."""
+    months = list(months)
+    known = sorted((m for m in months if _is_known_month(m)), reverse=reverse)
+    unknown = sorted((m for m in months if not _is_known_month(m)), key=str)
+    return known + unknown
+
+def year_title(year):
+    return f"Año {year}" if _is_known_year(year) else "Sin fecha"
+
 # --- FUNCIÓN GLOBAL DE CACHÉ EN RAM ---
 # Guarda las últimas 500 imágenes en memoria para que el scroll sea instantáneo
 @lru_cache(maxsize=500)
@@ -1721,6 +1750,9 @@ class PhotoFinderWorker(QObject):
 
                     photos_to_upsert_in_db.append((path, year, month))
 
+                # Una fecha vacía en la BD no debe romper la ordenación de la galería
+                year, month = year or NO_DATE_YEAR, month or NO_DATE_MONTH
+
                 if year not in photos_by_year_month:
                     photos_by_year_month[year] = {}
                 if month not in photos_by_year_month[year]:
@@ -1794,6 +1826,8 @@ class VideoFinderWorker(QObject):
                         year, month = get_video_date(path)
 
                     videos_to_upsert_in_db.append((path, year, month))
+
+                year, month = year or NO_DATE_YEAR, month or NO_DATE_MONTH
 
                 if year not in videos_by_year_month:
                     videos_by_year_month[year] = {}
@@ -3349,21 +3383,19 @@ class VisageVaultApp(QMainWindow):
         hidden_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
         hidden_item.setData(0, Qt.UserRole, "HIDDEN_SECTION")
 
-        sorted_years = sorted(self.photos_by_year_month.keys(), reverse=True)
+        sorted_years = sort_years(self.photos_by_year_month.keys())
 
         for year in sorted_years:
-            if year == "Sin Fecha": continue
             year_item = QTreeWidgetItem(self.date_tree_widget, [str(year)])
 
-            year_label = QLabel(f"Año {year}")
+            year_label = QLabel(year_title(year))
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
             widgets_added_for_year = [year_label]
 
             month_added_count = 0
-            sorted_months = sorted(self.photos_by_year_month[year].keys())
+            sorted_months = sort_months(self.photos_by_year_month[year].keys())
 
             for month in sorted_months:
-                if month == "00": continue
                 all_photos = self.photos_by_year_month[year][month]
 
                 # Filtrar
@@ -3487,22 +3519,20 @@ class VisageVaultApp(QMainWindow):
         hidden_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
         hidden_item.setData(0, Qt.UserRole, "HIDDEN_SECTION")
 
-        sorted_years = sorted(self.videos_by_year_month.keys(), reverse=True)
+        sorted_years = sort_years(self.videos_by_year_month.keys())
 
         for year in sorted_years:
-            if year == "Sin Fecha": continue
             year_item = QTreeWidgetItem(self.video_date_tree_widget, [str(year)])
 
-            year_label = QLabel(f"Año {year}")
+            year_label = QLabel(year_title(year))
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
 
             widgets_added_for_year = [year_label]
             month_added_count = 0
 
-            sorted_months = sorted(self.videos_by_year_month[year].keys())
+            sorted_months = sort_months(self.videos_by_year_month[year].keys())
 
             for month in sorted_months:
-                if month == "00": continue
                 all_videos = self.videos_by_year_month[year][month]
 
                 # --- PASO 2: FILTRAR VÍDEOS VISIBLES ---
@@ -5493,9 +5523,9 @@ class VisageVaultApp(QMainWindow):
         thumb_width = THUMBNAIL_SIZE[0] + 10
         num_cols = max(1, viewport_width // thumb_width)
 
-        sorted_years = sorted(photos_by_year_month.keys(), reverse=True)
+        sorted_years = sort_years(photos_by_year_month.keys())
         for year in sorted_years:
-            sorted_months = sorted(photos_by_year_month[year].keys(), reverse=True)
+            sorted_months = sort_months(photos_by_year_month[year].keys(), reverse=True)
             for month in sorted_months:
                 photos = photos_by_year_month[year][month]
                 if not photos: continue
@@ -5503,7 +5533,7 @@ class VisageVaultApp(QMainWindow):
                     month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
                 except ValueError:
                     month_name = "Mes Desconocido"
-                group_label = QLabel(f"{month_name} {year}")
+                group_label = QLabel(f"{month_name} {year}" if _is_known_year(year) else f"{month_name} (sin fecha)")
                 group_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
                 self.person_photo_layout.addWidget(group_label)
                 photo_grid_widget = QWidget()
@@ -6040,17 +6070,17 @@ class VisageVaultApp(QMainWindow):
         self.cloud_date_tree.clear()
         self.cloud_group_widgets = {}
 
-        sorted_years = sorted(self.drive_photos_by_date.keys(), reverse=True)
+        sorted_years = sort_years(self.drive_photos_by_date.keys())
 
         for year in sorted_years:
             year_item = QTreeWidgetItem(self.cloud_date_tree, [str(year)])
 
-            year_label = QLabel(f"Año {year}")
+            year_label = QLabel(year_title(year))
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
             widgets_to_add_for_year = [year_label]
             self.cloud_group_widgets[str(year)] = year_label
 
-            sorted_months = sorted(self.drive_photos_by_date[year].keys(), reverse=True)
+            sorted_months = sort_months(self.drive_photos_by_date[year].keys(), reverse=True)
 
             for month in sorted_months:
                 photos = self.drive_photos_by_date[year][month]
@@ -6586,15 +6616,15 @@ class VisageVaultApp(QMainWindow):
             if month not in safe_data[year]: safe_data[year][month] = []
             safe_data[year][month].append(row)
 
-        sorted_years = sorted(safe_data.keys(), reverse=True)
+        sorted_years = sort_years(safe_data.keys())
         thumb_size = self.current_thumbnail_size
 
         for year in sorted_years:
-            year_label = QLabel(f"Año {year}")
+            year_label = QLabel(year_title(year))
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px; color: #e74c3c;")
             self.safe_container_layout.addWidget(year_label)
 
-            for month in sorted(safe_data[year].keys(), reverse=True):
+            for month in sort_months(safe_data[year].keys(), reverse=True):
                 file_rows = safe_data[year][month]
                 try:
                     month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
