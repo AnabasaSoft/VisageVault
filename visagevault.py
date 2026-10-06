@@ -93,7 +93,7 @@ import re
 import db_manager
 from db_manager import VisageVaultDB
 import face_recognition
-from PIL import Image
+from PIL import Image, ImageOps
 import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
@@ -2416,57 +2416,83 @@ class LoginDialog(QDialog):
 
 class DuplicateFinderWorker(QObject):
     """
-    Busca duplicados visuales usando dHash con PIL.
-    Detecta la misma imagen aunque tenga diferente resolución.
+    Busca fotos duplicadas en dos fases:
+    1. Candidatas: misma huella visual (dHash de 64 bits). Es rápida, pero
+       por sí sola agrupa imágenes distintas: fondos lisos, cielos con el
+       mismo degradado o recortes de la misma escena.
+    2. Confirmación de cada pareja: misma proporción y colores casi iguales
+       (miniatura 16x16). Las imágenes casi sin detalle solo se consideran
+       duplicadas si los archivos son idénticos byte a byte.
+    Detecta la misma foto aunque tenga otra resolución o compresión.
     """
     progress = Signal(str)
-    finished = Signal(dict)  # { 'hash_string': [ruta1, ruta2], ... }
+    finished = Signal(dict)  # { 'clave_grupo': [ruta1, ruta2], ... }
+
+    ASPECT_TOLERANCE = 0.02   # Diferencia relativa de proporción admitida
+    MAX_COLOR_DIFF = 6.0      # Diferencia media por canal (0-255) en la miniatura 16x16
+    MIN_DETAIL = 4.0          # Desviación típica (gris 32x32) por debajo = imagen "plana"
 
     def __init__(self, db_path):
         super().__init__()
         self.db_path = db_path
         self.is_running = True
+        self._file_hashes = {}
 
-    def _calculate_dhash(self, image_path, hash_size=8):
-        """
-        Calcula una huella digital visual de la imagen.
-        Resistente a cambios de tamaño.
-        """
+    def _fingerprint(self, image_path):
+        """(dhash, proporción, miniatura 16x16 RGB, detalle) o None si no se puede leer."""
         try:
-            # Abrir imagen con PIL
             with Image.open(image_path) as img:
-                # 1. Convertir a escala de grises
-                img = img.convert("L")
+                img.draft("RGB", (256, 256))  # JPEG: decodificar ya reducido
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                width, height = img.size
+                if not width or not height:
+                    return None
 
-                # 2. Redimensionar a (hash_size + 1) x hash_size (ej: 9x8)
-                # Usamos LANCZOS para mejor calidad en la reducción
-                try:
-                    resample = Image.Resampling.LANCZOS
-                except AttributeError:
-                    resample = Image.LANCZOS
+                gray = img.convert("L")
+                pixels = np.asarray(gray.resize((9, 8), Image.Resampling.BOX), dtype=np.int16)
+                bits = (pixels[:, :-1] > pixels[:, 1:]).flatten()
+                dhash = hex(int("".join("1" if b else "0" for b in bits), 2))
 
-                img = img.resize((hash_size + 1, hash_size), resample)
-
-                pixels = list(img.getdata())
-
-                # 3. Comparar píxeles adyacentes
-                difference = []
-                for row in range(hash_size):
-                    for col in range(hash_size):
-                        pixel_left = pixels[row * (hash_size + 1) + col]
-                        pixel_right = pixels[row * (hash_size + 1) + col + 1]
-                        difference.append(pixel_left > pixel_right)
-
-                # 4. Convertir a hex
-                decimal_value = 0
-                for index, value in enumerate(difference):
-                    if value:
-                        decimal_value += 2**index
-
-                return hex(decimal_value)
+                small = np.asarray(img.resize((16, 16), Image.Resampling.BOX), dtype=np.float32)
+                detail = float(np.asarray(gray.resize((32, 32), Image.Resampling.BOX), dtype=np.float32).std())
+                return dhash, width / height, small, detail
         except Exception:
             # Si PIL falla (ej: archivo corrupto o RAW no soportado), lo ignoramos
             return None
+
+    def _file_hash(self, path):
+        if path not in self._file_hashes:
+            digest = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            self._file_hashes[path] = digest.hexdigest()
+        return self._file_hashes[path]
+
+    def _is_same_photo(self, a, b):
+        path_a, (_, aspect_a, small_a, detail_a) = a
+        path_b, (_, aspect_b, small_b, detail_b) = b
+        if abs(aspect_a - aspect_b) > self.ASPECT_TOLERANCE * max(aspect_a, aspect_b):
+            return False  # Otra proporción: recorte, no copia
+        if detail_a < self.MIN_DETAIL or detail_b < self.MIN_DETAIL:
+            # Sin detalle la comparación visual no distingue nada: exigir archivo idéntico
+            try:
+                return self._file_hash(path_a) == self._file_hash(path_b)
+            except OSError:
+                return False
+        return float(np.abs(small_a - small_b).mean()) <= self.MAX_COLOR_DIFF
+
+    def _confirm_groups(self, candidates):
+        """Divide un grupo de candidatas en grupos de duplicados confirmados."""
+        groups = []
+        for entry in candidates:
+            for group in groups:
+                if self._is_same_photo(group[0], entry):
+                    group.append(entry)
+                    break
+            else:
+                groups.append([entry])
+        return [[path for path, _ in group] for group in groups if len(group) > 1]
 
     @Slot()
     def run(self):
@@ -2484,27 +2510,28 @@ class DuplicateFinderWorker(QObject):
             total = len(all_photos)
             self.progress.emit(f"Analizando {total} fotos visualmente...")
 
-            hashes = {}
+            candidates = {}
             processed = 0
 
             for path in all_photos:
                 if not self.is_running: break
                 if not os.path.exists(path): continue
 
-                # Calculamos el hash visual
-                dhash = self._calculate_dhash(path)
-
-                if dhash:
-                    if dhash not in hashes:
-                        hashes[dhash] = []
-                    hashes[dhash].append(path)
+                fingerprint = self._fingerprint(path)
+                if fingerprint:
+                    candidates.setdefault(fingerprint[0], []).append((path, fingerprint))
 
                 processed += 1
                 if processed % 20 == 0:
                     self.progress.emit(f"Analizando... ({processed}/{total})")
 
-            # Filtrar solo los que tienen más de 1 archivo (duplicados)
-            duplicates = {h: paths for h, paths in hashes.items() if len(paths) > 1}
+            # Confirmar cada grupo de candidatas (misma huella)
+            duplicates = {}
+            for dhash, entries in candidates.items():
+                if len(entries) < 2 or not self.is_running:
+                    continue
+                for n, group in enumerate(self._confirm_groups(entries)):
+                    duplicates[f"{dhash}-{n}"] = group
 
             self.finished.emit(duplicates)
 
