@@ -10,6 +10,10 @@ import datetime
 from pathlib import Path
 import paths
 
+def meta_db_path_for(db_path):
+    """La MetaDB vive siempre junto a la BD principal."""
+    return os.path.join(os.path.dirname(db_path), "visagevault_meta.db")
+
 class VisageVaultDB:
     def __init__(self, db_path=None, is_worker=False):
         # --- 1. INICIALIZACIÓN SEGURA (Variables por defecto) ---
@@ -22,8 +26,7 @@ class VisageVaultDB:
         # --- 2. CONFIGURACIÓN DE RUTA ---
         self.db_path = db_path or paths.db_path()
 
-        # La MetaDB vive siempre junto a la BD principal
-        self.meta_db_path = os.path.join(os.path.dirname(self.db_path), "visagevault_meta.db")
+        self.meta_db_path = meta_db_path_for(self.db_path)
 
         # --- 3. CREACIÓN DE DIRECTORIOS ---
         try:

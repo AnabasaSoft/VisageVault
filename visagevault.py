@@ -749,6 +749,15 @@ class FaceScanWorker(QObject):
 # =================================================================
 # CLASE: FaceLoader (CORREGIDA PARA RUTAS LINUX)
 # =================================================================
+def get_face_cache_path(face_id) -> str:
+    """Ruta del recorte de una cara en la caché de disco."""
+    return os.path.join(paths.cache_subdir("face_cache"), f"face_{face_id}.jpg")
+
+def evict_cached_image(filepath: str):
+    """Quita una miniatura de la caché en RAM."""
+    with _image_cache_lock:
+        _image_cache.pop(str(filepath), None)
+
 class FaceLoader(QRunnable):
     def __init__(self, signals: FaceLoaderSignals, face_id: int, photo_path: str, location_str: str):
         super().__init__()
@@ -757,8 +766,7 @@ class FaceLoader(QRunnable):
         self.photo_path = photo_path
         self.location_str = location_str
 
-        self.cache_dir = paths.cache_subdir("face_cache")
-        self.cache_path = os.path.join(self.cache_dir, f"face_{self.face_id}.jpg")
+        self.cache_path = get_face_cache_path(self.face_id)
 
     @Slot()
     def run(self):
@@ -2648,6 +2656,7 @@ class MoveToSafeWorker(QObject):
                 local_db.conn.commit()
 
                 # 5. LIMPIEZA (Borrar original y referencias)
+                face_ids = []
                 if is_video:
                     local_db.conn.execute("DELETE FROM videos WHERE filepath = ?", (original_path,))
                 else:
@@ -2655,16 +2664,15 @@ class MoveToSafeWorker(QObject):
                     cur = local_db.conn.execute("SELECT id FROM photos WHERE filepath = ?", (original_path,))
                     row = cur.fetchone()
                     if row:
+                        face_ids = [r['id'] for r in local_db.conn.execute(
+                            "SELECT id FROM faces WHERE photo_id = ?", (row['id'],))]
                         local_db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (row['id'],))
                     local_db.conn.execute("DELETE FROM photos WHERE filepath = ?", (original_path,))
 
                 local_db.conn.commit()
 
-                # Borrar miniatura de caché pública si existe
-                try:
-                    thumb_file = get_thumbnail_path(str(original_path))
-                    if thumb_file.exists(): os.remove(thumb_file)
-                except: pass
+                # No dejar rastros en claro fuera de la caja fuerte
+                self._remove_traces(original_path, face_ids)
 
                 # Borrar archivo original del disco
                 os.remove(original_path)
@@ -2677,6 +2685,31 @@ class MoveToSafeWorker(QObject):
 
         local_db.conn.close()
         self.finished.emit()
+
+    def _remove_traces(self, original_path, face_ids):
+        """
+        Borra lo que quedaría visible del archivo fuera de la caja fuerte:
+        miniatura (disco y RAM), recortes de caras y su entrada en la MetaDB.
+        """
+        thumb_file = get_thumbnail_path(str(original_path))
+        leftovers = [str(thumb_file)] + [get_face_cache_path(fid) for fid in face_ids]
+        evict_cached_image(thumb_file)
+        for path in leftovers:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as e:
+                print(f"No se pudo borrar {path}: {e}")
+
+        try:
+            meta_conn = sqlite3.connect(db_manager.meta_db_path_for(self.db_path))
+            try:
+                with meta_conn:
+                    meta_conn.execute("DELETE FROM file_metadata WHERE filepath = ?", (original_path,))
+            finally:
+                meta_conn.close()
+        except sqlite3.Error as e:
+            print(f"No se pudo limpiar la MetaDB para {original_path}: {e}")
 
 # =================================================================
 # VENTANA PRINCIPAL DE LA APLICACIÓN (VisageVaultApp)
