@@ -69,3 +69,6 @@ user_token.pickle
 .serena/
 *.md
 !README.md
+
+# Versión generada por el workflow a partir del tag
+visagevault_version.py

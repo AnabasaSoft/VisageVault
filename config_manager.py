@@ -44,17 +44,21 @@ def load_config():
     if not os.path.exists(config_path):
         return {}
     try:
-        with open(config_path, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
         return {}
 
 def save_config(config_data):
     config_path = get_config_path()
+    # Escritura atómica: si la app se cierra a mitad, no queda un JSON a medias
+    tmp_path = config_path + ".tmp"
     try:
-        with open(config_path, 'w') as f:
-            json.dump(config_data, f, indent=4)
-    except IOError as e:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, config_path)
+    except OSError as e:
         print(f"Error guardando configuración en {config_path}: {e}")
 
 # --- GETTERS Y SETTERS ESPECÍFICOS ---
@@ -85,6 +89,26 @@ def get_drive_folder_id():
 def set_drive_folder_id(folder_id):
     config = load_config()
     config['drive_folder_id'] = folder_id
+    save_config(config)
+
+# --- ACTUALIZACIONES ---
+
+def get_check_updates():
+    """Buscar versiones nuevas al arrancar (activado por defecto)."""
+    return bool(load_config().get('comprobar_actualizaciones', True))
+
+def set_check_updates(enabled):
+    config = load_config()
+    config['comprobar_actualizaciones'] = bool(enabled)
+    save_config(config)
+
+def get_skipped_version():
+    """Versión de la que el usuario pidió no volver a avisar."""
+    return load_config().get('version_omitida', "")
+
+def set_skipped_version(tag):
+    config = load_config()
+    config['version_omitida'] = tag
     save_config(config)
 
 # --- SEGURIDAD CAJA FUERTE ---

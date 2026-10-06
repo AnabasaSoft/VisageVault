@@ -1,6 +1,5 @@
 # ==============================================================================
 # PROYECTO: VisageVault - Gestor de Fotografías Inteligente
-# VERSIÓN: 1.6.16
 # DERECHOS DE AUTOR: © 2025 Daniel Serrano Armenta
 # ==============================================================================
 #
@@ -38,6 +37,18 @@ from drive_auth import DriveAuthenticator, DriveAuthError
 import requests # Para bajar thumbnails
 from drive_manager import DriveManager
 import config_manager # Para guardar la carpeta elegida
+import updater
+
+# La versión la genera el workflow de release a partir del tag
+# (visagevault_version.py, que no está en git). Ejecutando desde el código
+# fuente vale "dev" y no se buscan actualizaciones.
+# Nombre propio y no "_version": en openSUSE, el paquete de Pillow añade la
+# carpeta PIL al sys.path y su _version.py se importaría en su lugar.
+try:
+    from visagevault_version import __version__ as APP_VERSION
+except ImportError:
+    APP_VERSION = "dev"
+APP_NAME = "VisageVault (dev)" if APP_VERSION == "dev" else f"VisageVault v{APP_VERSION}"
 import safe_crypto
 import redeye
 from safe_crypto import CryptoManager
@@ -58,7 +69,7 @@ import cv2
 from PySide6.QtWidgets import (
     QDialog, QTableWidget, QTableWidgetItem,
     QAbstractItemView, QHeaderView, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
-    QComboBox, QMenu, QListWidget, QListWidgetItem, QFrame, QMessageBox
+    QComboBox, QMenu, QListWidget, QListWidgetItem, QFrame, QMessageBox, QCheckBox
 )
 
 from PySide6.QtWidgets import (
@@ -342,6 +353,62 @@ class NetworkThumbnailLoader(QRunnable):
         except Exception as e:
             print(f"Error descargando miniatura de Drive {self.file_id}: {e}")
         self.signals.load_failed.emit(self.file_id)
+
+# =================================================================
+# ACTUALIZACIONES
+# =================================================================
+class UpdateCheckSignals(QObject):
+    """La consulta a GitHub se hace en un hilo; el resultado vuelve por señal."""
+    # (release {"tag", "url"} o None, error o None, automática, botón, ventana padre)
+    finished = Signal(object, object, bool, object, object)
+
+
+class UpdateDialog(QDialog):
+    """Avisa de una versión nueva con el enlace a su release.
+    Con allow_skip se ofrece no volver a avisar de esa versión."""
+    def __init__(self, rel, allow_skip, parent=None):
+        super().__init__(parent)
+        self.rel = rel
+        self.setWindowTitle("Nueva versión disponible")
+        layout = QVBoxLayout(self)
+
+        text = QLabel(f"Hay una versión nueva de VisageVault: {rel['tag']}\n(tienes la {APP_VERSION}).")
+        text.setAlignment(Qt.AlignCenter)
+        text.setWordWrap(True)
+        text.setStyleSheet("font-size: 11pt;")
+        layout.addWidget(text)
+
+        link = QLabel("<a href='#'>Ver la versión en GitHub</a>")
+        link.setAlignment(Qt.AlignCenter)
+        link.linkActivated.connect(lambda _: updater.open_url(rel["url"]))
+        layout.addWidget(link)
+
+        self.skip_check = None
+        if allow_skip:
+            self.skip_check = QCheckBox("No volver a avisar de esta versión")
+            layout.addWidget(self.skip_check, 0, Qt.AlignCenter)
+
+        buttons = QHBoxLayout()
+        btn_download = QPushButton("Descargar")
+        btn_download.setDefault(True)
+        btn_download.clicked.connect(lambda: self._close(True))
+        btn_later = QPushButton("Más tarde")
+        btn_later.clicked.connect(lambda: self._close(False))
+        buttons.addWidget(btn_download)
+        buttons.addWidget(btn_later)
+        layout.addLayout(buttons)
+
+    def _close(self, download):
+        if self.skip_check is not None and self.skip_check.isChecked():
+            config_manager.set_skipped_version(self.rel["tag"])
+        if download:
+            updater.open_url(self.rel["url"])
+        self.accept()
+
+    def reject(self):
+        # Cerrar con Esc o la X equivale a "Más tarde" (respetando la casilla)
+        self._close(False)
+
 
 # =================================================================
 # MINIATURAS DE LA CAJA FUERTE (descifrado en segundo plano)
@@ -2254,7 +2321,7 @@ class HelpDialog(QDialog):
         layout.addWidget(logo_label)
 
         # 2. Título y Versión
-        title_label = QLabel("<h2>VisageVault v1.4</h2>")
+        title_label = QLabel(f"<h2>{APP_NAME}</h2>")
         title_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(title_label)
 
@@ -2304,6 +2371,21 @@ class HelpDialog(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         layout.addWidget(scroll)
+
+        # Actualizaciones: botón manual e interruptor de la comprobación al arrancar
+        updates_layout = QHBoxLayout()
+        updates_layout.addStretch(1)
+        btn_updates = QPushButton("🔄 Buscar actualizaciones")
+        main_window = parent if isinstance(parent, VisageVaultApp) else None
+        btn_updates.clicked.connect(lambda: main_window and main_window.check_updates_manual(btn_updates, self))
+        btn_updates.setEnabled(main_window is not None)
+        updates_layout.addWidget(btn_updates)
+        auto_check = QCheckBox("Buscar al iniciar")
+        auto_check.setChecked(config_manager.get_check_updates())
+        auto_check.toggled.connect(config_manager.set_check_updates)
+        updates_layout.addWidget(auto_check)
+        updates_layout.addStretch(1)
+        layout.addLayout(updates_layout)
 
         # 4. Botón Cerrar
         btn_box = QDialogButtonBox(QDialogButtonBox.Close)
@@ -2885,7 +2967,7 @@ class VisageVaultApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VisageVault")
+        self.setWindowTitle(APP_NAME)
         icon_path = resource_path("visagevault.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
@@ -2975,6 +3057,8 @@ class VisageVaultApp(QMainWindow):
         self.safe_thumb_signals = SafeThumbnailSignals()
         self.safe_thumb_signals.loaded.connect(self._on_safe_thumbnail_loaded)
         self.safe_thumb_signals.failed.connect(self._on_safe_thumbnail_failed)
+        self.update_signals = UpdateCheckSignals()
+        self.update_signals.finished.connect(self._on_update_check_finished)
         self.safe_generation = 0     # Descarta resultados de cargas anteriores o tras bloquear
         self.safe_list_items = {}    # ruta cifrada -> (QListWidgetItem, tipo)
 
@@ -3008,6 +3092,8 @@ class VisageVaultApp(QMainWindow):
 
         QTimer.singleShot(100, self._initial_check)
         QTimer.singleShot(500, self._check_auto_login)
+        # Después del splash y de los diálogos de arranque, para que no se crucen
+        QTimer.singleShot(0, lambda: self._after_splash(lambda: QTimer.singleShot(2000, self.check_updates_auto)))
 
         # 2. 🔥 ELIMINAR RETARDO DE PESTAÑAS: Cargar datos pesados al arrancar
         # Lo lanzamos a los 800ms para no frenar la apertura de la ventana
@@ -3412,6 +3498,69 @@ class VisageVaultApp(QMainWindow):
     # ----------------------------------------------------
     # Lógica de Inicio y Configuración
     # ----------------------------------------------------
+
+    # ==========================================================
+    # ACTUALIZACIONES
+    # ==========================================================
+
+    def check_updates_auto(self):
+        """Busca una versión nueva al arrancar, en segundo plano. Los errores (sin red,
+        límite de la API de GitHub...) solo se registran en consola."""
+        if APP_VERSION == "dev":
+            print("Compilación de desarrollo: no se buscan actualizaciones")
+            return
+        if not config_manager.get_check_updates():
+            return
+        self._start_update_check(automatic=True)
+
+    def check_updates_manual(self, button, parent):
+        """Botón de la Ayuda: avisa aunque esa versión se hubiera omitido."""
+        if APP_VERSION == "dev":
+            QMessageBox.information(parent, "Actualizaciones",
+                                    "Esta es una compilación de desarrollo:\nno se buscan actualizaciones.")
+            return
+        button.setEnabled(False)
+        button.setText("🔄 Buscando...")
+        self._start_update_check(automatic=False, button=button, parent=parent)
+
+    def _start_update_check(self, automatic, button=None, parent=None):
+        signals = self.update_signals
+
+        def worker():
+            try:
+                rel, error = updater.check_latest(APP_VERSION), None
+            except Exception as e:
+                rel, error = None, e
+            try:
+                signals.finished.emit(rel, error, automatic, button, parent)
+            except RuntimeError:
+                pass  # App cerrada mientras se consultaba
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(object, object, bool, object, object)
+    def _on_update_check_finished(self, rel, error, automatic, button, parent):
+        if automatic:
+            if error:
+                print(f"No se pudo comprobar si hay actualizaciones: {error}")
+            elif rel and rel["tag"] != config_manager.get_skipped_version():
+                print(f"Nueva versión disponible: {rel['tag']}")
+                UpdateDialog(rel, True, self).exec()
+            return
+
+        # Búsqueda manual desde la Ayuda
+        try:
+            button.setEnabled(True)
+            button.setText("🔄 Buscar actualizaciones")
+            if not parent.isVisible():
+                return  # Se cerró la Ayuda mientras se buscaba
+        except RuntimeError:
+            return
+        if error:
+            QMessageBox.warning(parent, "Actualizaciones", f"No se pudo comprobar si hay actualizaciones:\n{error}")
+        elif rel is None:
+            QMessageBox.information(parent, "Actualizaciones", f"Ya tienes la última versión ({APP_VERSION}).")
+        else:
+            UpdateDialog(rel, False, parent).exec()
 
     def _after_splash(self, callback):
         """Ejecuta callback cuando se haya cerrado el splash (o ya, si no hay)."""

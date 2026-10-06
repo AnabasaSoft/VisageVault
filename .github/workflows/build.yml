@@ -26,6 +26,22 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Versión: sale del tag y se usa para la app (visagevault_version.py) y para los paquetes.
+      # dpkg y rpm exigen que empiece por un dígito
+      # (tag "v1.2.0" -> "1.2.0"; lanzado a mano sin tag -> "0.0.0+git<commit>")
+      - name: Package Version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+git${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # La app lee su versión de aquí (no está en git; en local vale "dev")
+          echo "__version__ = \"$VERSION\"" > visagevault_version.py
+          echo "Versión del paquete: $VERSION"
+
       # --- INYECCIÓN DE SECRETOS (Windows) ---
       - name: Inject Google Credentials
         run: |
@@ -44,6 +60,7 @@ jobs:
             --windowed \
             --name "VisageVault" \
             --add-data "visagevault.png;." \
+            --add-data "AnabasaSoft.png;." \
             --collect-data face_recognition_models \
             --collect-all rawpy \
             --hidden-import piexif \
@@ -76,6 +93,22 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Versión: sale del tag y se usa para la app (visagevault_version.py) y para los paquetes.
+      # dpkg y rpm exigen que empiece por un dígito
+      # (tag "v1.2.0" -> "1.2.0"; lanzado a mano sin tag -> "0.0.0+git<commit>")
+      - name: Package Version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+git${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # La app lee su versión de aquí (no está en git; en local vale "dev")
+          echo "__version__ = \"$VERSION\"" > visagevault_version.py
+          echo "Versión del paquete: $VERSION"
+
       # --- INYECCIÓN DE SECRETOS (macOS) ---
       - name: Inject Google Credentials
         run: |
@@ -95,6 +128,7 @@ jobs:
             --windowed \
             --name "VisageVault" \
             --add-data "visagevault.png:." \
+            --add-data "AnabasaSoft.png:." \
             --collect-data face_recognition_models \
             --collect-all rawpy \
             --hidden-import piexif \
@@ -140,6 +174,22 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Versión: sale del tag y se usa para la app (visagevault_version.py) y para los paquetes.
+      # dpkg y rpm exigen que empiece por un dígito
+      # (tag "v1.2.0" -> "1.2.0"; lanzado a mano sin tag -> "0.0.0+git<commit>")
+      - name: Package Version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+git${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # La app lee su versión de aquí (no está en git; en local vale "dev")
+          echo "__version__ = \"$VERSION\"" > visagevault_version.py
+          echo "Versión del paquete: $VERSION"
+
       # --- INYECCIÓN DE SECRETOS (Linux Binary) ---
       - name: Inject Google Credentials
         run: |
@@ -170,6 +220,7 @@ jobs:
             --windowed \
             --name "VisageVault" \
             --add-data "visagevault.png:." \
+            --add-data "AnabasaSoft.png:." \
             --collect-data face_recognition_models \
             --collect-all rawpy \
             --hidden-import piexif \
@@ -211,21 +262,44 @@ jobs:
             --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/visagevault.png \
             --output appimage
 
+      # Estructura: build en /opt/visagevault, enlace en /usr/bin, .desktop e icono en /usr/share
       - name: Build DEB / RPM
         run: |
-          VERSION_TAG=$(echo ${{ github.ref_name }} | sed 's/v//')
+          # $VERSION viene del paso "Package Version"
+          STAGE=pkgroot
+          mkdir -p $STAGE/opt/visagevault $STAGE/usr/bin \
+                   $STAGE/usr/share/applications $STAGE/usr/share/icons/hicolor/256x256/apps
+          chmod 755 $STAGE
+          cp -a dist/VisageVault/. $STAGE/opt/visagevault/
+          ln -s /opt/visagevault/VisageVault $STAGE/usr/bin/visagevault
+          cp visagevault.png $STAGE/usr/share/icons/hicolor/256x256/apps/visagevault.png
 
-          fpm -s dir -t deb -n VisageVault -v $VERSION_TAG \
-            --architecture amd64 \
-            --description "Gestor de Fotos y Videos Inteligente" \
-            --maintainer "Daniel Serrano" \
-            -C AppDir --prefix "/" .
+          cat << EOF > $STAGE/usr/share/applications/visagevault.desktop
+          [Desktop Entry]
+          Name=VisageVault
+          Comment=Gestor de fotografías inteligente
+          Exec=visagevault
+          Icon=visagevault
+          Type=Application
+          Categories=Graphics;Photography;
+          Terminal=false
+          EOF
+          sed -i 's/^ *//' $STAGE/usr/share/applications/visagevault.desktop
 
-          fpm -s dir -t rpm -n VisageVault -v $VERSION_TAG \
-            --architecture x86_64 \
-            --description "Gestor de Fotos y Videos Inteligente" \
-            --maintainer "Daniel Serrano" \
-            -C AppDir --prefix "/" .
+          COMMON="-s dir -n visagevault -v $VERSION --iteration 1 \
+            --description 'Gestor de fotografías inteligente con reconocimiento facial.' \
+            --maintainer 'Daniel Serrano Armenta <anabasasoft@gmail.com>' \
+            --vendor AnabasaSoft --url https://github.com/AnabasaSoft/VisageVault \
+            --license LGPL-3.0-or-later -C $STAGE"
+
+          eval fpm $COMMON -t deb --architecture amd64 --deb-priority optional --deb-suggests ffmpeg \
+            -p visagevault_${VERSION}_amd64.deb .
+
+          # _build_id_links none: sin enlaces /usr/lib/.build-id. Otras apps empaquetadas
+          # igual (PyInstaller + fpm) comparten bibliotecas idénticas y chocarían al instalarse.
+          eval fpm $COMMON -t rpm --architecture x86_64 \
+            --rpm-rpmbuild-define "'_build_id_links none'" \
+            -p visagevault-${VERSION}-1.x86_64.rpm .
 
       - name: Upload Linux Binaries
         uses: softprops/action-gh-release@v1
@@ -246,6 +320,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Versión: sale del tag y se usa para la app (visagevault_version.py) y para los paquetes.
+      # dpkg y rpm exigen que empiece por un dígito
+      # (tag "v1.2.0" -> "1.2.0"; lanzado a mano sin tag -> "0.0.0+git<commit>")
+      - name: Package Version
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0+git${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          # La app lee su versión de aquí (no está en git; en local vale "dev")
+          echo "__version__ = \"$VERSION\"" > visagevault_version.py
+          echo "Versión del paquete: $VERSION"
+
       # --- INYECCIÓN DE SECRETOS (Source) ---
       - name: Inject Google Credentials
         run: |
@@ -255,8 +345,7 @@ jobs:
       - name: Create Source Tarball
         run: |
           # 1. Obtener la versión pura (ej: 1.6.12) quitando la 'v' del tag
-          TAG_NAME="${{ github.ref_name }}"
-          VERSION_CLEAN="${TAG_NAME#v}"
+          VERSION_CLEAN="$VERSION"  # Del paso "Package Version" (visagevault_version.py va en *.py)
 
           # 2. Definir nombres
           DIR_NAME="visagevault-$VERSION_CLEAN"
