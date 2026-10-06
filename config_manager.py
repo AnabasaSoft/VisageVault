@@ -1,83 +1,11 @@
 # config_manager.py
 import json
-import hashlib
-from pathlib import Path
-
-CONFIG_FILE = Path("visagevault_config.json")
-
-def load_config():
-    """Carga la configuración desde el archivo JSON."""
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            print("Error: El archivo de configuración está corrupto. Se usarán valores por defecto.")
-            return {}
-    return {}
-
-def save_config(config_data):
-    """Guarda la configuración en el archivo JSON."""
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config_data, f, indent=4)
-
-def get_photo_directory():
-    """Obtiene la ruta de la carpeta de fotos configurada."""
-    config = load_config()
-    return config.get('photo_directory')
-
-def set_photo_directory(directory_path):
-    """Establece y guarda la nueva ruta de la carpeta de fotos."""
-    config = load_config()
-    config['photo_directory'] = directory_path
-    save_config(config)
-
-def get_thumbnail_size():
-    """Obtiene el tamaño de miniatura preferido por el usuario."""
-    config = load_config()
-    # Devuelve el tamaño guardado, o 128 como valor por defecto
-    return config.get('thumbnail_size', 128)
-
-def set_thumbnail_size(size):
-    """Guarda el tamaño de miniatura preferido por el usuario."""
-    config = load_config()
-    config['thumbnail_size'] = size
-    save_config(config)
-
-def get_drive_folder_id():
-    """Obtiene el ID de la carpeta de Drive configurada."""
-    config = load_config()
-    return config.get('drive_folder_id')
-
-def set_drive_folder_id(folder_id):
-    """Guarda el ID de la carpeta de Drive."""
-    config = load_config()
-    config['drive_folder_id'] = folder_id
-    save_config(config)
-
-def get_safe_password_hash():
-    """Obtiene el hash SHA-256 de la contraseña de la caja fuerte."""
-    config = load_config()
-    return config.get('safe_password_hash')
-
-def set_safe_password_hash(password):
-    """Guarda el hash de la contraseña (NO la contraseña en texto plano)."""
-    config = load_config()
-    hash_obj = hashlib.sha256(password.encode('utf-8'))
-    config['safe_password_hash'] = hash_obj.hexdigest()
-    save_config(config)
-
-def verify_safe_password(password):
-    """Verifica si la contraseña introducida coincide con la guardada."""
-    stored_hash = get_safe_password_hash()
-    if not stored_hash: return False
-
-    input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
-    return input_hash == stored_hash
-import json
 import os
 import shutil
+import hashlib
+import hmac
 import paths
+import safe_crypto
 
 # Nombre del archivo de configuración
 CONFIG_FILENAME = "visagevault_config.json"
@@ -160,27 +88,41 @@ def set_drive_folder_id(folder_id):
     save_config(config)
 
 # --- SEGURIDAD CAJA FUERTE ---
+# Se guardan los parámetros scrypt (con sal) y un verificador HMAC derivado de
+# la clave; nunca la contraseña ni nada que permita descifrar directamente.
+# 'safe_password_hash' (sha256 sin sal) es el formato antiguo y se migra al
+# primer desbloqueo correcto.
 
-def get_safe_password_hash():
+def has_safe_password():
     config = load_config()
-    return config.get('safe_password_hash', None)
+    return bool(config.get('safe_verifier') or config.get('safe_password_hash'))
 
-def set_safe_password_hash(password_plain):
-    import hashlib
-    # Guardamos solo el hash SHA256, nunca la contraseña plana
-    hash_object = hashlib.sha256(password_plain.encode())
-    hex_dig = hash_object.hexdigest()
+def set_safe_password(password_plain):
+    """Configura la contraseña de la caja fuerte y devuelve la clave derivada."""
+    kdf = safe_crypto.new_kdf_params()
+    key = safe_crypto.derive_key(password_plain, kdf)
 
     config = load_config()
-    config['safe_password_hash'] = hex_dig
+    config['safe_kdf'] = kdf
+    config['safe_verifier'] = safe_crypto.make_verifier(key)
+    config.pop('safe_password_hash', None)
     save_config(config)
+    return key
 
-def verify_safe_password(password_plain):
-    import hashlib
-    stored_hash = get_safe_password_hash()
-    if not stored_hash: return False
+def unlock_safe(password_plain):
+    """Devuelve la clave de la caja fuerte si la contraseña es correcta, o None."""
+    config = load_config()
 
-    hash_object = hashlib.sha256(password_plain.encode())
-    hex_dig = hash_object.hexdigest()
+    kdf = config.get('safe_kdf')
+    verifier = config.get('safe_verifier')
+    if kdf and verifier:
+        key = safe_crypto.derive_key(password_plain, kdf)
+        return key if safe_crypto.check_verifier(key, verifier) else None
 
-    return hex_dig == stored_hash
+    # Formato antiguo: comprobar el hash sin sal y migrar la configuración
+    legacy_hash = config.get('safe_password_hash')
+    if legacy_hash:
+        input_hash = hashlib.sha256(password_plain.encode()).hexdigest()
+        if hmac.compare_digest(input_hash, legacy_hash):
+            return set_safe_password(password_plain)
+    return None

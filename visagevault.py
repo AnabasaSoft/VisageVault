@@ -38,6 +38,8 @@ from drive_auth import DriveAuthenticator
 import requests # Para bajar thumbnails
 from drive_manager import DriveManager
 import config_manager # Para guardar la carpeta elegida
+import safe_crypto
+from safe_crypto import CryptoManager
 
 # --- Silenciar solo el aviso de pkg_resources ---
 warnings.filterwarnings(
@@ -2154,89 +2156,6 @@ class PhotoDirWatcher(QObject):
             self.signal.emit()
 
 # =================================================================
-# GESTOR DE ENCRIPTACIÓN Y CAJA FUERTE (ACTUALIZADO)
-# =================================================================
-class CryptoManager:
-    """
-    Maneja la encriptación XOR usando Numpy para máxima velocidad.
-    Procesa archivos grandes (vídeos) en fracciones de segundo.
-    """
-
-    @staticmethod
-    def get_key_from_password(password):
-        if not password: return b'default_key'
-        return hashlib.sha256(password.encode()).digest() # 32 bytes
-
-    @staticmethod
-    def process_file(input_path, output_path, password, encrypt=True):
-        """Encripta o desencripta de DISCO a DISCO usando Numpy."""
-        # Asegurar directorio destino
-        if output_path:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        key_bytes = CryptoManager.get_key_from_password(password)
-
-        # Convertir clave a array uint8 una sola vez
-        key_arr = np.frombuffer(key_bytes, dtype=np.uint8)
-
-        # Usamos un chunk grande (4MB) para velocidad de disco
-        # 4MB es múltiplo de 32 bytes (tamaño clave), así que la alineación es perfecta
-        CHUNK_SIZE = 4 * 1024 * 1024
-
-        # Pre-creamos un array de clave gigante para hacer XOR directo con el chunk
-        # Esto evita redimensionar la clave en cada vuelta del bucle
-        full_key_tile = np.resize(key_arr, CHUNK_SIZE)
-
-        with open(input_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
-            while True:
-                chunk = f_in.read(CHUNK_SIZE)
-                if not chunk: break
-
-                # Convertir chunk a numpy
-                chunk_arr = np.frombuffer(chunk, dtype=np.uint8)
-
-                # Obtener la parte correspondiente de la clave (por si es el último chunk más pequeño)
-                current_key = full_key_tile[:len(chunk_arr)]
-
-                # --- LA MAGIA: XOR VECTORIZADO (C++ Speed) ---
-                encrypted_arr = np.bitwise_xor(chunk_arr, current_key)
-                # ---------------------------------------------
-
-                # Escribir a disco
-                f_out.write(encrypted_arr.tobytes())
-
-    @staticmethod
-    def decrypt_to_bytes(input_path, password):
-        """Desencripta a MEMORIA (para previsualización) usando Numpy."""
-        if not os.path.exists(input_path): return None
-
-        key_bytes = CryptoManager.get_key_from_password(password)
-        key_arr = np.frombuffer(key_bytes, dtype=np.uint8)
-
-        CHUNK_SIZE = 4 * 1024 * 1024
-        full_key_tile = np.resize(key_arr, CHUNK_SIZE)
-
-        decrypted_data = bytearray()
-
-        try:
-            with open(input_path, 'rb') as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk: break
-
-                    chunk_arr = np.frombuffer(chunk, dtype=np.uint8)
-                    current_key = full_key_tile[:len(chunk_arr)]
-
-                    decrypted_arr = np.bitwise_xor(chunk_arr, current_key)
-
-                    decrypted_data.extend(decrypted_arr.tobytes())
-
-            return bytes(decrypted_data)
-        except Exception as e:
-            print(f"Error desencriptando visualización: {e}")
-            return None
-
-# =================================================================
 # DIÁLOGOS DE SEGURIDAD
 # =================================================================
 class CreatePasswordDialog(QDialog):
@@ -2293,12 +2212,20 @@ class LoginDialog(QDialog):
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
 
-        self.password = None
+        self.key = None
+        self.legacy_key = None
 
     def validate(self):
         pwd = self.pass_edit.text()
-        if config_manager.verify_safe_password(pwd):
-            self.password = pwd
+        QApplication.setOverrideCursor(Qt.WaitCursor)  # scrypt tarda una fracción de segundo
+        try:
+            key = config_manager.unlock_safe(pwd)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if key:
+            self.key = key
+            # Necesaria para leer/migrar archivos de versiones antiguas
+            self.legacy_key = safe_crypto.legacy_key(pwd)
             self.accept()
         else:
             QMessageBox.warning(self, "Error", "Contraseña incorrecta.")
@@ -2576,14 +2503,14 @@ class MoveToSafeWorker(QObject):
     item_finished = Signal(str, bool) # Envía (path, is_video) cuando termina uno
     finished = Signal()
 
-    def __init__(self, db_path, items_data, password):
+    def __init__(self, db_path, items_data, key):
         """
         items_data: Lista de tuplas [(path, is_video), ...]
         """
         super().__init__()
         self.db_path = db_path
         self.items_data = items_data
-        self.password = password
+        self.key = key
         self.is_running = True
 
     @Slot()
@@ -2619,12 +2546,12 @@ class MoveToSafeWorker(QObject):
                     if thumb_temp_path and os.path.exists(thumb_temp_path):
                         encrypted_thumb_path = str(encrypted_path) + ".thumb"
                         # Encriptar miniatura
-                        CryptoManager.process_file(thumb_temp_path, encrypted_thumb_path, self.password)
+                        CryptoManager.encrypt_file(thumb_temp_path, encrypted_thumb_path, self.key)
                         # Borrar temporal
                         os.remove(thumb_temp_path)
 
                 # 3. ENCRIPTAR ARCHIVO PRINCIPAL (Esto es lo que tardaba)
-                CryptoManager.process_file(original_path, encrypted_path, self.password)
+                CryptoManager.encrypt_file(original_path, encrypted_path, self.key)
 
                 # 4. GUARDAR EN DB
                 year, month = "0000", "00"
@@ -6570,23 +6497,63 @@ class VisageVaultApp(QMainWindow):
 
         layout.addWidget(self.unlocked_widget)
 
-        self.current_safe_password = None
+        self.current_safe_key = None
+        self.current_safe_legacy_key = None
 
     def _unlock_safe(self):
         # Verificar si ya existe contraseña configurada
-        if not config_manager.get_safe_password_hash():
+        if not config_manager.has_safe_password():
             QMessageBox.information(self, "Configuración", "Primero debes añadir una foto a la caja fuerte para configurar la contraseña.")
             return
 
         dialog = LoginDialog(self)
         if dialog.exec() == QDialog.Accepted:
-            self.current_safe_password = dialog.password
+            self.current_safe_key = dialog.key
+            self.current_safe_legacy_key = dialog.legacy_key
+            self._migrate_legacy_safe_files()
             self.locked_widget.setVisible(False)
             self.unlocked_widget.setVisible(True)
             self._load_safe_content()
 
+    def _migrate_legacy_safe_files(self):
+        """Convierte al cifrado AES los archivos de versiones antiguas (XOR)."""
+        pending = []
+        for row in self.db.get_safe_files():
+            for path in (row['encrypted_path'], row['encrypted_path'] + ".thumb"):
+                try:
+                    if os.path.exists(path) and safe_crypto.is_legacy_file(path):
+                        pending.append(path)
+                except OSError as e:
+                    print(f"No se pudo leer {path}: {e}")
+        if not pending:
+            return
+
+        migrated, errors = 0, []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for i, path in enumerate(pending):
+                self._set_status(f"Actualizando cifrado de la caja fuerte ({i+1}/{len(pending)})...")
+                QApplication.processEvents()
+                try:
+                    CryptoManager.migrate_legacy_file(path, self.current_safe_key, self.current_safe_legacy_key)
+                    migrated += 1
+                except Exception as e:
+                    print(f"Error migrando {path}: {e}")
+                    errors.append(f"{Path(path).name}: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        self._set_status(f"Cifrado actualizado en {migrated} archivo(s) de la caja fuerte.")
+        if errors:
+            QMessageBox.warning(
+                self, "Actualización de cifrado incompleta",
+                f"Se actualizaron {migrated} de {len(pending)} archivos. Los demás se reintentarán "
+                "la próxima vez que desbloquees la caja fuerte.\n\n" + "\n".join(errors[:10])
+            )
+
     def _lock_safe(self):
-        self.current_safe_password = None
+        self.current_safe_key = None
+        self.current_safe_legacy_key = None
         # Destruir las miniaturas desencriptadas por seguridad
         while self.safe_container_layout.count():
             item = self.safe_container_layout.takeAt(0)
@@ -6671,12 +6638,12 @@ class VisageVaultApp(QMainWindow):
                     try:
                         if media_type == 'photo':
                             # Desencriptar la foto en sí
-                            img_bytes = CryptoManager.decrypt_to_bytes(encrypted_path, self.current_safe_password)
+                            img_bytes = CryptoManager.decrypt_to_bytes(encrypted_path, self.current_safe_key, self.current_safe_legacy_key)
                         elif media_type == 'video':
                             # Desencriptar el THUMBNAIL asociado (.thumb)
                             thumb_enc_path = encrypted_path + ".thumb"
                             if os.path.exists(thumb_enc_path):
-                                img_bytes = CryptoManager.decrypt_to_bytes(thumb_enc_path, self.current_safe_password)
+                                img_bytes = CryptoManager.decrypt_to_bytes(thumb_enc_path, self.current_safe_key, self.current_safe_legacy_key)
 
                         if img_bytes:
                             pixmap.loadFromData(img_bytes)
@@ -6743,19 +6710,15 @@ class VisageVaultApp(QMainWindow):
 
     def _move_to_safe_box(self, items, is_video):
         """Prepara y lanza el hilo de encriptación en segundo plano."""
-        # 1. Gestionar contraseña
-        password = None
-        if not config_manager.get_safe_password_hash():
+        # 1. Obtener la clave (creando la contraseña la primera vez)
+        if not config_manager.has_safe_password():
             dialog = CreatePasswordDialog(self)
-            if dialog.exec() == QDialog.Accepted:
-                password = dialog.password
-                config_manager.set_safe_password_hash(password)
-            else: return
+            if dialog.exec() != QDialog.Accepted: return
+            key = config_manager.set_safe_password(dialog.password)
         else:
             dialog = LoginDialog(self)
-            if dialog.exec() == QDialog.Accepted:
-                password = dialog.password
-            else: return
+            if dialog.exec() != QDialog.Accepted: return
+            key = dialog.key
 
         # 2. Recopilar datos para no pasar widgets al hilo
         items_data = []
@@ -6770,7 +6733,7 @@ class VisageVaultApp(QMainWindow):
 
         # 3. Configurar Worker y Thread
         self.safe_thread = QThread()
-        self.safe_worker = MoveToSafeWorker(self.db.db_path, items_data, password)
+        self.safe_worker = MoveToSafeWorker(self.db.db_path, items_data, key)
         self.safe_worker.moveToThread(self.safe_thread)
 
         # Conectar señales
@@ -6799,7 +6762,7 @@ class VisageVaultApp(QMainWindow):
 
         self._set_status("Desencriptando para visualización...")
         try:
-            img_bytes = CryptoManager.decrypt_to_bytes(encrypted_path, self.current_safe_password)
+            img_bytes = CryptoManager.decrypt_to_bytes(encrypted_path, self.current_safe_key, self.current_safe_legacy_key)
             if img_bytes:
                 pixmap = QPixmap()
                 pixmap.loadFromData(img_bytes)
@@ -6891,7 +6854,7 @@ class VisageVaultApp(QMainWindow):
         # 1. Desencriptar a un temporal y renombrar: un fallo no deja un archivo a medias
         temp_path = original_path + ".restoring"
         try:
-            CryptoManager.process_file(encrypted_path, temp_path, self.current_safe_password)
+            CryptoManager.decrypt_file(encrypted_path, temp_path, self.current_safe_key, self.current_safe_legacy_key)
             os.replace(temp_path, original_path)
         except Exception as e:
             if os.path.exists(temp_path):
