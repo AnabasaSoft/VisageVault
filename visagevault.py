@@ -6587,9 +6587,9 @@ class VisageVaultApp(QMainWindow):
 
     def _lock_safe(self):
         self.current_safe_password = None
-        # Limpiar grid visualmente por seguridad
-        while self.safe_grid.count():
-            item = self.safe_grid.takeAt(0)
+        # Destruir las miniaturas desencriptadas por seguridad
+        while self.safe_container_layout.count():
+            item = self.safe_container_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
 
         self.unlocked_widget.setVisible(False)
