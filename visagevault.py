@@ -750,6 +750,23 @@ class FaceScanWorker(QObject):
 # =================================================================
 # CLASE: FaceLoader (CORREGIDA PARA RUTAS LINUX)
 # =================================================================
+_SAFE_DRIVE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
+
+def drive_cache_path(file_id, name):
+    """
+    Ruta local de una descarga de Drive. Se nombra por el ID (único) y no por
+    el nombre: en Drive puede haber nombres repetidos o con '/' y '..'.
+    Se conserva la extensión porque el visor la usa para detectar los RAW.
+    """
+    if not file_id or not _SAFE_DRIVE_ID.match(str(file_id)):
+        raise ValueError(f"ID de Drive no válido: {file_id!r}")
+    base_name = os.path.basename(str(name or "").replace("\\", "/"))
+    extension = os.path.splitext(base_name)[1].lower()
+    if not _SAFE_EXTENSION.match(extension):
+        extension = ""
+    return os.path.join(paths.cache_subdir("drive_cache"), f"{file_id}{extension}")
+
 def get_face_cache_path(face_id) -> str:
     """Ruta del recorte de una cara en la caché de disco."""
     return os.path.join(paths.cache_subdir("face_cache"), f"face_{face_id}.jpg")
@@ -4647,10 +4664,13 @@ class VisageVaultApp(QMainWindow):
         name = file_data.get('name')
         if not file_id or not name: return
 
-        self._set_status(f"Vista previa: Bajando {name}...")
+        try:
+            local_path = drive_cache_path(file_id, name)
+        except ValueError as e:
+            print(e)
+            return
 
-        temp_dir = paths.cache_subdir("drive_cache")
-        local_path = os.path.join(temp_dir, name)
+        self._set_status(f"Vista previa: Bajando {name}...")
 
         # Comprobar Caché
         if os.path.exists(local_path):
@@ -4667,55 +4687,28 @@ class VisageVaultApp(QMainWindow):
 
     def _download_thread_safe(self, file_id, local_path):
         """Descarga el archivo sin bloquear la interfaz."""
+        # Se descarga a un temporal: si se corta, no queda un archivo a medias
+        # que la siguiente vez se tomaría como caché válida
+        part_path = local_path + ".part"
         try:
             manager = DriveManager()
-            manager.download_file(file_id, local_path)
+            manager.download_file(file_id, part_path)
+            os.replace(part_path, local_path)
 
             # Volver al hilo principal para abrir la ventana
             QTimer.singleShot(0, lambda: self._finish_cloud_preview(local_path))
         except Exception as e:
             print(f"Error descarga preview: {e}")
             QTimer.singleShot(0, lambda: self._set_status("Error al descargar imagen."))
-            # Borrar archivo parcial si falló
-            if os.path.exists(local_path):
-                try: os.remove(local_path)
-                except: pass
+        finally:
+            if os.path.exists(part_path):
+                try: os.remove(part_path)
+                except OSError: pass
 
     def _finish_cloud_preview(self, local_path):
         """Se ejecuta en el hilo principal cuando la descarga termina."""
         self._set_status("Imagen descargada. Abriendo visor...")
         self._open_preview_dialog(local_path)
-
-    @Slot(QListWidgetItem)
-    def _on_drive_item_double_clicked(self, item):
-        file_data = item.data(Qt.UserRole)
-        if not file_data: return
-
-        file_id = file_data['id']
-        name = file_data['name']
-
-        self._set_status(f"Descargando {name} de la nube...")
-
-        # Crear carpeta temporal si no existe
-        temp_dir = os.path.join(self.root_cache, "drive_cache")
-        if not os.path.exists(temp_dir): os.makedirs(temp_dir)
-
-        local_path = os.path.join(temp_dir, name)
-
-        # Descargar en hilo para no congelar
-        threading.Thread(target=self._download_and_show, args=(file_id, local_path), daemon=True).start()
-
-    def _download_and_show(self, file_id, local_path):
-        try:
-            # --- CORRECCIÓN CRÍTICA DE SEGURIDAD DE HILOS ---
-            local_manager = DriveManager()
-            local_manager.download_file(file_id, local_path)
-
-            # Volver a UI para abrir el visor
-            QTimer.singleShot(0, lambda: self._open_photo_detail(local_path))
-            QTimer.singleShot(0, lambda: self._set_status("Descarga completada."))
-        except Exception as e:
-            print(f"Error descarga: {e}")
 
     @Slot(str)
     def _handle_thumbnail_failed(self, original_path: str):
