@@ -317,7 +317,9 @@ class NetworkThumbnailLoader(QRunnable):
                 return
 
         # 2. DESCARGA
-        if not self.url: return
+        if not self.url:
+            self.signals.load_failed.emit(self.file_id)
+            return
 
         try:
             response = requests.get(self.url, timeout=10)
@@ -329,8 +331,10 @@ class NetworkThumbnailLoader(QRunnable):
                 image = get_cached_image(cache_path) # <--- Se guarda en LRU Cache al leer
                 if not image.isNull():
                     self.signals.thumbnail_loaded.emit(self.file_id, image)
-        except Exception:
-            pass
+                    return
+        except Exception as e:
+            print(f"Error descargando miniatura de Drive {self.file_id}: {e}")
+        self.signals.load_failed.emit(self.file_id)
 
 class DriveFolderDialog(QDialog):
     def __init__(self, drive_manager, parent=None):
@@ -2811,6 +2815,7 @@ class VisageVaultApp(QMainWindow):
         # --- Variables de Nube ---
         self.drive_photos_by_date = {}
         self.cloud_group_widgets = {}
+        self.cloud_list_widget_items = {}  # file_id -> QListWidgetItem (búsqueda directa)
         self.cloud_photo_count = 0
         self.current_drive_folder_id = None
         self.drive_scan_thread = None
@@ -4597,30 +4602,23 @@ class VisageVaultApp(QMainWindow):
             return
 
         # ---------------------------------------------------------
-        # 3. BLOQUE PARA DRIVE (CORREGIDO PARA AJUSTAR TAMAÑO)
+        # 3. BLOQUE PARA DRIVE
         # ---------------------------------------------------------
-        if self.cloud_scroll_area.widget():
-            for list_widget in self.cloud_scroll_area.widget().findChildren(PreviewListWidget):
-                if not list_widget.isVisible(): continue
-
-                for i in range(list_widget.count()):
-                    item = list_widget.item(i)
-                    data = item.data(Qt.UserRole)
-
-                    if data and data.get('id') == original_path:
-                        # Escalamos manteniendo aspecto
-                        scaled = pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        item.setIcon(QIcon(scaled))
-
-                        # --- ¡ESTA ES LA LÍNEA QUE FALTABA! ---
-                        # Ajusta la celda al tamaño real de la imagen (ej: 128x90)
-                        # eliminando el espacio vacío sobrante.
-                        item.setSizeHint(scaled.size())
-                        # --------------------------------------
-
-                        item.setText("")
-                        item.setData(Qt.UserRole + 1, "loaded")
-                        return
+        item = self.cloud_list_widget_items.get(original_path)
+        if item is not None:
+            try:
+                scaled = pixmap.scaled(
+                    self.current_thumbnail_size, self.current_thumbnail_size,
+                    Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+                item.setIcon(QIcon(scaled))
+                # Ajusta la celda al tamaño real de la imagen (ej: 128x90)
+                item.setSizeHint(scaled.size())
+                item.setText("")
+                item.setData(Qt.UserRole + 1, "loaded")
+            except RuntimeError:
+                pass  # La lista se destruyó mientras se descargaba
+            return
 
         # ---------------------------------------------------------
         # 4. BLOQUE PARA PERSONAS
@@ -4714,6 +4712,15 @@ class VisageVaultApp(QMainWindow):
             item.setIcon(icon)
             item.setText("") # Quitar "Cargando..."
             item.setData(Qt.UserRole + 1, "failed") # Marcar como fallido
+            return
+
+        # Nube
+        item = self.cloud_list_widget_items.get(original_path)
+        if item is not None:
+            try:
+                item.setData(Qt.UserRole + 1, "failed")
+            except RuntimeError:
+                pass
             return
 
         # Lógica original (para la pestaña Personas)
@@ -5048,11 +5055,9 @@ class VisageVaultApp(QMainWindow):
         """
         self.threadpool.clear()
 
-        list_items = list(self.photo_list_widget_items.values()) + list(self.video_list_widget_items.values())
-        cloud_widget = self.cloud_scroll_area.widget()
-        if cloud_widget:
-            for list_widget in cloud_widget.findChildren(PreviewListWidget):
-                list_items += [list_widget.item(i) for i in range(list_widget.count())]
+        list_items = (list(self.photo_list_widget_items.values())
+                      + list(self.video_list_widget_items.values())
+                      + list(self.cloud_list_widget_items.values()))
         for item in list_items:
             try:
                 if item.data(Qt.UserRole + 1) == "loading":
@@ -5947,6 +5952,7 @@ class VisageVaultApp(QMainWindow):
 
         # B) Limpiar el panel de fotos (Layout)
         # Usamos un bucle while para asegurar que no queda NADA
+        self.cloud_list_widget_items = {}
         while self.cloud_container_layout.count() > 0:
             item = self.cloud_container_layout.takeAt(0)
             widget = item.widget()
@@ -6047,6 +6053,7 @@ class VisageVaultApp(QMainWindow):
                 self.cloud_photo_count = 0
                 self.cloud_date_tree.clear()
                 # Limpiar widgets de fotos anteriores
+                self.cloud_list_widget_items = {}
                 while self.cloud_container_layout.count() > 0:
                     item = self.cloud_container_layout.takeAt(0)
                     if item.widget(): item.widget().deleteLater()
@@ -6207,6 +6214,7 @@ class VisageVaultApp(QMainWindow):
 
         self.cloud_date_tree.clear()
         self.cloud_group_widgets = {}
+        self.cloud_list_widget_items = {}
 
         sorted_years = sort_years(self.drive_photos_by_date.keys())
 
@@ -6272,6 +6280,7 @@ class VisageVaultApp(QMainWindow):
                         'webContentLink': f.get('webContentLink','')
                     }
                     item.setData(Qt.UserRole, safe_data)
+                    self.cloud_list_widget_items[safe_data['id']] = item
                     item.setData(Qt.UserRole + 1, "not_loaded")
                     item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon))
                     item.setSizeHint(QSize(item_w, item_h))
