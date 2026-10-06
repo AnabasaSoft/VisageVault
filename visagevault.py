@@ -74,7 +74,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent,
-    QPainterPath, QKeyEvent, QDesktopServices, QImage, QColor, QPen, QBrush
+    QPainterPath, QKeyEvent, QDesktopServices, QImage, QImageReader, QColor, QPen, QBrush
 )
 
 # --- MODIFICADO: Importar las funciones de foto Y vídeo ---
@@ -335,6 +335,59 @@ class NetworkThumbnailLoader(QRunnable):
         except Exception as e:
             print(f"Error descargando miniatura de Drive {self.file_id}: {e}")
         self.signals.load_failed.emit(self.file_id)
+
+# =================================================================
+# MINIATURAS DE LA CAJA FUERTE (descifrado en segundo plano)
+# =================================================================
+class SafeThumbnailSignals(QObject):
+    loaded = Signal(int, str, QImage)  # generación, ruta cifrada, miniatura
+    failed = Signal(int, str)
+
+
+class SafeThumbnailLoader(QRunnable):
+    """
+    Descifra un archivo de la caja fuerte (o la miniatura .thumb de un vídeo)
+    y devuelve solo una miniatura. La imagen se decodifica ya reducida, así
+    que nunca se tiene la foto completa decodificada en memoria.
+    """
+    def __init__(self, signals, generation, encrypted_path, media_type, key, legacy_key, size):
+        super().__init__()
+        self.signals = signals
+        self.generation = generation
+        self.encrypted_path = encrypted_path
+        self.media_type = media_type
+        self.key = key
+        self.legacy_key = legacy_key
+        self.size = size
+
+    @Slot()
+    def run(self):
+        image = QImage()
+        try:
+            source = self.encrypted_path if self.media_type == 'photo' else self.encrypted_path + ".thumb"
+            data = CryptoManager.decrypt_to_bytes(source, self.key, self.legacy_key) if os.path.exists(source) else None
+            if data:
+                buffer = QBuffer()
+                buffer.setData(data)
+                buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+                reader = QImageReader(buffer)
+                reader.setAutoTransform(True)  # Respeta la orientación EXIF
+                original_size = reader.size()
+                if original_size.isValid():
+                    reader.setScaledSize(original_size.scaled(self.size, self.size, Qt.KeepAspectRatio))
+                image = reader.read()
+                buffer.close()
+        except Exception as e:
+            print(f"Error cargando miniatura de la caja fuerte: {e}")
+
+        try:
+            if image.isNull():
+                self.signals.failed.emit(self.generation, self.encrypted_path)
+            else:
+                self.signals.loaded.emit(self.generation, self.encrypted_path, image)
+        except RuntimeError:
+            pass  # App cerrada
+
 
 class DriveFolderDialog(QDialog):
     def __init__(self, drive_manager, parent=None):
@@ -2839,6 +2892,14 @@ class VisageVaultApp(QMainWindow):
         # con clear() al cambiar de pestaña y la cancelaría
         self.cluster_pool = QThreadPool()
         self.cluster_pool.setMaxThreadCount(1)
+        # Pool aparte para descifrar la caja fuerte (no se vacía al cambiar de pestaña)
+        self.safe_pool = QThreadPool()
+        self.safe_pool.setMaxThreadCount(max(1, min(4, os.cpu_count() or 2)))
+        self.safe_thumb_signals = SafeThumbnailSignals()
+        self.safe_thumb_signals.loaded.connect(self._on_safe_thumbnail_loaded)
+        self.safe_thumb_signals.failed.connect(self._on_safe_thumbnail_failed)
+        self.safe_generation = 0     # Descarta resultados de cargas anteriores o tras bloquear
+        self.safe_list_items = {}    # ruta cifrada -> (QListWidgetItem, tipo)
 
         # Usamos la MISMA señal para todas las miniaturas (fotos, vídeos, caras)
         self.thumb_signals = ThumbnailLoaderSignals()
@@ -5535,7 +5596,7 @@ class VisageVaultApp(QMainWindow):
             except RuntimeError:
                 pass
         pool_done = True
-        for pool in (self.threadpool, self.cluster_pool):
+        for pool in (self.threadpool, self.cluster_pool, self.safe_pool):
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             pool_done = pool.waitForDone(remaining_ms) and pool_done
 
@@ -6774,6 +6835,10 @@ class VisageVaultApp(QMainWindow):
     def _lock_safe(self):
         self.current_safe_key = None
         self.current_safe_legacy_key = None
+        # Las miniaturas que aún se estén descifrando se descartarán al llegar
+        self.safe_generation += 1
+        self.safe_pool.clear()
+        self.safe_list_items = {}
         # Destruir las miniaturas desencriptadas por seguridad
         while self.safe_container_layout.count():
             item = self.safe_container_layout.takeAt(0)
@@ -6783,6 +6848,11 @@ class VisageVaultApp(QMainWindow):
         self.locked_widget.setVisible(True)
 
     def _load_safe_content(self):
+        self.safe_generation += 1
+        self.safe_pool.clear()
+        self.safe_list_items = {}
+        placeholders = {}
+
         while self.safe_container_layout.count() > 0:
             item = self.safe_container_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -6850,70 +6920,17 @@ class VisageVaultApp(QMainWindow):
                     item.setText("")
                     item.setData(Qt.UserRole, row)
 
-                    pixmap = QPixmap()
-                    loaded = False
-
-                    # --- INTENTO DE CARGA DE IMAGEN (FOTO O THUMBNAIL DE VIDEO) ---
-                    img_bytes = None
-                    try:
-                        if media_type == 'photo':
-                            # Desencriptar la foto en sí
-                            img_bytes = CryptoManager.decrypt_to_bytes(encrypted_path, self.current_safe_key, self.current_safe_legacy_key)
-                        elif media_type == 'video':
-                            # Desencriptar el THUMBNAIL asociado (.thumb)
-                            thumb_enc_path = encrypted_path + ".thumb"
-                            if os.path.exists(thumb_enc_path):
-                                img_bytes = CryptoManager.decrypt_to_bytes(thumb_enc_path, self.current_safe_key, self.current_safe_legacy_key)
-
-                        if img_bytes:
-                            pixmap.loadFromData(img_bytes)
-                            if not pixmap.isNull():
-                                scaled = pixmap.scaled(thumb_size, thumb_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-                                # Si es vídeo, pintamos el icono de PLAY encima de la foto
-                                if media_type == 'video':
-                                    painter = QPainter(scaled)
-                                    icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-                                    icon_dim = int(thumb_size * 0.4)
-                                    x = (scaled.width() - icon_dim) // 2
-                                    y = (scaled.height() - icon_dim) // 2
-                                    # Pintar un fondo semitransparente para que se vea el play
-                                    painter.setBrush(QColor(0, 0, 0, 128))
-                                    painter.setPen(Qt.NoPen)
-                                    painter.drawEllipse(x, y, icon_dim, icon_dim)
-                                    icon.paint(painter, x, y, icon_dim, icon_dim)
-                                    painter.end()
-
-                                item.setIcon(QIcon(scaled))
-                                item.setSizeHint(scaled.size())
-                                loaded = True
-                    except: pass
-
-                    # --- FALLBACK (Si no hay thumb o falló) ---
-                    if not loaded:
-                        placeholder = QPixmap(thumb_size, thumb_size)
-                        placeholder.fill(Qt.transparent)
-                        painter = QPainter(placeholder)
-                        painter.setRenderHint(QPainter.Antialiasing)
-
-                        brush = QBrush(QColor("#454545"))
-                        painter.setBrush(brush)
-                        pen = QPen(QColor("#666666"))
-                        pen.setWidth(2)
-                        painter.setPen(pen)
-                        rect_size = thumb_size - 2
-                        painter.drawRoundedRect(1, 1, rect_size, rect_size, 4, 4)
-
-                        icon_type = QStyle.StandardPixmap.SP_MediaPlay if media_type == 'video' else QStyle.StandardPixmap.SP_FileIcon
-                        icon = self.style().standardIcon(icon_type)
-                        icon_dim = int(thumb_size * 0.5)
-                        x = (thumb_size - icon_dim) // 2
-                        y = (thumb_size - icon_dim) // 2
-                        icon.paint(painter, x, y, icon_dim, icon_dim)
-                        painter.end()
-
-                        item.setIcon(QIcon(placeholder))
-                        item.setSizeHint(QSize(thumb_size, thumb_size))
+                    # Marcador inmediato; la miniatura real se descifra en segundo plano
+                    if media_type not in placeholders:
+                        placeholders[media_type] = self._safe_placeholder_icon(media_type, thumb_size)
+                    item.setIcon(placeholders[media_type])
+                    item.setSizeHint(QSize(thumb_size, thumb_size))
+                    item.setData(Qt.UserRole + 1, "safe_loading")
+                    self.safe_list_items[encrypted_path] = (item, media_type)
+                    self.safe_pool.start(SafeThumbnailLoader(
+                        self.safe_thumb_signals, self.safe_generation, encrypted_path, media_type,
+                        self.current_safe_key, self.current_safe_legacy_key, thumb_size
+                    ))
 
                     list_widget.addItem(item)
 
@@ -6927,6 +6944,71 @@ class VisageVaultApp(QMainWindow):
                 self.safe_container_layout.addWidget(list_widget)
 
         self.safe_container_layout.addStretch(1)
+
+    def _safe_placeholder_icon(self, media_type, thumb_size):
+        """Icono gris de espera (o de error) para un elemento de la caja fuerte."""
+        placeholder = QPixmap(thumb_size, thumb_size)
+        placeholder.fill(Qt.transparent)
+        painter = QPainter(placeholder)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        painter.setBrush(QBrush(QColor("#454545")))
+        pen = QPen(QColor("#666666"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        rect_size = thumb_size - 2
+        painter.drawRoundedRect(1, 1, rect_size, rect_size, 4, 4)
+
+        icon_type = QStyle.StandardPixmap.SP_MediaPlay if media_type == 'video' else QStyle.StandardPixmap.SP_FileIcon
+        icon = self.style().standardIcon(icon_type)
+        icon_dim = int(thumb_size * 0.5)
+        x = (thumb_size - icon_dim) // 2
+        y = (thumb_size - icon_dim) // 2
+        icon.paint(painter, x, y, icon_dim, icon_dim)
+        painter.end()
+        return QIcon(placeholder)
+
+    @Slot(int, str, QImage)
+    def _on_safe_thumbnail_loaded(self, generation, encrypted_path, image):
+        if generation != self.safe_generation:
+            return  # Carga antigua o caja ya bloqueada
+        entry = self.safe_list_items.get(encrypted_path)
+        if not entry:
+            return
+        item, media_type = entry
+        scaled = QPixmap.fromImage(image)
+
+        # Si es vídeo, pintamos el icono de PLAY encima de la foto
+        if media_type == 'video':
+            icon_dim = int(min(scaled.width(), scaled.height()) * 0.5)
+            x = (scaled.width() - icon_dim) // 2
+            y = (scaled.height() - icon_dim) // 2
+            painter = QPainter(scaled)
+            painter.setRenderHint(QPainter.Antialiasing)
+            # Fondo semitransparente para que se vea el play
+            painter.setBrush(QColor(0, 0, 0, 128))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(x, y, icon_dim, icon_dim)
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay).paint(painter, x, y, icon_dim, icon_dim)
+            painter.end()
+
+        try:
+            item.setIcon(QIcon(scaled))
+            item.setSizeHint(scaled.size())
+            item.setData(Qt.UserRole + 1, "safe_loaded")
+        except RuntimeError:
+            pass
+
+    @Slot(int, str)
+    def _on_safe_thumbnail_failed(self, generation, encrypted_path):
+        if generation != self.safe_generation:
+            return
+        entry = self.safe_list_items.get(encrypted_path)
+        if entry:
+            try:
+                entry[0].setData(Qt.UserRole + 1, "safe_failed")  # Se queda con el marcador gris
+            except RuntimeError:
+                pass
 
     def _move_to_safe_box(self, items, is_video):
         """Prepara y lanza el hilo de encriptación en segundo plano."""
