@@ -1,7 +1,7 @@
 # drive_manager.py
 import io
 from googleapiclient.http import MediaIoBaseDownload
-from drive_auth import DriveAuthenticator # <--- USAMOS TU CLASE CORREGIDA
+from drive_auth import DriveAuthenticator, DriveAuthError
 
 class DriveManager:
     def __init__(self):
@@ -9,10 +9,15 @@ class DriveManager:
         self.service = None
 
     def authenticate(self):
-        """Usa DriveAuthenticator para obtener el servicio."""
-        # Esto reutiliza la lógica de credenciales incrustadas de drive_auth.py
-        self.service = self.auth.get_service()
-        return self.service is not None
+        """
+        Obtiene el servicio con la sesión guardada. Nunca abre el navegador:
+        se usa desde hilos en segundo plano. El inicio de sesión lo hace
+        DriveLoginWorker cuando el usuario lo pide.
+        """
+        self.service = self.auth.get_service(silent=True)
+        if self.service is None:
+            raise DriveAuthError("La sesión de Google ha caducado. Vuelve a conectar desde la pestaña Nube.")
+        return True
 
     def list_folders(self, parent_id='root'):
         """Devuelve carpetas."""

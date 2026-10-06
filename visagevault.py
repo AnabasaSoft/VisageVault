@@ -34,7 +34,7 @@ import sqlite3
 import time
 
 import threading # Necesario para evitar que la UI se congele
-from drive_auth import DriveAuthenticator
+from drive_auth import DriveAuthenticator, DriveAuthError
 import requests # Para bajar thumbnails
 from drive_manager import DriveManager
 import config_manager # Para guardar la carpeta elegida
@@ -611,6 +611,9 @@ class DriveScanWorker(QObject):
             self.progress.emit(f"Finalizado. Total: {count} fotos.")
             self.finished.emit(count)
 
+        except DriveAuthError as e:
+            self.progress.emit(str(e))
+            self.finished.emit(-1)
         except Exception as e:
             print(f"❌ ERROR FATAL EN WORKER DRIVE: {e}")
             import traceback
@@ -6010,21 +6013,6 @@ class VisageVaultApp(QMainWindow):
         else:
             self._set_status("Conexión fallida. Verifique sus credenciales.")
 
-    def _perform_google_login(self):
-        try:
-            self.drive_auth = DriveAuthenticator()
-            # Esta línea bloquea el hilo hasta que el usuario inicia sesión en el navegador
-            self.drive_service = self.drive_auth.get_service()
-
-            # Si llegamos aquí, fue exitoso. Programar actualización de UI en el hilo principal
-            QTimer.singleShot(0, self._on_login_success)
-
-        except FileNotFoundError as e:
-            QTimer.singleShot(0, lambda: QMessageBox.critical(self, "Error Fatal", str(e)))
-        except Exception as e:
-            print(f"Error de Login con Google: {e}")
-            QTimer.singleShot(0, self._on_login_failure)
-
     def _select_drive_folder(self):
         """Abre el navegador de carpetas de Drive."""
         try:
@@ -6174,6 +6162,12 @@ class VisageVaultApp(QMainWindow):
     @Slot(int)
     def _on_drive_scan_finished(self, total_count):
         """Se llama cuando termina el escaneo."""
+        if total_count < 0:
+            # Sesión caducada: el worker ya lo ha indicado en la barra de estado
+            self.is_drive_connected = False
+            self.btn_gdrive.setText("Reconectar con Google")
+            self.btn_gdrive.setStyleSheet("")
+            return
         self._set_status(f"Indexación completada ({total_count} nuevos). Recargando vista...")
 
         # Volvemos a cargar desde la DB local para refrescar la pantalla con lo nuevo
