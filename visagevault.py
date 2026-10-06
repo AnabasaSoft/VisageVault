@@ -163,6 +163,28 @@ def sort_months(months, reverse=False):
 def year_title(year):
     return f"Año {year}" if _is_known_year(year) else "Sin fecha"
 
+# =================================================================
+# PROTECCIÓN CONTRA BORRADOS MASIVOS DE LA BIBLIOTECA
+# =================================================================
+def find_missing_paths(db_paths, disk_paths_set, directory):
+    """
+    Rutas de la BD que pertenecen a `directory` y ya no están en el disco.
+    Las de otras carpetas (p. ej. una biblioteca anterior) no se tocan.
+    Devuelve (conocidas_en_la_carpeta, desaparecidas).
+    """
+    prefix = os.path.join(os.path.normpath(directory), "")
+    known = [p for p in db_paths if p.startswith(prefix)]
+    missing = [p for p in known if p not in disk_paths_set]
+    return known, missing
+
+def needs_removal_confirmation(n_missing, n_known):
+    """True si faltan tantos archivos que puede ser un disco desmontado."""
+    if n_missing == 0:
+        return False
+    if n_missing == n_known:
+        return True  # Ha desaparecido todo
+    return n_missing >= 50 or n_missing > n_known * 0.25
+
 # --- FUNCIÓN GLOBAL DE CACHÉ EN RAM ---
 # Guarda las últimas 500 imágenes en memoria para que el scroll sea instantáneo
 @lru_cache(maxsize=500)
@@ -1706,7 +1728,8 @@ class DateChangeDialog(QDialog):
 # CLASE TRABAJADORA DEL ESCANEO DE FOTOS (Sin cambios)
 # =================================================================
 class PhotoFinderWorker(QObject):
-    finished = Signal(dict)
+    # (fechas | None si la carpeta no está disponible, rutas desaparecidas a confirmar)
+    finished = Signal(object, list)
     progress = Signal(str)
 
     # Recibimos db_path (texto) en lugar de db_manager (objeto)
@@ -1726,11 +1749,18 @@ class PhotoFinderWorker(QObject):
         local_db.conn.row_factory = sqlite3.Row
 
         photos_by_year_month = {}
+        available = True
+        pending_missing = []
         try:
             self.progress.emit("Cargando fechas de fotos conocidas desde la BD...")
             db_dates = local_db.load_all_photo_dates()
 
             self.progress.emit("Escaneando archivos de FOTOS en el directorio...")
+            if not os.path.isdir(self.directory_path):
+                # Disco o unidad de red desconectado: no se modifica la biblioteca
+                available = False
+                self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
+                return
             photo_paths_on_disk = find_photos(self.directory_path)
             photo_paths_on_disk_set = set(photo_paths_on_disk)
 
@@ -1762,12 +1792,14 @@ class PhotoFinderWorker(QObject):
                 photos_by_year_month[year][month].append(path)
 
             self.progress.emit("Buscando fotos eliminadas...")
-            db_paths_set = set(db_dates.keys())
-            paths_to_delete = list(db_paths_set - photo_paths_on_disk_set)
+            known_paths, missing_paths = find_missing_paths(db_dates.keys(), photo_paths_on_disk_set, self.directory_path)
 
-            if paths_to_delete:
-                self.progress.emit(f"Eliminando {len(paths_to_delete)} fotos de la BD...")
-                local_db.bulk_delete_photos(paths_to_delete)
+            if needs_removal_confirmation(len(missing_paths), len(known_paths)):
+                # Posible disco desmontado: decide el usuario (en el hilo principal)
+                pending_missing = missing_paths
+            elif missing_paths:
+                self.progress.emit(f"Eliminando {len(missing_paths)} fotos de la BD...")
+                local_db.bulk_delete_photos(missing_paths)
 
             if photos_to_upsert_in_db:
                 self.progress.emit(f"Guardando {len(photos_to_upsert_in_db)} fotos nuevas en la BD...")
@@ -1781,13 +1813,14 @@ class PhotoFinderWorker(QObject):
         finally:
             # Cerramos conexión
             local_db.conn.close()
-            self.finished.emit(photos_by_year_month)
+            self.finished.emit(photos_by_year_month if available else None, pending_missing)
 
 # =================================================================
 # CLASE TRABAJADORA DEL ESCANEO DE VÍDEOS (Sin cambios)
 # =================================================================
 class VideoFinderWorker(QObject):
-    finished = Signal(dict)
+    # (fechas | None si la carpeta no está disponible, rutas desaparecidas a confirmar)
+    finished = Signal(object, list)
     progress = Signal(str)
 
     def __init__(self, directory_path: str, db_path: str):
@@ -1804,11 +1837,18 @@ class VideoFinderWorker(QObject):
         local_db.conn.row_factory = sqlite3.Row
 
         videos_by_year_month = {}
+        available = True
+        pending_missing = []
         try:
             self.progress.emit("Cargando fechas de vídeos conocidas desde la BD...")
             db_dates = local_db.load_all_video_dates()
 
             self.progress.emit("Escaneando archivos de VÍDEOS en el directorio...")
+            if not os.path.isdir(self.directory_path):
+                # Disco o unidad de red desconectado: no se modifica la biblioteca
+                available = False
+                self.progress.emit(f"⚠️ La carpeta {self.directory_path} no está disponible. No se ha modificado la biblioteca.")
+                return
             video_paths_on_disk = find_videos(self.directory_path)
             video_paths_on_disk_set = set(video_paths_on_disk)
 
@@ -1838,12 +1878,14 @@ class VideoFinderWorker(QObject):
                 videos_by_year_month[year][month].append(path)
 
             self.progress.emit("Buscando vídeos eliminados...")
-            db_paths_set = set(db_dates.keys())
-            paths_to_delete = list(db_paths_set - video_paths_on_disk_set)
+            known_paths, missing_paths = find_missing_paths(db_dates.keys(), video_paths_on_disk_set, self.directory_path)
 
-            if paths_to_delete:
-                self.progress.emit(f"Eliminando {len(paths_to_delete)} vídeos de la BD...")
-                local_db.bulk_delete_videos(paths_to_delete)
+            if needs_removal_confirmation(len(missing_paths), len(known_paths)):
+                # Posible disco desmontado: decide el usuario (en el hilo principal)
+                pending_missing = missing_paths
+            elif missing_paths:
+                self.progress.emit(f"Eliminando {len(missing_paths)} vídeos de la BD...")
+                local_db.bulk_delete_videos(missing_paths)
 
             if videos_to_upsert_in_db:
                 self.progress.emit(f"Guardando {len(videos_to_upsert_in_db)} vídeos nuevos en la BD...")
@@ -1856,7 +1898,7 @@ class VideoFinderWorker(QObject):
             self.progress.emit(f"Error en escaneo de vídeos: {e}")
         finally:
             local_db.conn.close()
-            self.finished.emit(videos_by_year_month)
+            self.finished.emit(videos_by_year_month if available else None, pending_missing)
 
 # =================================================================
 # CLASE TRABAJADORA DEL ESCANEO DE CARAS (CIERRE SEGURO)
@@ -2683,6 +2725,9 @@ class VisageVaultApp(QMainWindow):
         self.is_drive_connected = False
         self.active_folder_threads = []
         self.current_drive_folder_name = "Inicio"
+
+        # Archivos desaparecidos que el usuario decidió conservar en esta sesión
+        self.kept_missing_paths = set()
 
         # --- Variables para filtrado local ---
         self.current_photo_filter_path = None
@@ -4288,10 +4333,18 @@ class VisageVaultApp(QMainWindow):
             except RuntimeError:
                 print("Aviso: No se pudo hacer scroll al widget de vídeo.")
 
-    @Slot(dict)
-    def _handle_search_finished(self, new_photos_by_year_month):
+    @Slot(object, list)
+    def _handle_search_finished(self, new_photos_by_year_month, missing_paths):
         """Se llama cuando el PhotoFinderWorker termina."""
         self.select_dir_button.setEnabled(True)
+
+        # Carpeta no disponible: no se toca ni la galería ni la BD
+        if new_photos_by_year_month is None:
+            self._set_status("La carpeta de fotos no está disponible (¿disco desconectado?). Biblioteca sin cambios.")
+            return
+
+        if missing_paths:
+            QTimer.singleShot(0, lambda: self._confirm_missing_removal(missing_paths, is_video=False))
 
         # 1. OPTIMIZACIÓN: Si los datos no han cambiado, NO redibujamos nada.
         # Esto evita parpadeos por falsas alarmas del vigilante.
@@ -4322,10 +4375,17 @@ class VisageVaultApp(QMainWindow):
 
         self._start_face_scan()
 
-    @Slot(dict)
-    def _handle_video_search_finished(self, new_videos_by_year_month):
+    @Slot(object, list)
+    def _handle_video_search_finished(self, new_videos_by_year_month, missing_paths):
         """Se llama cuando el VideoFinderWorker termina."""
         self.select_dir_button.setEnabled(True)
+
+        if new_videos_by_year_month is None:
+            self._set_status("La carpeta de vídeos no está disponible (¿disco desconectado?). Biblioteca sin cambios.")
+            return
+
+        if missing_paths:
+            QTimer.singleShot(0, lambda: self._confirm_missing_removal(missing_paths, is_video=True))
 
         # 1. Verificar cambios
         if self.videos_by_year_month == new_videos_by_year_month:
@@ -4349,6 +4409,40 @@ class VisageVaultApp(QMainWindow):
         # 4. Restaurar y Descongelar
         self.video_scroll_area.verticalScrollBar().setValue(current_scroll)
         self.video_scroll_area.setUpdatesEnabled(True)
+
+    def _confirm_missing_removal(self, missing_paths, is_video):
+        """
+        Pregunta antes de quitar de la BD muchos archivos desaparecidos de golpe
+        (p. ej. un disco externo o NAS desmontado), para no perder fechas,
+        caras ni personas por error.
+        """
+        # No volver a preguntar en esta sesión por archivos que ya decidió conservar
+        pending = [p for p in missing_paths if p not in self.kept_missing_paths]
+        if not pending:
+            return
+
+        kind = "vídeos" if is_video else "fotos"
+        answer = QMessageBox.question(
+            self,
+            "Archivos no encontrados",
+            f"{len(pending)} {kind} de la biblioteca ya no están en la carpeta:\n"
+            f"{self.current_directory}\n\n"
+            "Si el disco o la unidad de red está desconectado, responde «No»: "
+            "se conservarán sus fechas, caras y personas hasta que vuelva a estar disponible.\n\n"
+            f"¿Quitar esos {kind} de la biblioteca definitivamente?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if answer == QMessageBox.StandardButton.Yes:
+            if is_video:
+                self.db.bulk_delete_videos(pending)
+            else:
+                self.db.bulk_delete_photos(pending)
+            self._set_status(f"{len(pending)} {kind} quitados de la biblioteca.")
+        else:
+            self.kept_missing_paths.update(pending)
+            self._set_status(f"Se conservan en la biblioteca {len(pending)} {kind} no encontrados.")
 
     def _set_status(self, message):
         # Usamos la barra de estado nativa de la ventana (visible en todas las pestañas)
