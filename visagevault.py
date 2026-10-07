@@ -1570,10 +1570,20 @@ class PreviewListWidget(QListWidget):
 # CLASE PARA VISTA PREVIA CON ZOOM (ImagePreviewDialog)
 # =================================================================
 class ImagePreviewDialog(QDialog):
+    # Solo un visor abierto a la vez. Se libera al cerrarse de CUALQUIER forma
+    # (animación, Alt+F4, destrucción de la ventana padre...): si se quedara a
+    # True, no se podría volver a abrir ninguna vista previa.
     is_showing = False
+
+    @staticmethod
+    def _release():
+        ImagePreviewDialog.is_showing = False
+
     def __init__(self, pixmap: QPixmap, parent=None):
         super().__init__(parent)
         ImagePreviewDialog.is_showing = True
+        self.destroyed.connect(ImagePreviewDialog._release)
+        self._closing = False
 
         # Identificador para que el Label sepa que es un visor
         self.setProperty("is_lightbox", True)
@@ -1618,6 +1628,10 @@ class ImagePreviewDialog(QDialog):
         self.show()
 
     def close_with_animation(self):
+        # Esc, perder el foco y hacer clic pueden llegar a la vez: cerrar una sola vez
+        if self._closing:
+            return
+        self._closing = True
         end_pos = QCursor.pos()
         end_geom = QRect(end_pos.x(), end_pos.y(), 1, 1)
         start_geom = self.geometry()
@@ -1630,8 +1644,12 @@ class ImagePreviewDialog(QDialog):
         self.animation.start()
 
     def _handle_close_animation_finished(self):
-        ImagePreviewDialog.is_showing = False
         self.accept()
+
+    def done(self, result):
+        # Pasa por aquí cualquier cierre del diálogo (accept, reject, Alt+F4)
+        ImagePreviewDialog._release()
+        super().done(result)
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
