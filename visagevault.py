@@ -3425,7 +3425,7 @@ class VisageVaultApp(QMainWindow):
         self.show_deleted_faces_button = QPushButton("Ver caras eliminadas")
         self.show_deleted_faces_button.clicked.connect(self._show_deleted_faces)
         people_panel_layout.addWidget(self.show_deleted_faces_button)
-        self.cluster_faces_button = QPushButton("Buscar Duplicados")
+        self.cluster_faces_button = QPushButton("Agrupar caras parecidas")
         self.cluster_faces_button.clicked.connect(self._start_clustering)
         people_panel_layout.addWidget(self.cluster_faces_button)
         self.people_splitter.addWidget(people_panel_widget)
@@ -6017,27 +6017,27 @@ class VisageVaultApp(QMainWindow):
 
     @Slot()
     def _start_clustering(self):
-        self.cluster_faces_button.setText("Procesando...")
+        self.cluster_faces_button.setText("Agrupando...")
         self.cluster_faces_button.setEnabled(False)
-        self._set_status("Iniciando búsqueda de duplicados...")
+        self._set_status("Agrupando caras parecidas...")
         worker = ClusterWorker(self.cluster_signals, self.db.db_path)
         self.cluster_pool.start(worker)
 
     @Slot(list)
     def _handle_clusters_found(self, clusters: list):
         if not clusters:
-            self._set_status("No se encontraron nuevos duplicados.")
+            self._set_status("No se encontraron grupos de caras parecidas.")
             return
         self.cluster_queue = clusters
-        self._set_status(f"¡Encontrados {len(self.cluster_queue)} grupos! Procesando...")
+        self._set_status(f"¡Encontrados {len(self.cluster_queue)} grupos de caras parecidas!")
         self._process_cluster_queue()
 
     @Slot()
     def _handle_clustering_finished(self):
-        self.cluster_faces_button.setText("Buscar Duplicados")
+        self.cluster_faces_button.setText("Agrupar caras parecidas")
         self.cluster_faces_button.setEnabled(True)
         if not self.cluster_queue:
-             self._set_status("Búsqueda de duplicados finalizada. No se encontraron grupos.")
+             self._set_status("Agrupación terminada. No se encontraron grupos de caras parecidas.")
 
     @Slot()
     def _process_cluster_queue(self):
@@ -6046,7 +6046,7 @@ class VisageVaultApp(QMainWindow):
             self._load_existing_faces_async()
             return
         next_cluster_ids = self.cluster_queue.pop(0)
-        self._set_status(f"Procesando grupo... quedan {len(self.cluster_queue)} grupos.")
+        self._set_status(f"Etiquetando grupo de caras... quedan {len(self.cluster_queue)} grupos.")
         dialog = FaceClusterDialog(
             self.db,
             self.threadpool,
