@@ -125,14 +125,13 @@ from PySide6.QtGui import (
 # --- MODIFICADO: Importar las funciones de foto Y vídeo ---
 from photo_finder import find_photos, find_videos, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 import config_manager
-from metadata_reader import get_photo_date, get_video_date
+from metadata_reader import get_photo_date, get_video_date  # Fecha por nombre o, si no, por fecha de modificación
 from thumbnail_generator import (
     generate_image_thumbnail, generate_video_thumbnail, get_thumbnail_path, THUMBNAIL_SIZE
 )
 import paths
 # --- FIN DE MODIFICACIÓN ---
 
-import metadata_reader
 import piexif.helper
 import re
 import db_manager
@@ -147,40 +146,6 @@ import pickle
 import shutil
 import hashlib
 from collections import OrderedDict
-
-# =================================================================
-# EXTRACTOR DE FECHA POR NOMBRE DE ARCHIVO
-# =================================================================
-def parse_date_from_filename(filepath):
-    """
-    Intenta extraer la fecha (Año, Mes) basándose exclusivamente en el nombre del archivo.
-    Soporta: YYYYMMDD, DD-MM-YYYY, YYYY-MM-DD, DDMMYYYY.
-    """
-    filename = os.path.basename(filepath)
-
-    # 1. Patrón YYYYMMDD (Ej: IMG-20250304-..., VID-20240411..., 20231005.jpg)
-    # Busca 20xx seguido de mes (01-12) y día (01-31)
-    match = re.search(r'(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])', filename)
-    if match:
-        return match.group(1), match.group(2) # Retorna (Año, Mes)
-
-    # 2. Patrón DD-MM-YYYY o DD.MM.YYYY o DD_MM_YYYY (Ej: 07-10-2023.jpg)
-    match = re.search(r'(0[1-9]|[12]\d|3[01])[-._](0[1-9]|1[0-2])[-._](20\d{2})', filename)
-    if match:
-        return match.group(3), match.group(2) # Retorna (Año, Mes)
-
-    # 3. Patrón YYYY-MM-DD (Ej: 2023-11-01_Foto.jpg)
-    match = re.search(r'(20\d{2})[-._](0[1-9]|1[0-2])[-._](0[1-9]|[12]\d|3[01])', filename)
-    if match:
-        return match.group(1), match.group(2)
-
-    # 4. Patrón DDMMYYYY Compacto (Ej: IMG-04122021.jpg -> 04/12/2021)
-    # Asume formato europeo DDMMYYYY si no hay separadores
-    match = re.search(r'(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(20\d{2})', filename)
-    if match:
-        return match.group(3), match.group(2)
-
-    return None, None
 
 # =================================================================
 # AGRUPACIÓN POR FECHA: VALORES DESCONOCIDOS
@@ -1789,14 +1754,9 @@ class PhotoDetailDialog(QDialog):
         """Carga solo la fecha actual de la BD o del archivo."""
         current_year, current_month = self.db.get_photo_date(self.original_path)
 
-        # Si no está en BD...
+        # Si no está en BD: por el nombre del archivo o su fecha de modificación
         if current_year is None or current_month is None:
-            # 1. Intentar por nombre primero
-            current_year, current_month = parse_date_from_filename(self.original_path)
-
-            # 2. Si falla, usar metadatos
-            if not current_year:
-                current_year, current_month = metadata_reader.get_photo_date(self.original_path)
+            current_year, current_month = get_photo_date(self.original_path)
 
         self.year_edit.setText(current_year or "Sin Fecha")
         month_index = self.month_combo.findData(current_month or "00")
@@ -2112,12 +2072,7 @@ class PhotoFinderWorker(QObject):
                     year, month = db_dates[path]
                 else:
                     self.progress.emit(f"Procesando nueva foto: {Path(path).name}")
-                    year, month = parse_date_from_filename(path)
-
-                    # Si no se encontró fecha en el nombre, usamos metadatos internos (EXIF)
-                    if not year:
-                        year, month = get_photo_date(path)
-                    # ---------------------------------------------------
+                    year, month = get_photo_date(path)
 
                     photos_to_upsert_in_db.append((path, year, month))
 
@@ -2208,11 +2163,7 @@ class VideoFinderWorker(QObject):
                     year, month = db_dates[path]
                 else:
                     self.progress.emit(f"Procesando nuevo vídeo: {Path(path).name}")
-                    year, month = parse_date_from_filename(path)
-
-                    # Si no hay fecha en nombre, buscar metadatos internos
-                    if not year:
-                        year, month = get_video_date(path)
+                    year, month = get_video_date(path)
 
                     videos_to_upsert_in_db.append((path, year, month))
 
@@ -4421,8 +4372,8 @@ class VisageVaultApp(QMainWindow):
                     print(f"No se pudo escribir EXIF en {filepath} (posiblemente corrupto o sin cabecera): {e_exif}")
 
             # 3. CAMBIAR FECHA DEL SISTEMA DE ARCHIVOS (Para Vídeos, RAWs y respaldo de JPG)
-            # Esto asegura que al re-escanear, la función 'get_photo_date' o 'get_video_date'
-            # lea esta fecha si falla la lectura de metadatos internos.
+            # Al indexar, get_photo_date/get_video_date usan esta fecha si el nombre
+            # del archivo no contiene una (el EXIF no se lee al indexar).
             os.utime(filepath, (timestamp, timestamp))
 
         except Exception as e:
