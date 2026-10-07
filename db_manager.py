@@ -7,8 +7,8 @@ import os
 import pickle
 import shutil
 import datetime
-from pathlib import Path
 import paths
+from photo_finder import VIDEO_EXTENSIONS
 
 def meta_db_path_for(db_path):
     """La MetaDB vive siempre junto a la BD principal."""
@@ -20,7 +20,7 @@ class VisageVaultDB:
         # Definimos esto PRIMERO para que existan aunque todo lo demás falle.
         self.conn = None
         self.meta_conn = None
-        self.was_reset = False  # <--- Esto arregla el AttributeError
+        self.was_reset = False
         self.is_worker = is_worker
 
         # --- 2. CONFIGURACIÓN DE RUTA ---
@@ -66,6 +66,18 @@ class VisageVaultDB:
         self._check_migrations()
         # Respaldo inicial de fechas/ocultos (solo si la MetaDB está vacía)
         self._sync_main_to_meta()
+
+    @classmethod
+    def for_worker(cls, db_path):
+        """
+        Conexión propia para un hilo en segundo plano: no crea tablas, no
+        comprueba la integridad ni abre la MetaDB (eso lo hace la ventana principal).
+        """
+        db = cls(db_path, is_worker=True)
+        db.conn = sqlite3.connect(db_path, check_same_thread=False)
+        db.conn.row_factory = sqlite3.Row
+        db.conn.execute("PRAGMA journal_mode=WAL;")
+        return db
 
     def _connect_main_db(self):
         """Conexión estándar con optimizaciones."""
@@ -219,12 +231,11 @@ class VisageVaultDB:
             videos_to_restore = []
 
             # Clasificación simple por extensión
-            VIDEO_EXTS = ('.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg')
 
             for r in rows:
                 path = r[0]
                 ext = os.path.splitext(path)[1].lower()
-                if ext in VIDEO_EXTS:
+                if ext in VIDEO_EXTENSIONS:
                     videos_to_restore.append(r)
                 else:
                     photos_to_restore.append(r)
@@ -384,10 +395,6 @@ class VisageVaultDB:
             self.conn.execute("UPDATE videos SET is_hidden = 0 WHERE filepath = ?", (video_path,))
         # RESPALDO
         self._save_meta(video_path, is_hidden=0)
-
-    # --- EL RESTO DE MÉTODOS SE MANTIENEN IGUAL ---
-    # (Copia aquí get_photo_date, load_all_photo_dates, bulk_upsert, faces, drive, safe, etc.)
-    # Solo asegúrate de que los métodos de modificación (update/hide) tengan la llamada a _save_meta
 
     def load_all_photo_dates(self):
         cursor = self.conn.execute("SELECT filepath, year, month FROM photos")

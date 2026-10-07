@@ -23,6 +23,8 @@ IMAGE_EXTENSIONS = (
 VIDEO_EXTENSIONS = (
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.mpeg', '.mpg'
 )
+# Formatos RAW: PIL no los abre, se leen con rawpy
+RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
 
 # Las fotos y los vídeos de una misma tanda de escaneo comparten un único
 # recorrido del disco: el primero que llega lo hace y el segundo reutiliza

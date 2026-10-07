@@ -96,13 +96,11 @@ warnings.filterwarnings(
 import numpy as np
 from sklearn.cluster import DBSCAN
 _keep_splash_alive()
-import sklearn
 import rawpy # Importar rawpy para soporte RAW
-import cv2
 
 from PySide6.QtWidgets import (
-    QDialog, QTableWidget, QTableWidgetItem,
-    QAbstractItemView, QHeaderView, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
+    QDialog, 
+    QAbstractItemView, QDialogButtonBox, QTreeWidget, QTreeWidgetItem,
     QComboBox, QMenu, QListWidget, QListWidgetItem, QFrame, QMessageBox, QCheckBox
 )
 
@@ -115,22 +113,19 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import (
     Qt, QSize, QObject, Signal, QThread, Slot, QTimer,
     QRunnable, QThreadPool, QPropertyAnimation, QEasingCurve, QRect, QPoint, QRectF,
-    QPointF, QBuffer, QIODevice, QUrl, QEventLoop, QEvent
+    QPointF, QBuffer, QIODevice, QUrl, QEvent
 )
 from PySide6.QtGui import (
-    QPixmap, QIcon, QCursor, QTransform, QPainter, QPaintEvent,
+    QPixmap, QIcon, QCursor, QPainter, QPaintEvent,
     QPainterPath, QKeyEvent, QDesktopServices, QImage, QImageReader, QColor, QPen, QBrush
 )
 
-# --- MODIFICADO: Importar las funciones de foto Y vídeo ---
-from photo_finder import find_photos, find_videos, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
-import config_manager
+from photo_finder import find_photos, find_videos, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, RAW_EXTENSIONS
 from metadata_reader import get_photo_date, get_video_date  # Fecha por nombre o, si no, por fecha de modificación
 from thumbnail_generator import (
     generate_image_thumbnail, generate_video_thumbnail, get_thumbnail_path, THUMBNAIL_SIZE
 )
 import paths
-# --- FIN DE MODIFICACIÓN ---
 
 import piexif.helper
 import re
@@ -141,6 +136,8 @@ _keep_splash_alive()
 from PIL import Image, ImageOps
 from send2trash import send2trash
 import ast
+import traceback
+import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import shutil
@@ -329,7 +326,7 @@ class NetworkThumbnailLoader(QRunnable):
 
         # 1. INTENTO CACHÉ DISCO + RAM
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-            image = get_cached_image(cache_path) # <--- RAM CACHE
+            image = get_cached_image(cache_path)
             if not image.isNull():
                 self.signals.thumbnail_loaded.emit(self.file_id, image)
                 return
@@ -346,7 +343,7 @@ class NetworkThumbnailLoader(QRunnable):
                     f.write(response.content)
 
                 # Cargar en memoria y cachear
-                image = get_cached_image(cache_path) # <--- Se guarda en LRU Cache al leer
+                image = get_cached_image(cache_path)
                 if not image.isNull():
                     self.signals.thumbnail_loaded.emit(self.file_id, image)
                     return
@@ -495,7 +492,7 @@ class DriveFolderDialog(QDialog):
         self.path_label.setStyleSheet("font-weight: bold; color: #3daee9; font-size: 14px; padding: 5px;")
         layout.addWidget(self.path_label)
 
-        # --- NUEVO: AVISO INFORMATIVO ---
+        # --- AVISO INFORMATIVO ---
         info_layout = QHBoxLayout()
         info_icon = QLabel("ℹ️")
         info_text = QLabel("Esta lista <b>SOLO muestra carpetas</b>. Tus fotos no aparecerán aquí, pero se escanearán al pulsar 'Seleccionar'.")
@@ -588,7 +585,6 @@ class DriveFolderDialog(QDialog):
 
         except Exception as e:
             QApplication.restoreOverrideCursor()
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Error", f"No se pudo listar: {e}")
 
     def _on_item_double_clicked(self, item):
@@ -615,7 +611,6 @@ class DriveFolderDialog(QDialog):
 
     def _select_current(self):
         if self.current_folder_id == "HOME" or self.current_folder_id == "computers":
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self, "Aviso", "Por favor, entra en una carpeta específica para seleccionarla.")
             return
 
@@ -624,7 +619,7 @@ class DriveFolderDialog(QDialog):
         self.accept()
 
 # =================================================================
-# SEÑALES Y WORKER PARA CARGAR Y RECORTAR CARAS (Sin cambios)
+# SEÑALES Y WORKER PARA CARGAR Y RECORTAR CARAS
 # =================================================================
 class FaceLoaderSignals(QObject):
     face_loaded = Signal(int, QImage, str)
@@ -650,7 +645,6 @@ class DriveLoginWorker(QObject):
     @Slot()
     def run(self):
         try:
-            from drive_auth import DriveAuthenticator
             auth = DriveAuthenticator()
             service = auth.get_service(silent=self.silent)
             if service is None:
@@ -679,7 +673,6 @@ class FolderLoaderWorker(QObject):
     def run(self):
         try:
             # Instanciamos un manager independiente para este hilo
-            from drive_manager import DriveManager
             manager = DriveManager()
 
             # Obtenemos carpetas (esto puede tardar 1-2 segundos)
@@ -702,7 +695,7 @@ class DriveScanWorker(QObject):
         self.folder_id = folder_id
         self.db_path = db_path
         self.is_running = True
-        self.slow_mode = False # <--- NUEVA VARIABLE DE CONTROL
+        self.slow_mode = False
 
     @Slot(bool)
     def set_slow_mode(self, active):
@@ -715,14 +708,9 @@ class DriveScanWorker(QObject):
 
     @Slot()
     def run(self):
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.execute("PRAGMA journal_mode=WAL;")
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         try:
-            from drive_manager import DriveManager
             local_manager = DriveManager()
 
             count = 0
@@ -765,7 +753,6 @@ class DriveScanWorker(QObject):
             self.finished.emit(-1)
         except Exception as e:
             print(f"❌ ERROR FATAL EN WORKER DRIVE: {e}")
-            import traceback
             traceback.print_exc()
             self.finished.emit(0)
         finally:
@@ -777,127 +764,6 @@ class DriveScanWorker(QObject):
             db_instance.bulk_upsert_drive_photos(items, root_folder_id=self.folder_id)
         except Exception as e:
             print(f"Error guardando en DB Drive: {e}")
-
-class FaceScanWorker(QObject):
-    def __init__(self, db_path: str):
-        super().__init__()
-        self.db_path = db_path
-        self.signals = FaceScanSignals()
-        self.is_running = True
-
-    @Slot()
-    def run(self):
-        # Configuración de la DB en el hilo
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-
-        # --- CORRECCIÓN CRÍTICA ---
-        local_db.conn.row_factory = sqlite3.Row  # <--- ¡ESTA ES LA LÍNEA QUE FALTABA!
-        # --------------------------
-
-        local_db.conn.execute("PRAGMA journal_mode=WAL;")
-
-        try:
-            self.signals.scan_progress.emit("Buscando fotos sin escanear...")
-
-            # Ahora esto funcionará porque row_factory convierte las tuplas en objetos accesibles por nombre
-            unscanned_photos = local_db.get_unscanned_photos()
-
-            total = len(unscanned_photos)
-            if total == 0:
-                self.signals.scan_progress.emit("No hay fotos nuevas para analizar.")
-                self.signals.scan_percentage.emit(100)
-                self.signals.scan_finished.emit()
-                return
-
-            self.signals.scan_progress.emit(f"Escaneando {total} fotos nuevas para caras...")
-
-            # Extensiones RAW
-            RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
-
-            for i, row in enumerate(unscanned_photos):
-                if not self.is_running: break
-
-                # AQUÍ DABA EL ERROR ANTES: row['id'] fallaba sin row_factory
-                photo_id = row['id']
-                photo_path = row['filepath']
-
-                # Actualizar barra de progreso con menos frecuencia (cada 5 fotos)
-                if i % 5 == 0:
-                    percentage = (i + 1) * 100 // total
-                    self.signals.scan_percentage.emit(percentage)
-                    self.signals.scan_progress.emit(f"Analizando caras ({i+1}/{total})...")
-                    time.sleep(0.001)
-
-                try:
-                    image = None
-                    file_suffix = Path(photo_path).suffix.lower()
-
-                    # 1. Cargar Imagen (Soporte RAW + Standard)
-                    if file_suffix in RAW_EXTENSIONS:
-                        try:
-                            with rawpy.imread(photo_path) as raw:
-                                image = raw.postprocess()
-                        except Exception:
-                            local_db.mark_photo_as_scanned(photo_id)
-                            continue
-                    else:
-                        image = face_recognition.load_image_file(photo_path)
-
-                    if image is None:
-                        local_db.mark_photo_as_scanned(photo_id)
-                        continue
-
-                    # 2. Optimización: Redimensionar si es gigante
-                    h, w = image.shape[:2]
-                    max_width = 1000
-                    scale_ratio = 1.0
-
-                    if w > max_width:
-                        scale_ratio = max_width / float(w)
-                        new_h = int(h * scale_ratio)
-                        image = cv2.resize(image, (max_width, new_h))
-
-                    # 3. Detectar caras
-                    locations = face_recognition.face_locations(image)
-
-                    if locations:
-                        encodings = face_recognition.face_encodings(image, locations)
-
-                        for loc, enc in zip(locations, encodings):
-                            # Restaurar coordenadas originales si hubo redimensionado
-                            if scale_ratio != 1.0:
-                                top, right, bottom, left = loc
-                                top = int(top / scale_ratio)
-                                right = int(right / scale_ratio)
-                                bottom = int(bottom / scale_ratio)
-                                left = int(left / scale_ratio)
-                                loc = (top, right, bottom, left)
-
-                            location_str = str(loc)
-                            encoding_blob = pickle.dumps(enc)
-
-                            # Guardar cara encontrada
-                            face_db_id = local_db.add_face(photo_id, encoding_blob, location_str)
-                            self.signals.face_found.emit(face_db_id, photo_path, location_str)
-
-                    # Marcar foto como procesada
-                    local_db.mark_photo_as_scanned(photo_id)
-
-                except Exception as e:
-                    print(f"Error procesando caras en {photo_path}: {e}")
-                    local_db.mark_photo_as_scanned(photo_id)
-
-            self.signals.scan_progress.emit("Escaneo de caras finalizado.")
-            self.signals.scan_finished.emit()
-
-        except Exception as e:
-            print(f"Error crítico worker caras: {e}")
-            self.signals.scan_progress.emit(f"Error: {e}")
-            self.signals.scan_finished.emit()
-        finally:
-            local_db.conn.close()
 
 # =================================================================
 # CLASE: FaceLoader (CORREGIDA PARA RUTAS LINUX)
@@ -957,6 +823,16 @@ def send_files_to_trash(parent, file_paths):
                     print(f"Error eliminando {path}: {e}")
     return removed
 
+def load_full_pixmap(path) -> QPixmap:
+    """Foto completa como QPixmap (también RAW, con rawpy). Solo en el hilo de la interfaz."""
+    if Path(path).suffix.lower() in RAW_EXTENSIONS:
+        with rawpy.imread(path) as raw:
+            rgb_array = raw.postprocess()
+        height, width, _ = rgb_array.shape
+        image = QImage(rgb_array.data, width, height, 3 * width, QImage.Format.Format_RGB888).copy()
+        return QPixmap.fromImage(image)
+    return QPixmap(path)
+
 def get_face_cache_path(face_id) -> str:
     """Ruta del recorte de una cara en la caché de disco."""
     return os.path.join(paths.cache_subdir("face_cache"), f"face_{face_id}.jpg")
@@ -1003,9 +879,7 @@ def cleanup_orphan_caches(db_path):
         thumb_dir = get_thumbnail_path("").parent
         thumb_files = os.listdir(thumb_dir)
 
-        local_db = VisageVaultDB(os.path.basename(db_path), is_worker=True)
-        local_db.db_path = db_path
-        local_db.conn = sqlite3.connect(db_path, check_same_thread=False)
+        local_db = VisageVaultDB.for_worker(db_path)
         try:
             orphan_faces = local_db.delete_orphan_faces()
             face_ids = local_db.get_all_face_ids()
@@ -1059,7 +933,6 @@ class FaceLoader(QRunnable):
             location = ast.literal_eval(self.location_str)
             (top, right, bottom, left) = location
 
-            RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
             file_suffix = Path(self.photo_path).suffix.lower()
 
             img = None
@@ -1105,7 +978,7 @@ class FaceLoader(QRunnable):
             except RuntimeError:
                 pass # App cerrada, no hacer nada
 
-        except Exception as e:
+        except Exception:
             # Si falla, emitimos señal de fallo, pero también protegida
             try:
                 self.signals.face_load_failed.emit(self.face_id)
@@ -1113,7 +986,7 @@ class FaceLoader(QRunnable):
                 pass # App cerrada
 
 # =================================================================
-# SEÑALES Y WORKER PARA AGRUPAR CARAS (CLUSTERING) (Sin cambios)
+# SEÑALES Y WORKER PARA AGRUPAR CARAS (CLUSTERING)
 # =================================================================
 class ClusterSignals(QObject):
     clusters_found = Signal(list)
@@ -1128,10 +1001,7 @@ class ClusterWorker(QRunnable):
 
     @Slot()
     def run(self):
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         try:
             self.signals.clustering_progress.emit("Cargando datos de caras...")
@@ -1172,7 +1042,7 @@ class ClusterWorker(QRunnable):
             self.signals.clustering_finished.emit()
 
 # =================================================================
-# CLASE PARA MOSTRAR CARAS RECORTADAS (Sin cambios)
+# CLASE PARA MOSTRAR CARAS RECORTADAS
 # =================================================================
 class CircularFaceLabel(QLabel):
     clicked = Signal()
@@ -1329,10 +1199,6 @@ class ZoomableClickableLabel(QLabel):
             y_start = (self.height() - scaled_h) / 2 if scaled_h < self.height() else 0
 
             # 3. Crear el rectángulo que ocupa la imagen REALMENTE en pantalla
-            # Usamos el ancho/alto visual o el de la ventana (el que sea menor) para definir el área clicable válida
-            valid_w = min(scaled_w, self.width())
-            valid_h = min(scaled_h, self.height())
-
             # Ajuste: Si la imagen es gigante (zoom), el rect válido es toda la pantalla
             img_rect = QRectF(x_start, y_start, scaled_w, scaled_h)
 
@@ -1513,7 +1379,6 @@ class PreviewListWidget(QListWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() == Qt.Key_Escape:
-            from PySide6.QtWidgets import QApplication
             for widget in QApplication.allWidgets():
                 if widget.__class__.__name__ == "ImagePreviewDialog" and widget.isVisible():
                     if hasattr(widget, 'close_with_animation'):
@@ -1746,25 +1611,8 @@ class PhotoDetailDialog(QDialog):
         self._load_current_date() # Renombrado de _load_metadata
 
     def _load_photo(self):
-        # ... (MANTENER EL CÓDIGO DE CARGA DE IMAGEN/RAW IGUAL QUE ANTES) ...
-        # (No copies esto, solo deja el método _load_photo tal cual lo tenías)
         try:
-            # Definir extensiones RAW
-            RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
-            file_suffix = Path(self.original_path).suffix.lower()
-            pixmap = QPixmap()
-
-            if file_suffix in RAW_EXTENSIONS:
-                with rawpy.imread(self.original_path) as raw:
-                    rgb_array = raw.postprocess()
-                height, width, channel = rgb_array.shape
-                bytes_per_line = 3 * width
-                q_image = QImage(rgb_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                pixmap = QPixmap.fromImage(q_image)
-            else:
-                pixmap = QPixmap(self.original_path)
-
-            self.image_label.setOriginalPixmap(pixmap)
+            self.image_label.setOriginalPixmap(load_full_pixmap(self.original_path))
         except Exception as e:
             self.image_label.setText(f"Error: {e}")
 
@@ -1781,15 +1629,12 @@ class PhotoDetailDialog(QDialog):
         self.month_combo.setCurrentIndex(month_index if month_index != -1 else 0)
 
     def _save_metadata(self):
-        # ... (MANTENER IGUAL QUE ANTES) ...
-        # Solo cambia la BD, lo cual es correcto según tus instrucciones.
         try:
             new_year_str = self.year_edit.text()
             new_month_str = self.month_combo.currentData()
 
             # Validación simple
             if not (new_year_str == "Sin Fecha" or (len(new_year_str) == 4 and new_year_str.isdigit())):
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(self, "Datos Inválidos", "Año inválido.")
                 return
 
@@ -1803,7 +1648,7 @@ class PhotoDetailDialog(QDialog):
             print(f"Error al guardar: {e}")
 
 # =================================================================
-# CLASE: DIÁLOGO DE ETIQUETADO DE GRUPOS (CLUSTERS) (Sin cambios)
+# CLASE: DIÁLOGO DE ETIQUETADO DE GRUPOS (CLUSTERS)
 # =================================================================
 class FaceClusterDialog(QDialog):
     SkipRole = QDialog.Accepted + 1
@@ -1900,7 +1745,6 @@ class FaceClusterDialog(QDialog):
             elif selected_id != -1:
                 self.person_id_to_save = selected_id
             else:
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(self, "Acción Requerida",
                                     "Por favor, selecciona una persona existente o escribe un nombre nuevo.")
                 return
@@ -1934,24 +1778,8 @@ class FaceClusterDialog(QDialog):
             return
 
         # --- SOPORTE RAW PARA VISTA PREVIA ---
-        RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
-        file_suffix = Path(photo_path).suffix.lower()
-
-        full_pixmap = QPixmap()
-
         try:
-            if file_suffix in RAW_EXTENSIONS:
-                # Procesar con rawpy
-                with rawpy.imread(photo_path) as raw:
-                    rgb_array = raw.postprocess()
-
-                height, width, channel = rgb_array.shape
-                bytes_per_line = 3 * width
-                q_image = QImage(rgb_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-                full_pixmap = QPixmap.fromImage(q_image)
-            else:
-                # Procesar estándar
-                full_pixmap = QPixmap(photo_path)
+            full_pixmap = load_full_pixmap(photo_path)
 
             if full_pixmap.isNull():
                 print(f"Error: No se pudo cargar la imagen completa de {photo_path}")
@@ -2031,7 +1859,6 @@ class DateChangeDialog(QDialog):
 
         # Validación: Debe ser 4 dígitos numéricos
         if not year.isdigit() or len(year) != 4:
-            from PySide6.QtWidgets import QMessageBox # Asegurar import
             QMessageBox.warning(self, "Año incorrecto", "Por favor, escribe un año válido de 4 cifras (ej: 2025).")
             return
 
@@ -2041,7 +1868,7 @@ class DateChangeDialog(QDialog):
         return self.year_edit.text().strip(), self.month_combo.currentData()
 
 # =================================================================
-# CLASE TRABAJADORA DEL ESCANEO DE FOTOS (Sin cambios)
+# CLASE TRABAJADORA DEL ESCANEO DE FOTOS
 # =================================================================
 class PhotoFinderWorker(QObject):
     # (fechas | None si la carpeta no está disponible, rutas desaparecidas a confirmar)
@@ -2059,11 +1886,7 @@ class PhotoFinderWorker(QObject):
     @Slot()
     def run(self):
         # Abrimos nuestra propia conexión segura
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        # Forzamos que use la ruta correcta si no coincide con el default
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         photos_by_year_month = {}
         available = True
@@ -2135,7 +1958,7 @@ class PhotoFinderWorker(QObject):
             self.finished.emit(photos_by_year_month if available else None, pending_missing)
 
 # =================================================================
-# CLASE TRABAJADORA DEL ESCANEO DE VÍDEOS (Sin cambios)
+# CLASE TRABAJADORA DEL ESCANEO DE VÍDEOS
 # =================================================================
 class VideoFinderWorker(QObject):
     # (fechas | None si la carpeta no está disponible, rutas desaparecidas a confirmar)
@@ -2151,10 +1974,7 @@ class VideoFinderWorker(QObject):
 
     @Slot()
     def run(self):
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         videos_by_year_month = {}
         available = True
@@ -2251,11 +2071,7 @@ class FaceScanWorker(QObject):
 
     @Slot()
     def run(self):
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
-        local_db.conn.execute("PRAGMA journal_mode=WAL;")
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         try:
             self.signals.scan_progress.emit("Buscando fotos sin escanear...")
@@ -2272,7 +2088,6 @@ class FaceScanWorker(QObject):
 
             # WARMUP
             try:
-                import face_recognition
                 dummy = np.zeros((50, 50, 3), dtype=np.uint8)
                 face_recognition.face_locations(dummy, model="hog")
             except Exception: pass
@@ -2313,8 +2128,8 @@ class FaceScanWorker(QObject):
                     except TimeoutError:
                         # Si tarda mucho y estamos cerrando, ignorar
                         pass
-                    except Exception as e:
-                        # print(f"Error procesando {photo_path}: {e}")
+                    except Exception:
+                        # Foto ilegible: se marca para no reintentarla en cada escaneo
                         local_db.mark_photo_as_scanned(photo_id)
 
                     processed_count += 1
@@ -2326,7 +2141,7 @@ class FaceScanWorker(QObject):
             self.signals.scan_finished.emit()
 
         except Exception as e:
-            # print(f"Worker interrumpido o error: {e}")
+            print(f"Escaneo de caras interrumpido: {e}")
             self.signals.scan_finished.emit()
         finally:
             # Asegurar limpieza final
@@ -2336,11 +2151,6 @@ class FaceScanWorker(QObject):
             except: pass
 
     def _process_single_image(self, photo_id, photo_path):
-        # ... (Mantén este método IGUAL que en la versión PIL anterior) ...
-        # (Copia el método _process_single_image de mi respuesta anterior)
-        # Extensiones RAW
-        RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
-
         try:
             image = None
             file_suffix = Path(photo_path).suffix.lower()
@@ -2706,10 +2516,7 @@ class DuplicateFinderWorker(QObject):
     @Slot()
     def run(self):
         # Conexión DB local para el hilo
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         try:
             self.progress.emit("Cargando lista de fotos...")
@@ -2800,9 +2607,9 @@ class DuplicateDialog(QDialog):
 
     def _load_list(self):
         self.list_widget.clear()
-        for h, paths in self.duplicates.items():
+        for h, group_paths in self.duplicates.items():
             # Filtrar si ya borramos alguna
-            valid_paths = [p for p in paths if p not in self.deleted_paths and os.path.exists(p)]
+            valid_paths = [p for p in group_paths if p not in self.deleted_paths and os.path.exists(p)]
             if len(valid_paths) > 1:
                 name = Path(valid_paths[0]).name
                 item = QListWidgetItem(f"{name} ({len(valid_paths)} copias)")
@@ -2932,10 +2739,7 @@ class MoveToSafeWorker(QObject):
     @Slot()
     def run(self):
         # Conexión DB independiente para este hilo
-        local_db = VisageVaultDB(os.path.basename(self.db_path), is_worker=True)
-        local_db.db_path = self.db_path
-        local_db.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        local_db.conn.row_factory = sqlite3.Row
+        local_db = VisageVaultDB.for_worker(self.db_path)
 
         safe_dir = Path(paths.safe_dir())
 
@@ -3183,7 +2987,6 @@ class VisageVaultApp(QMainWindow):
         # Lo lanzamos a los 800ms para no frenar la apertura de la ventana
         QTimer.singleShot(800, self._preload_heavy_tabs)
 
-    # --- AÑADIR ESTE NUEVO MÉTODO ---
     def _preload_heavy_tabs(self):
         """Carga los datos de Personas y Nube en segundo plano al iniciar."""
         # 1. Cargar lista de nombres de personas (DB Query + TreeWidget)
@@ -3208,7 +3011,7 @@ class VisageVaultApp(QMainWindow):
 
         self.main_splitter = QSplitter(Qt.Horizontal)
 
-        # --- NUEVO: Panel Izquierdo (Árbol de Carpetas Local) ---
+        # --- Panel Izquierdo (Árbol de Carpetas Local) ---
         self.photo_folder_panel = QWidget()
         self.photo_folder_panel.setMinimumWidth(200)
         photo_folder_layout = QVBoxLayout(self.photo_folder_panel)
@@ -3258,7 +3061,7 @@ class VisageVaultApp(QMainWindow):
 
         top_controls.addLayout(botones_layout)
 
-        # --- NUEVO: Botón Ver Árbol ---
+        # --- Botón Ver Árbol ---
         self.btn_show_photo_tree = QPushButton("Ver árbol de directorios")
         self.btn_show_photo_tree.setCheckable(True)
         self.btn_show_photo_tree.clicked.connect(self._toggle_photo_folder_tree)
@@ -3292,7 +3095,7 @@ class VisageVaultApp(QMainWindow):
 
         self.video_splitter = QSplitter(Qt.Horizontal)
 
-        # --- NUEVO: Panel Izquierdo (Árbol de Carpetas Local Vídeos) ---
+        # --- Panel Izquierdo (Árbol de Carpetas Local Vídeos) ---
         self.video_folder_panel = QWidget()
         self.video_folder_panel.setMinimumWidth(200)
         video_folder_layout = QVBoxLayout(self.video_folder_panel)
@@ -3327,7 +3130,7 @@ class VisageVaultApp(QMainWindow):
         video_right_panel_widget = QWidget()
         video_right_panel_layout = QVBoxLayout(video_right_panel_widget)
 
-        # --- NUEVO: Botonera superior para Vídeos ---
+        # --- Botonera superior para Vídeos ---
         video_top_controls = QVBoxLayout()
         self.btn_show_video_tree = QPushButton("Ver árbol de directorios")
         self.btn_show_video_tree.setCheckable(True)
@@ -3353,7 +3156,7 @@ class VisageVaultApp(QMainWindow):
 
 
         # ==========================================================
-        # 4. Pestaña "Personas" (Sin cambios)
+        # 4. Pestaña "Personas"
         # ==========================================================
         self.personas_tab_widget = QWidget()
         personas_layout = QVBoxLayout(self.personas_tab_widget)
@@ -3410,7 +3213,7 @@ class VisageVaultApp(QMainWindow):
         self.people_splitter.setSizes([left_width, min_right_width])
 
         # ==========================================================
-        # 5. Pestaña "Ayuda" (NUEVO)
+        # 5. Pestaña "Ayuda"
         # ==========================================================
         help_tab_widget = QWidget()
         help_layout = QVBoxLayout(help_tab_widget)
@@ -3492,7 +3295,7 @@ class VisageVaultApp(QMainWindow):
         # 2. Splitter Principal (Árbol Carpetas | Fotos | Árbol Fechas)
         self.cloud_splitter = QSplitter(Qt.Horizontal)
 
-        # --- NUEVO PANEL IZQUIERDO: ÁRBOL DE DIRECTORIOS ---
+        # --- PANEL IZQUIERDO: ÁRBOL DE DIRECTORIOS ---
         self.cloud_folder_panel = QWidget()
         folder_panel_layout = QVBoxLayout(self.cloud_folder_panel)
         folder_panel_layout.setContentsMargins(0, 0, 0, 0)
@@ -3575,7 +3378,7 @@ class VisageVaultApp(QMainWindow):
 
         video_right_panel_widget.setMinimumWidth(180)
         # self.video_splitter.splitterMoved.connect(self._save_video_splitter_state)
-        self._load_video_splitter_state() # <-- NUEVO
+        self._load_video_splitter_state()
 
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
@@ -3662,7 +3465,7 @@ class VisageVaultApp(QMainWindow):
     def _initial_check(self):
         """Comprueba la configuración al arrancar la app."""
 
-        # --- NUEVA COMPROBACIÓN DE AUTOREPARACIÓN ---
+        # --- COMPROBACIÓN DE AUTOREPARACIÓN ---
         if self.db.was_reset:
             self._after_splash(lambda: QMessageBox.warning(
                 self,
@@ -3788,7 +3591,6 @@ class VisageVaultApp(QMainWindow):
         self.select_dir_button.setEnabled(False)
         self.photo_thread.start()
 
-    # --- NUEVA FUNCIÓN ---
     def _start_video_search(self, directory, scan_id=None):
         """Configura y lanza el trabajador de escaneo de VÍDEOS."""
         if self.video_thread and self.video_thread.isRunning():
@@ -3809,10 +3611,9 @@ class VisageVaultApp(QMainWindow):
 
         self.select_dir_button.setEnabled(False) # Compartido
         self.video_thread.start()
-    # --- FIN DE LO NUEVO ---
 
     # ----------------------------------------------------
-    # Escaneo de caras (Sin cambios)
+    # Escaneo de caras
     # ----------------------------------------------------
     def _start_face_scan(self):
         """Configura y lanza el trabajador de escaneo de caras."""
@@ -3837,249 +3638,142 @@ class VisageVaultApp(QMainWindow):
     # Lógica de Visualización y Miniaturas
     # ----------------------------------------------------
 
+    def _gallery(self, is_video):
+        """Piezas de la galería de Fotos o de Vídeos (comparten toda la lógica)."""
+        if is_video:
+            return types.SimpleNamespace(
+                kind="vídeos", data=self.videos_by_year_month, items=self.video_list_widget_items,
+                groups_attr="video_group_widgets", container=self.video_container_layout,
+                scroll=self.video_scroll_area, tree=self._date_tree(True),
+                filter_path=self.current_video_filter_path, get_hidden=self.db.get_hidden_videos,
+                hidden_label="Ocultos", hidden_title="Vídeos Ocultos", hidden_kind="vídeos ocultos",
+                spacing=20, padding=8,
+                loader=VideoThumbnailLoader, open_item=self._open_video_player,
+                splitter=self.video_splitter, splitter_key="video_splitter_sizes",
+                folder_panel=self.video_folder_panel, folder_tree=self.video_folder_tree,
+                tree_button=self.btn_show_video_tree)
+        return types.SimpleNamespace(
+            kind="fotos", data=self.photos_by_year_month, items=self.photo_list_widget_items,
+            groups_attr="photo_group_widgets", container=self.photo_container_layout,
+            scroll=self.scroll_area, tree=self._date_tree(False),
+            filter_path=self.current_photo_filter_path, get_hidden=self.db.get_hidden_photos,
+            hidden_label="Ocultas", hidden_title="Fotos Ocultas", hidden_kind="fotos ocultas",
+            spacing=10, padding=10,
+            loader=ThumbnailLoader, open_item=self._open_preview_dialog,
+            splitter=self.main_splitter, splitter_key="photo_splitter_sizes",
+            folder_panel=self.photo_folder_panel, folder_tree=self.photo_folder_tree,
+            tree_button=self.btn_show_photo_tree)
+
+    def _date_tree(self, is_video):
+        return self.video_date_tree_widget if is_video else self.date_tree_widget
+
+    def _new_gallery_list(self, is_video, hidden_view=False):
+        """QListWidget de miniaturas configurado para Fotos o Vídeos."""
+        g = self._gallery(is_video)
+        list_widget = PreviewListWidget()
+        list_widget.setMovement(QListWidget.Static)
+        list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        list_widget.setViewMode(QListWidget.IconMode)
+        list_widget.setResizeMode(QListWidget.Adjust)
+        list_widget.setSpacing(20 if hidden_view else g.spacing)
+        list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        list_widget.customContextMenuRequested.connect(
+            lambda pos, lw=list_widget: self._on_context_menu(pos, lw, is_video=is_video, is_hidden_view=hidden_view)
+        )
+        # Doble clic: PreviewListWidget lo convierte en previewRequested (no emite itemDoubleClicked)
+        list_widget.previewRequested.connect(g.open_item)
+        list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
+        list_widget.setProperty("thumb_padding", 8 if hidden_view else g.padding)
+        if not hidden_view:
+            list_widget.itemPressed.connect(self._handle_global_selection)
+            list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            list_widget.setFrameShape(QFrame.NoFrame)
+            list_widget.setToolTip("Ctrl + (+/-): Zoom\n\nHaz clic para seleccionar.")
+        return list_widget
+
+    def _add_gallery_item(self, list_widget, path, items_index):
+        cell = self.current_thumbnail_size + (list_widget.property("thumb_padding") or 10)
+        item = QListWidgetItem("Cargando...")
+        item.setToolTip(Path(path).name)
+        # Tamaño de la celda fijo: la selección se ajusta a él
+        item.setSizeHint(QSize(cell, cell))
+        item.setData(Qt.UserRole, path)
+        item.setData(Qt.UserRole + 1, "not_loaded")
+        list_widget.addItem(item)
+        items_index[path] = item
+
     def _display_photos(self):
-        """Muestra las FOTOS (Lógica clonada de Vídeos para corregir selección y huecos)."""
-        while self.photo_container_layout.count() > 0:
-            item = self.photo_container_layout.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-
-        self.date_tree_widget.clear()
-        self.photo_list_widget_items.clear()
-        self.photo_group_widgets = {}
-
-        # 1. Preparar lista de ocultos
-        hidden_paths = set(self.db.get_hidden_photos())
-        hidden_item = QTreeWidgetItem(self.date_tree_widget, ["Ocultas"])
-        hidden_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
-        hidden_item.setData(0, Qt.UserRole, "HIDDEN_SECTION")
-
-        sorted_years = sort_years(self.photos_by_year_month.keys())
-
-        for year in sorted_years:
-            year_item = QTreeWidgetItem(self.date_tree_widget, [str(year)])
-
-            year_label = QLabel(year_title(year))
-            year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
-            widgets_added_for_year = [year_label]
-
-            month_added_count = 0
-            sorted_months = sort_months(self.photos_by_year_month[year].keys())
-
-            for month in sorted_months:
-                all_photos = self.photos_by_year_month[year][month]
-
-                # Filtrar
-                visible_photos = []
-                for p in all_photos:
-                    if p in hidden_paths: continue
-                    if self.current_photo_filter_path and not p.startswith(self.current_photo_filter_path):
-                        continue
-                    visible_photos.append(p)
-
-                if not visible_photos: continue
-                month_added_count += 1
-
-                try: month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
-                except: month_name = "Mes Desconocido"
-
-                month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(visible_photos)})"])
-                month_item.setData(0, Qt.UserRole, (year, month))
-
-                month_label = QLabel(month_name)
-                month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
-                widgets_added_for_year.append(month_label)
-                self.photo_group_widgets[f"{year}-{month}"] = month_label
-
-                # --- CONFIGURACIÓN LISTWIDGET EXACTA A VÍDEO ---
-                list_widget = PreviewListWidget()
-                list_widget.setMovement(QListWidget.Static)
-                list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-
-                # ¡CRUCIAL! Desactivar uniformidad para que la selección se ajuste al tamaño real
-                list_widget.setUniformItemSizes(False)
-
-                # Configuración de vista
-                list_widget.setViewMode(QListWidget.IconMode)
-                list_widget.setResizeMode(QListWidget.Adjust)
-                list_widget.setSpacing(10) # Espacio entre fotos (ajustado para que no haya huecos grandes)
-
-                list_widget.itemPressed.connect(self._handle_global_selection)
-
-                # ¡CRUCIAL! Desactivar uniformidad
-                list_widget.setUniformItemSizes(False)
-
-                list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-                list_widget.customContextMenuRequested.connect(
-                    lambda pos, lw=list_widget: self._on_context_menu(pos, lw, is_video=False)
-                )
-                list_widget.previewRequested.connect(self._open_preview_dialog)
-                list_widget.itemDoubleClicked.connect(self._on_photo_item_double_clicked)
-
-                list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                list_widget.setFrameShape(QFrame.NoFrame)
-
-                # Tamaño de iconos
-                thumb_size = self.current_thumbnail_size
-                list_widget.setIconSize(QSize(thumb_size, thumb_size))
-
-                # Definimos el tamaño exacto que ocupará cada item (Icono + un pequeño borde)
-                item_w = thumb_size + 10
-                item_h = thumb_size + 10
-
-                for photo_path in visible_photos:
-                    item = QListWidgetItem("Cargando...")
-                    item.setToolTip(Path(photo_path).name)
-                    # ¡CRUCIAL! Forzar el tamaño de la celda para que la selección sea correcta
-                    item.setSizeHint(QSize(item_w, item_h))
-                    item.setData(Qt.UserRole, photo_path)
-                    item.setData(Qt.UserRole + 1, "not_loaded")
-                    list_widget.addItem(item)
-                    self.photo_list_widget_items[photo_path] = item
-
-                # Altura fija para mostrar todas las filas sin "huecos" (se recalcula al redimensionar)
-                list_widget.setProperty("thumb_padding", 10)
-                list_widget.setProperty("fixed_grid", True)
-                self._fit_grid_height(list_widget, self.scroll_area)
-                widgets_added_for_year.append(list_widget)
-
-            if month_added_count > 0:
-                self.photo_container_layout.addWidget(year_label)
-                self.photo_group_widgets[year] = year_label
-                for i, w in enumerate(widgets_added_for_year):
-                    if i == 0: continue
-                    self.photo_container_layout.addWidget(w)
-                year_item.setExpanded(True)
-            else:
-                year_item.setHidden(True)
-
-        self.photo_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_main_visible_thumbnails)
-
+        self._display_media(is_video=False)
 
     def _display_videos(self):
-        """Muestra los VÍDEOS agrupados por fecha (FILTRANDO LOS OCULTOS)."""
-        while self.video_container_layout.count() > 0:
-            item = self.video_container_layout.takeAt(0)
+        self._display_media(is_video=True)
+
+    def _display_media(self, is_video):
+        """Galería de Fotos o Vídeos agrupada por año y mes, sin los ocultos."""
+        g = self._gallery(is_video)
+        while g.container.count() > 0:
+            item = g.container.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        self.video_date_tree_widget.clear()
 
-        self.video_list_widget_items.clear()
-        self.video_group_widgets = {}
+        g.tree.clear()
+        g.items.clear()
+        group_widgets = {}
+        setattr(self, g.groups_attr, group_widgets)
 
-        # --- PASO 1: OBTENER LISTA NEGRA DE VÍDEOS ---
-        hidden_paths = set(self.db.get_hidden_videos())
-        # ---------------------------------------------
-
-        hidden_item = QTreeWidgetItem(self.video_date_tree_widget, ["Ocultos"])
+        hidden_paths = set(g.get_hidden())
+        hidden_item = QTreeWidgetItem(g.tree, [g.hidden_label])
         hidden_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
         hidden_item.setData(0, Qt.UserRole, "HIDDEN_SECTION")
 
-        sorted_years = sort_years(self.videos_by_year_month.keys())
+        # Filtro por carpeta (árbol de directorios): con separador final para que
+        # ".../fotos" no incluya también ".../fotos2"
+        folder_prefix = os.path.join(g.filter_path, "") if g.filter_path else None
 
-        for year in sorted_years:
-            year_item = QTreeWidgetItem(self.video_date_tree_widget, [str(year)])
-
+        for year in sort_years(g.data.keys()):
+            year_item = QTreeWidgetItem(g.tree, [str(year)])
             year_label = QLabel(year_title(year))
             year_label.setStyleSheet("font-size: 16pt; font-weight: bold; margin-top: 20px; margin-bottom: 5px;")
+            widgets_for_year = []
 
-            widgets_added_for_year = [year_label]
-            month_added_count = 0
-
-            sorted_months = sort_months(self.videos_by_year_month[year].keys())
-
-            for month in sorted_months:
-                all_videos = self.videos_by_year_month[year][month]
-
-                # --- PASO 2: FILTRAR VÍDEOS VISIBLES ---
-                # Modificado para incluir filtro de carpeta
-                visible_videos = []
-                for v in all_videos:
-                    if v in hidden_paths: continue
-
-                    # Filtro de carpeta
-                    if self.current_video_filter_path:
-                        if not v.startswith(self.current_video_filter_path):
-                            continue
-
-                    visible_videos.append(v)
-
-                if not visible_videos:
+            for month in sort_months(g.data[year].keys()):
+                visible = [p for p in g.data[year][month]
+                           if p not in hidden_paths and (folder_prefix is None or p.startswith(folder_prefix))]
+                if not visible:
                     continue
-                # ---------------------------------------
-
-                month_added_count += 1
 
                 try:
                     month_name = datetime.datetime.strptime(month, "%m").strftime("%B").capitalize()
                 except ValueError:
                     month_name = "Mes Desconocido"
 
-                month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(visible_videos)})"])
+                month_item = QTreeWidgetItem(year_item, [f"{month_name} ({len(visible)})"])
                 month_item.setData(0, Qt.UserRole, (year, month))
 
                 month_label = QLabel(month_name)
                 month_label.setStyleSheet("font-size: 14pt; font-weight: bold; margin-top: 10px;")
-                widgets_added_for_year.append(month_label)
+                widgets_for_year.append(month_label)
+                group_widgets[f"{year}-{month}"] = month_label
 
-                self.video_group_widgets[f"{year}-{month}"] = month_label
-
-                list_widget = PreviewListWidget()
-                list_widget.setMovement(QListWidget.Static)
-                list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-                list_widget.setSpacing(20)
-
-                list_widget.itemPressed.connect(self._handle_global_selection)
-
-                list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-                list_widget.customContextMenuRequested.connect(
-                    lambda pos, lw=list_widget: self._on_context_menu(pos, lw, is_video=True)
-                )
-
-                list_widget.setViewMode(QListWidget.IconMode)
-                list_widget.setResizeMode(QListWidget.Adjust)
-                list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-                list_widget.setFrameShape(QFrame.NoFrame)
-                list_widget.setToolTip("Ctrl + (+/-): Zoom\n\nHaz clic para seleccionar.")
-
-                list_widget.itemDoubleClicked.connect(self._on_video_item_double_clicked)
-
-                list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
-
-                item_w = self.current_thumbnail_size + 8
-                item_h = self.current_thumbnail_size + 8
-
-                # --- USAR LISTA FILTRADA ---
-                for video_path in visible_videos:
-                    item = QListWidgetItem("Cargando...")
-                    item.setToolTip(Path(video_path).name)
-                    item.setSizeHint(QSize(item_w, item_h))
-                    item.setData(Qt.UserRole, video_path)
-                    item.setData(Qt.UserRole + 1, "not_loaded")
-                    list_widget.addItem(item)
-                    self.video_list_widget_items[video_path] = item
-
-                list_widget.setProperty("thumb_padding", 8)
+                list_widget = self._new_gallery_list(is_video)
+                for path in visible:
+                    self._add_gallery_item(list_widget, path, g.items)
+                # Altura fija para mostrar todas las filas sin "huecos" (se recalcula al redimensionar)
                 list_widget.setProperty("fixed_grid", True)
-                self._fit_grid_height(list_widget, self.video_scroll_area)
+                self._fit_grid_height(list_widget, g.scroll)
+                widgets_for_year.append(list_widget)
 
-                widgets_added_for_year.append(list_widget)
-
-            if month_added_count > 0:
-                self.video_container_layout.addWidget(year_label)
-                self.video_group_widgets[year] = year_label
-                for i, w in enumerate(widgets_added_for_year):
-                    if i == 0: continue
-                    self.video_container_layout.addWidget(w)
+            if widgets_for_year:
+                g.container.addWidget(year_label)
+                group_widgets[year] = year_label
+                for w in widgets_for_year:
+                    g.container.addWidget(w)
                 year_item.setExpanded(True)
             else:
                 year_item.setHidden(True)
 
-        self.video_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_visible_video_thumbnails)
-
-    # --- FIN DE LAS NUEVAS FUNCIONES DE DISPLAY ---
+        g.container.addStretch(1)
+        QTimer.singleShot(100, lambda: self._load_visible_gallery_thumbnails(is_video))
 
     # ----------------------------------------------------------------
     # MENÚ CONTEXTUAL ESPECÍFICO PARA DRIVE
@@ -4250,7 +3944,7 @@ class VisageVaultApp(QMainWindow):
                 action_redeye = menu.addAction("Corregir Ojos Rojos (Auto)")
                 action_redeye.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
 
-            # 3. Caja Fuerte (NUEVO)
+            # 3. Caja Fuerte
             action_safe = menu.addAction("🔒 Añadir a Caja Fuerte")
 
             menu.addSeparator()
@@ -4278,7 +3972,6 @@ class VisageVaultApp(QMainWindow):
                 self._remove_red_eyes_for_selected(selected_items)
 
             elif action == action_safe:
-                # Llamada a la nueva función de encriptación
                 self._move_to_safe_box(selected_items, is_video)
 
     def _remove_red_eye_from_image(self, image_path):
@@ -4659,88 +4352,46 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_item(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
-        """Desplazarse al grupo de FOTOS. Versión blindada contra errores C++."""
-        if not current_item: return
-
-        # --- PASO 1: EXTRAER DATOS ---
-        user_data = current_item.data(0, Qt.UserRole)
-
-        if user_data == "HIDDEN_SECTION":
-            self._show_hidden_photos_view()
-            return
-
-        target_key = ""
-        if current_item.parent():
-            year, month = user_data
-            target_key = f"{year}-{month}"
-        else:
-            target_key = current_item.text(0)
-
-        # --- PASO 2: OBTENER WIDGET ---
-        target_widget = self.photo_group_widgets.get(target_key)
-
-        # --- PASO 3: VALIDACIÓN DE VIDA ---
-        is_zombie = False
-        if target_widget:
-            try:
-                _ = target_widget.isVisible()
-            except RuntimeError:
-                is_zombie = True
-
-        # Si no existe o es un zombie, regeneramos la vista
-        if not target_widget or is_zombie:
-            self._display_photos()
-            target_widget = self.photo_group_widgets.get(target_key)
-
-        # --- PASO 4: SCROLL SEGURO ---
-        if target_widget:
-            try:
-                self.scroll_area.ensureWidgetVisible(target_widget, 50, 50)
-                QTimer.singleShot(200, self._load_main_visible_thumbnails)
-            except RuntimeError:
-                print("Aviso: No se pudo hacer scroll al widget de foto.")
+        self._scroll_to_group(current_item, is_video=False)
 
     @Slot(QTreeWidgetItem, QTreeWidgetItem)
     def _scroll_to_video_item(self, current_item: QTreeWidgetItem, previous_item: QTreeWidgetItem):
-        """Desplazarse al grupo de VÍDEOS. Versión blindada contra errores C++."""
+        self._scroll_to_group(current_item, is_video=True)
+
+    def _scroll_to_group(self, current_item, is_video):
+        """Desplaza la galería al año/mes elegido en el árbol de fechas."""
         if not current_item: return
-
-        # --- PASO 1: EXTRAER DATOS ---
         user_data = current_item.data(0, Qt.UserRole)
-
         if user_data == "HIDDEN_SECTION":
-            self._show_hidden_videos_view()
+            self._show_hidden_view(is_video)
             return
 
-        target_key = ""
         if current_item.parent():
             year, month = user_data
             target_key = f"{year}-{month}"
         else:
             target_key = current_item.text(0)
 
-        # --- PASO 2: OBTENER WIDGET ---
-        target_widget = self.video_group_widgets.get(target_key)
+        g = self._gallery(is_video)
+        target_widget = getattr(self, g.groups_attr, {}).get(target_key)
+        alive = False
+        if target_widget is not None:
+            try:
+                target_widget.isVisible()
+                alive = True
+            except RuntimeError:
+                pass  # Widget ya destruido (p. ej. tras ver los ocultos)
 
-        # --- PASO 3: VALIDACIÓN DE VIDA ---
-        is_zombie = False
+        if not alive:
+            self._display_media(is_video)
+            target_widget = getattr(self, g.groups_attr, {}).get(target_key)
+
         if target_widget:
             try:
-                _ = target_widget.isVisible()
+                g.scroll.ensureWidgetVisible(target_widget, 50, 50)
+                QTimer.singleShot(200, lambda: self._load_visible_gallery_thumbnails(is_video))
             except RuntimeError:
-                is_zombie = True
-
-        if not target_widget or is_zombie:
-            self._display_videos()
-            target_widget = self.video_group_widgets.get(target_key)
-
-        # --- PASO 4: SCROLL SEGURO ---
-        if target_widget:
-            try:
-                self.video_scroll_area.ensureWidgetVisible(target_widget, 50, 50)
-                QTimer.singleShot(200, self._load_visible_video_thumbnails)
-            except RuntimeError:
-                print("Aviso: No se pudo hacer scroll al widget de vídeo.")
+                print(f"Aviso: no se pudo desplazar la galería de {g.kind}.")
 
     @Slot(object, list)
     def _handle_search_finished(self, new_photos_by_year_month, missing_paths):
@@ -4859,7 +4510,6 @@ class VisageVaultApp(QMainWindow):
         # Usamos la barra de estado nativa de la ventana (visible en todas las pestañas)
         self.statusBar().showMessage(f"Estado: {message}")
 
-    # --- NUEVO MÉTODO PARA SUAVIZAR SCROLL ---
     def _debounced_thumbnail_load(self):
         """Espera a que el usuario deje de hacer scroll antes de cargar imágenes."""
         if hasattr(self, '_thumb_timer') and self._thumb_timer.isActive():
@@ -4873,58 +4523,30 @@ class VisageVaultApp(QMainWindow):
         self._thumb_timer.start()
 
     def _load_main_visible_thumbnails(self):
-        """Carga miniaturas de FOTOS visibles (Refactorizado para QListWidget)."""
-        viewport = self.scroll_area.viewport()
-        preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
-
-        # Iterar sobre los QListWidgets en el área de scroll de fotos
-        for list_widget in self.scroll_area.widget().findChildren(PreviewListWidget):
-
-            # Comprobar si el QListWidget está visible
-            list_widget_pos = list_widget.mapTo(viewport, list_widget.rect().topLeft())
-            list_widget_rect_in_viewport = list_widget.rect().translated(list_widget_pos)
-
-            if preload_rect.intersects(list_widget_rect_in_viewport):
-                # Si el widget es visible, comprobar sus items
-                for i in range(list_widget.count()):
-                    item = list_widget.item(i)
-                    load_status = item.data(Qt.UserRole + 1)
-
-                    if load_status == "not_loaded":
-                        original_path = item.data(Qt.UserRole)
-                        if original_path:
-                            item.setData(Qt.UserRole + 1, "loading") # Marcar como "cargando"
-                            item.setText("Cargando...") # Asegurarse de que el texto de carga está
-
-                            loader = ThumbnailLoader(original_path, self.thumb_signals)
-                            self.threadpool.start(loader)
+        self._load_visible_gallery_thumbnails(is_video=False)
 
     def _load_visible_video_thumbnails(self):
-        """Carga miniaturas de VÍDEOS visibles (Refactorizado para QListWidget)."""
-        viewport = self.video_scroll_area.viewport()
+        self._load_visible_gallery_thumbnails(is_video=True)
+
+    def _load_visible_gallery_thumbnails(self, is_video):
+        """Lanza la carga de las miniaturas visibles (y un margen) de Fotos o Vídeos."""
+        g = self._gallery(is_video)
+        viewport = g.scroll.viewport()
         preload_rect = viewport.rect().adjusted(0, -PRELOAD_MARGIN_PX, 0, PRELOAD_MARGIN_PX)
-
-        # Iterar sobre los QListWidgets en el área de scroll de vídeos
-        for list_widget in self.video_scroll_area.widget().findChildren(PreviewListWidget):
-
-            # Comprobar si el QListWidget está visible
-            list_widget_pos = list_widget.mapTo(viewport, list_widget.rect().topLeft())
-            list_widget_rect_in_viewport = list_widget.rect().translated(list_widget_pos)
-
-            if preload_rect.intersects(list_widget_rect_in_viewport):
-                # Si el widget es visible, comprobar sus items
-                for i in range(list_widget.count()):
-                    item = list_widget.item(i)
-                    load_status = item.data(Qt.UserRole + 1)
-
-                    if load_status == "not_loaded":
-                        original_path = item.data(Qt.UserRole)
-                        if original_path:
-                            item.setData(Qt.UserRole + 1, "loading") # Marcar como "cargando"
-                            item.setText("Cargando...")
-
-                            loader = VideoThumbnailLoader(original_path, self.thumb_signals)
-                            self.threadpool.start(loader)
+        container = g.scroll.widget()
+        if not container:
+            return
+        for list_widget in container.findChildren(PreviewListWidget):
+            pos = list_widget.mapTo(viewport, list_widget.rect().topLeft())
+            if not preload_rect.intersects(list_widget.rect().translated(pos)):
+                continue
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                original_path = item.data(Qt.UserRole)
+                if item.data(Qt.UserRole + 1) == "not_loaded" and original_path:
+                    item.setData(Qt.UserRole + 1, "loading")
+                    item.setText("Cargando...")
+                    self.threadpool.start(g.loader(original_path, self.thumb_signals))
 
     @Slot()
     def _load_person_visible_thumbnails(self):
@@ -4962,7 +4584,7 @@ class VisageVaultApp(QMainWindow):
                 Qt.SmoothTransformation
             )
             item.setIcon(QIcon(scaled_pixmap))
-            item.setSizeHint(scaled_pixmap.size()) # <--- Esto ajusta el tamaño en local
+            item.setSizeHint(scaled_pixmap.size())
             item.setText("")
             item.setData(Qt.UserRole + 1, "loaded")
             return
@@ -5123,74 +4745,50 @@ class VisageVaultApp(QMainWindow):
 
     @Slot()
     def _save_photo_splitter_state(self):
-        """Guarda las posiciones del splitter de FOTOS en la configuración."""
-        sizes = self.main_splitter.sizes()
-        config_data = config_manager.load_config()
-        config_data['photo_splitter_sizes'] = sizes
-        config_manager.save_config(config_data)
+        self._save_splitter_state(is_video=False)
 
     @Slot()
     def _save_video_splitter_state(self):
-        """Guarda las posiciones del splitter de VÍDEOS en la configuración."""
-        sizes = self.video_splitter.sizes()
+        self._save_splitter_state(is_video=True)
+
+    def _save_splitter_state(self, is_video):
+        """Guarda las posiciones del splitter de Fotos o Vídeos en la configuración."""
+        g = self._gallery(is_video)
         config_data = config_manager.load_config()
-        config_data['video_splitter_sizes'] = sizes
+        config_data[g.splitter_key] = g.splitter.sizes()
         config_manager.save_config(config_data)
 
     def _load_photo_splitter_state(self):
-        """Carga posiciones y configura prioridades de estiramiento (Fotos)."""
-        # 1. Configurar prioridades: Centro (1) se estira, Lados (0) fijos.
-        self.main_splitter.setStretchFactor(0, 0) # Árbol
-        self.main_splitter.setStretchFactor(1, 1) # Fotos (Prioridad)
-        self.main_splitter.setStretchFactor(2, 0) # Fechas
-
-        config_data = config_manager.load_config()
-        sizes = config_data.get('photo_splitter_sizes')
-        min_right_width = 180
-
-        # Migración de config antigua
-        if sizes and len(sizes) == 2:
-            sizes.insert(0, 0)
-
-        if not sizes or len(sizes) != 3:
-            w = self.width()
-            sizes = [0, int(w * 0.8), int(w * 0.2)]
-
-        # Proteger ancho mínimo panel derecho
-        if sizes[2] < min_right_width:
-            diff = min_right_width - sizes[2]
-            sizes[2] = min_right_width
-            if sizes[1] > diff:
-                sizes[1] -= diff
-
-        self.main_splitter.setSizes(sizes)
+        self._load_splitter_state(is_video=False)
 
     def _load_video_splitter_state(self):
-        """Carga posiciones y configura prioridades de estiramiento (Vídeos)."""
-        # 1. Configurar prioridades
-        self.video_splitter.setStretchFactor(0, 0)
-        self.video_splitter.setStretchFactor(1, 1) # Vídeos (Prioridad)
-        self.video_splitter.setStretchFactor(2, 0)
+        self._load_splitter_state(is_video=True)
 
-        config_data = config_manager.load_config()
-        sizes = config_data.get('video_splitter_sizes')
+    def _load_splitter_state(self, is_video):
+        """Carga posiciones y prioridades de estiramiento: árbol | galería | fechas."""
+        g = self._gallery(is_video)
+        g.splitter.setStretchFactor(0, 0)  # Árbol de carpetas
+        g.splitter.setStretchFactor(1, 1)  # Galería (se estira)
+        g.splitter.setStretchFactor(2, 0)  # Árbol de fechas
+
+        sizes = config_manager.load_config().get(g.splitter_key)
         min_right_width = 180
 
-        # Migración
+        # Migración de config antigua (sin árbol de carpetas)
         if sizes and len(sizes) == 2:
             sizes.insert(0, 0)
-
         if not sizes or len(sizes) != 3:
             w = self.width()
             sizes = [0, int(w * 0.8), int(w * 0.2)]
 
+        # Proteger el ancho mínimo del panel derecho
         if sizes[2] < min_right_width:
             diff = min_right_width - sizes[2]
             sizes[2] = min_right_width
             if sizes[1] > diff:
                 sizes[1] -= diff
 
-        self.video_splitter.setSizes(sizes)
+        g.splitter.setSizes(sizes)
 
     def resizeEvent(self, event):
         self.resize_timer.start()
@@ -5265,21 +4863,8 @@ class VisageVaultApp(QMainWindow):
         dialog.exec()
         self._set_status("Detalle cerrado.")
 
-    @Slot(QListWidgetItem)
-    def _on_photo_item_double_clicked(self, item: QListWidgetItem):
-        """Se llama cuando se hace doble clic en un item de QListWidget de fotos."""
-        original_path = item.data(Qt.UserRole)
-        if original_path:
-            self._open_photo_detail(original_path)
 
-    @Slot(QListWidgetItem)
-    def _on_video_item_double_clicked(self, item: QListWidgetItem):
-        """Se llama cuando se hace doble clic en un item de QListWidget de vídeos."""
-        original_path = item.data(Qt.UserRole)
-        if original_path:
-            self._open_video_player(original_path)
 
-    # --- ¡NUEVO SLOT PARA VISTA PREVIA! ---
     @Slot(str)
     def _open_preview_dialog(self, original_path: str):
         """
@@ -5291,29 +4876,8 @@ class VisageVaultApp(QMainWindow):
         if not original_path:
             return
 
-        pixmap = QPixmap() # Empezar con un pixmap vacío
-
-        # Definir extensiones RAW (deben coincidir con las de los otros archivos)
-        RAW_EXTENSIONS = ('.nef', '.cr2', '.cr3', '.crw', '.arw', '.srf', '.orf', '.rw2', '.raf', '.pef', '.dng', '.raw')
-        file_suffix = Path(original_path).suffix.lower()
-
         try:
-            if file_suffix in RAW_EXTENSIONS:
-                # 1. Usar rawpy para leer el archivo RAW
-                with rawpy.imread(original_path) as raw:
-                    rgb_array = raw.postprocess()
-
-                # 2. Convertir el array de numpy a QImage
-                height, width, channel = rgb_array.shape
-                bytes_per_line = 3 * width
-                q_image = QImage(rgb_array.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-
-                # 3. Convertir QImage a QPixmap
-                pixmap = QPixmap.fromImage(q_image)
-
-            else:
-                # 4. Lógica original para JPG, PNG, etc.
-                pixmap = QPixmap(original_path)
+            pixmap = load_full_pixmap(original_path)
 
             if pixmap.isNull():
                 print(f"Error cargando pixmap para vista previa: {original_path}")
@@ -5678,7 +5242,7 @@ class VisageVaultApp(QMainWindow):
 
         self._set_status(f"Cara ID {face_id} eliminada.")
 
-        # 3. Recargar (ahora nuestra nueva función _load... no la volverá a pintar)
+        # 3. Recargar (la cara borrada ya no se vuelve a pintar)
         self._load_existing_faces_async()
 
     def _restore_face(self, face_id: int, widget: QWidget):
@@ -5964,7 +5528,6 @@ class VisageVaultApp(QMainWindow):
         print("Limpieza finalizada. Adiós.")
         event.accept()
 
-    # --- ¡NUEVO MÉTODO DE KEYPRESS! ---
     def keyPressEvent(self, event: QKeyEvent):
         """Maneja los atajos de teclado para el zoom."""
 
@@ -6118,112 +5681,39 @@ class VisageVaultApp(QMainWindow):
         QTimer.singleShot(100, self._load_person_visible_thumbnails)
 
     def _show_hidden_photos_view(self):
-        """Muestra solo las fotos ocultas en el panel principal."""
-        self._set_status("Cargando fotos ocultas...")
-
-        # Limpiar layout existente
-        while self.photo_container_layout.count() > 0:
-            item = self.photo_container_layout.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-
-        # IMPORTANTE: Limpiar referencias a widgets antiguos para evitar RuntimeError
-        self.photo_group_widgets.clear()
-        self.photo_list_widget_items.clear()
-
-        title = QLabel("Fotos Ocultas")
-        title.setStyleSheet("font-size: 18pt; color: red; font-weight: bold; margin: 20px;")
-        self.photo_container_layout.addWidget(title)
-
-        hidden_paths = self.db.get_hidden_photos()
-
-        if not hidden_paths:
-            self.photo_container_layout.addWidget(QLabel("No hay fotos ocultas."))
-            self.photo_container_layout.addStretch(1)
-            return  # <--- Aquí salimos si no hay nada.
-
-        # Si llegamos aquí, SÍ creamos el list_widget
-        list_widget = PreviewListWidget()
-        list_widget.setMovement(QListWidget.Static)
-        list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        list_widget.setSpacing(20)
-
-        list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        list_widget.customContextMenuRequested.connect(
-            lambda pos, lw=list_widget: self._on_context_menu(pos, lw, is_video=False, is_hidden_view=True)
-        )
-
-        list_widget.setViewMode(QListWidget.IconMode)
-        list_widget.setResizeMode(QListWidget.Adjust)
-
-        list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
-        list_widget.setProperty("thumb_padding", 8)
-        item_w = self.current_thumbnail_size + 8
-        item_h = self.current_thumbnail_size + 8
-
-        for path in hidden_paths:
-            if not os.path.exists(path): continue
-            item = QListWidgetItem("Cargando...")
-            item.setSizeHint(QSize(item_w, item_h))
-            item.setData(Qt.UserRole, path)
-            item.setData(Qt.UserRole + 1, "not_loaded")
-            list_widget.addItem(item)
-            self.photo_list_widget_items[path] = item
-
-        self.photo_container_layout.addWidget(list_widget)
-        self.photo_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_main_visible_thumbnails)
+        self._show_hidden_view(is_video=False)
 
     def _show_hidden_videos_view(self):
-        """Muestra solo los vídeos ocultos en el panel principal."""
-        self._set_status("Cargando vídeos ocultos...")
+        self._show_hidden_view(is_video=True)
 
-        while self.video_container_layout.count() > 0:
-            item = self.video_container_layout.takeAt(0)
+    def _show_hidden_view(self, is_video):
+        """Muestra solo las fotos o los vídeos ocultos en el panel principal."""
+        g = self._gallery(is_video)
+        self._set_status(f"Cargando {g.hidden_kind}...")
+
+        while g.container.count() > 0:
+            item = g.container.takeAt(0)
             if item.widget(): item.widget().deleteLater()
+        # Limpiar referencias a los widgets antiguos (evita RuntimeError al hacer scroll)
+        setattr(self, g.groups_attr, {})
+        g.items.clear()
 
-        self.video_list_widget_items.clear()
-
-        title = QLabel("Vídeos Ocultos")
+        title = QLabel(g.hidden_title)
         title.setStyleSheet("font-size: 18pt; color: red; font-weight: bold; margin: 20px;")
-        self.video_container_layout.addWidget(title)
+        g.container.addWidget(title)
 
-        hidden_paths = self.db.get_hidden_videos()
-
+        hidden_paths = [p for p in g.get_hidden() if os.path.exists(p)]
         if not hidden_paths:
-            self.video_container_layout.addWidget(QLabel("No hay vídeos ocultos."))
-            self.video_container_layout.addStretch(1)
+            g.container.addWidget(QLabel(f"No hay {g.hidden_kind}."))
+            g.container.addStretch(1)
             return
 
-        # Si llegamos aquí, SÍ creamos el list_widget
-        list_widget = PreviewListWidget()
-        list_widget.setMovement(QListWidget.Static)
-        list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        list_widget.setSpacing(20)
-
-        list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        list_widget.customContextMenuRequested.connect(
-            lambda pos, lw=list_widget: self._on_context_menu(pos, lw, is_video=True, is_hidden_view=True)
-        )
-        list_widget.setViewMode(QListWidget.IconMode)
-        list_widget.setResizeMode(QListWidget.Adjust)
-
-        list_widget.setIconSize(QSize(self.current_thumbnail_size, self.current_thumbnail_size))
-        list_widget.setProperty("thumb_padding", 8)
-        item_w = self.current_thumbnail_size + 8
-        item_h = self.current_thumbnail_size + 8
-
+        list_widget = self._new_gallery_list(is_video, hidden_view=True)
         for path in hidden_paths:
-            if not os.path.exists(path): continue
-            item = QListWidgetItem("Cargando...")
-            item.setSizeHint(QSize(item_w, item_h))
-            item.setData(Qt.UserRole, path)
-            item.setData(Qt.UserRole + 1, "not_loaded")
-            list_widget.addItem(item)
-            self.video_list_widget_items[path] = item
-
-        self.video_container_layout.addWidget(list_widget)
-        self.video_container_layout.addStretch(1)
-        QTimer.singleShot(100, self._load_visible_video_thumbnails)
+            self._add_gallery_item(list_widget, path, g.items)
+        g.container.addWidget(list_widget)
+        g.container.addStretch(1)
+        QTimer.singleShot(100, lambda: self._load_visible_gallery_thumbnails(is_video))
 
     @Slot()
     def _open_help_dialog(self):
@@ -6315,7 +5805,6 @@ class VisageVaultApp(QMainWindow):
         Cierra sesión y realiza un BORRADO TOTAL de datos locales, caché e interfaz.
         """
         # 1. LOGOUT LÓGICO (Token)
-        from drive_auth import DriveAuthenticator
         auth = DriveAuthenticator()
         if auth.logout():
             self._set_status("Sesión cerrada. Iniciando limpieza profunda...")
@@ -6413,10 +5902,10 @@ class VisageVaultApp(QMainWindow):
     @Slot()
     def _on_login_success(self):
         self._set_status("¡Conectado a Google Drive!")
-        self.is_drive_connected = True  # <--- IMPORTANTE
+        self.is_drive_connected = True
 
         # Actualizar botón para que ahora sirva para desconectar
-        self.btn_gdrive.setText("Desconectar de Google") # <--- CAMBIO DE TEXTO
+        self.btn_gdrive.setText("Desconectar de Google")
         self.btn_gdrive.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton))
         self.btn_gdrive.setEnabled(True)
         self.btn_gdrive.setStyleSheet("background-color: #34a853; color: white; padding: 12px; font-weight: bold;")
@@ -6435,7 +5924,7 @@ class VisageVaultApp(QMainWindow):
             folder_id = config_manager.get_drive_folder_id()
 
             if folder_id:
-                self._set_status(f"Sincronizando carpeta guardada automáticamente...")
+                self._set_status("Sincronizando carpeta guardada automáticamente...")
                 # Lanzamos escaneo directo (ya optimizado)
                 self._scan_drive_content(folder_id)
             else:
@@ -6508,7 +5997,6 @@ class VisageVaultApp(QMainWindow):
             dialog.deleteLater()
 
         except Exception as e:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Error", f"Error al abrir navegador de Drive: {e}")
 
     def _load_drive_from_db(self, root_folder_id):
@@ -6520,7 +6008,7 @@ class VisageVaultApp(QMainWindow):
         if not db_photos:
             # Si está vacía, limpiamos todo por si acaso
             self.drive_photos_by_date = {}
-            self.drive_loaded_ids = set() # <--- LIMPIEZA
+            self.drive_loaded_ids = set()
             self.cloud_photo_count = 0
             self._display_cloud_photos() # Limpia la pantalla
             return
@@ -6537,7 +6025,7 @@ class VisageVaultApp(QMainWindow):
             })
 
         self.drive_photos_by_date = {}
-        self.drive_loaded_ids = set() # <--- LIMPIEZA ANTES DE RELLENAR
+        self.drive_loaded_ids = set()
         self.cloud_photo_count = 0
 
         self._classify_drive_items_in_memory(formatted_photos)
@@ -6620,7 +6108,6 @@ class VisageVaultApp(QMainWindow):
         self.cloud_scroll_area.setUpdatesEnabled(True)
 
         if self.cloud_photo_count == 0:
-             from PySide6.QtWidgets import QMessageBox
              QMessageBox.information(self, "Aviso", "No se encontraron imágenes en esa carpeta.")
 
         self._set_status(f"Listo. {self.cloud_photo_count} fotos disponibles.")
@@ -6850,7 +6337,6 @@ class VisageVaultApp(QMainWindow):
 
     def _check_auto_login(self):
         """Intenta conectar automáticamente si hay credenciales guardadas."""
-        from drive_auth import DriveAuthenticator
         auth = DriveAuthenticator()
 
         if auth.has_credentials():
@@ -6952,7 +6438,7 @@ class VisageVaultApp(QMainWindow):
 
             # TRUCO: Añadimos un hijo dummy para que aparezca la flechita de expansión
             # (Lazy Loading: solo cargaremos sus hijos reales si el usuario expande)
-            dummy = QTreeWidgetItem(item, ["Cargando..."])
+            QTreeWidgetItem(item, ["Cargando..."])
 
         self.cloud_folder_tree.expandItem(parent_item)
 
@@ -7584,55 +7070,30 @@ class VisageVaultApp(QMainWindow):
 
     @Slot()
     def _toggle_photo_folder_tree(self):
-        """Muestra/Oculta el árbol de fotos con gestión precisa del espacio."""
-        # 1. Capturar tamaños ACTUALES antes de cambiar nada
-        current_sizes = self.main_splitter.sizes() # [Izq, Centro, Der]
-
-        should_show = self.btn_show_photo_tree.isChecked()
-        self.photo_folder_panel.setVisible(should_show)
-
-        if should_show:
-            # --- ABRIR ---
-            # Si estaba colapsado (ancho < 50), le damos 280px quitándoselos al centro.
-            if current_sizes[0] < 50:
-                target_width = 280
-                # Nuevo Centro = Centro Actual - Lo que ocupa el árbol
-                new_center = max(100, current_sizes[1] - target_width)
-
-                # [280, Resto, Derecha_Intacta]
-                self.main_splitter.setSizes([target_width, new_center, current_sizes[2]])
-
-            # Carga perezosa de datos
-            if self.photo_folder_tree.topLevelItemCount() == 0 and self.current_directory:
-                self._load_local_tree_root(self.photo_folder_tree, self.current_directory)
-        else:
-            # --- CERRAR ---
-            # Sumamos el ancho del árbol (current_sizes[0]) al centro.
-            # La derecha (current_sizes[2]) se queda IGUAL.
-            new_center = current_sizes[1] + current_sizes[0]
-            self.main_splitter.setSizes([0, new_center, current_sizes[2]])
+        self._toggle_local_folder_tree(is_video=False)
 
     @Slot()
     def _toggle_video_folder_tree(self):
-        """Muestra/Oculta el árbol de vídeos con gestión precisa del espacio."""
-        current_sizes = self.video_splitter.sizes()
+        self._toggle_local_folder_tree(is_video=True)
 
-        should_show = self.btn_show_video_tree.isChecked()
-        self.video_folder_panel.setVisible(should_show)
+    def _toggle_local_folder_tree(self, is_video):
+        """Muestra u oculta el árbol de carpetas sin tocar el panel derecho."""
+        g = self._gallery(is_video)
+        left, center, right = g.splitter.sizes()
+        should_show = g.tree_button.isChecked()
+        g.folder_panel.setVisible(should_show)
 
         if should_show:
-            # --- ABRIR ---
-            if current_sizes[0] < 50:
+            # Si estaba colapsado, darle 280 px quitándoselos a la galería
+            if left < 50:
                 target_width = 280
-                new_center = max(100, current_sizes[1] - target_width)
-                self.video_splitter.setSizes([target_width, new_center, current_sizes[2]])
-
-            if self.video_folder_tree.topLevelItemCount() == 0 and self.current_directory:
-                self._load_local_tree_root(self.video_folder_tree, self.current_directory)
+                g.splitter.setSizes([target_width, max(100, center - target_width), right])
+            # Carga perezosa
+            if g.folder_tree.topLevelItemCount() == 0 and self.current_directory:
+                self._load_local_tree_root(g.folder_tree, self.current_directory)
         else:
-            # --- CERRAR ---
-            new_center = current_sizes[1] + current_sizes[0]
-            self.video_splitter.setSizes([0, new_center, current_sizes[2]])
+            # El ancho del árbol vuelve a la galería; la derecha no cambia
+            g.splitter.setSizes([0, center + left, right])
 
     def _load_local_tree_root(self, tree_widget, root_path):
         """Carga la raíz del árbol local."""
@@ -7691,32 +7152,27 @@ class VisageVaultApp(QMainWindow):
 
     @Slot(QTreeWidgetItem, int)
     def _on_photo_folder_tree_clicked(self, item, column):
-        path = item.data(0, Qt.UserRole)
-        if not path: return
-
-        # Si es la raíz, quitamos el filtro
-        if path == self.current_directory:
-            self.current_photo_filter_path = None
-            self._set_status(f"Mostrando todas las fotos de: {Path(path).name}")
-        else:
-            self.current_photo_filter_path = path
-            self._set_status(f"Filtrando fotos en: {Path(path).name}")
-
-        self._display_photos() # Redibujar con filtro
+        self._on_local_folder_tree_clicked(item, is_video=False)
 
     @Slot(QTreeWidgetItem, int)
     def _on_video_folder_tree_clicked(self, item, column):
+        self._on_local_folder_tree_clicked(item, is_video=True)
+
+    def _on_local_folder_tree_clicked(self, item, is_video):
+        """Filtra la galería por la carpeta pulsada (la raíz quita el filtro)."""
         path = item.data(0, Qt.UserRole)
         if not path: return
-
-        if path == self.current_directory:
-            self.current_video_filter_path = None
-            self._set_status(f"Mostrando todos los vídeos de: {Path(path).name}")
+        kind = "vídeos" if is_video else "fotos"
+        filter_path = None if path == self.current_directory else path
+        if is_video:
+            self.current_video_filter_path = filter_path
         else:
-            self.current_video_filter_path = path
-            self._set_status(f"Filtrando vídeos en: {Path(path).name}")
-
-        self._display_videos() # Redibujar con filtro
+            self.current_photo_filter_path = filter_path
+        if filter_path is None:
+            self._set_status(f"Mostrando todos los {kind} de: {Path(path).name}")
+        else:
+            self._set_status(f"Filtrando {kind} en: {Path(path).name}")
+        self._display_media(is_video)
 
     def _handle_global_selection(self, item):
         """
