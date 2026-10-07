@@ -25,12 +25,44 @@
 
 import sys
 import os
+import time
+
+# --- SPLASH TEMPRANO ---
+# Las importaciones de abajo (sklearn, face_recognition, cv2...) tardan varios
+# segundos. Al ejecutar la app, el splash se muestra ANTES de importarlas, con
+# solo PySide6 cargado; run_visagevault() reutiliza esta QApplication y este
+# splash. Importado como módulo (pruebas, otros scripts) no se hace nada.
+_early_app = None
+_early_splash = None
+_early_splash_shown_at = None
+if __name__ == "__main__":
+    from PySide6.QtWidgets import QApplication as _QApplication, QSplashScreen as _QSplashScreen
+    from PySide6.QtGui import QPixmap as _QPixmap
+    from PySide6.QtCore import Qt as _Qt
+
+    _base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    _early_app = _QApplication(sys.argv)
+    _splash_pixmap = _QPixmap(os.path.join(_base_dir, "AnabasaSoft.png"))
+    if _splash_pixmap.isNull():
+        _splash_pixmap = _QPixmap(os.path.join(_base_dir, "visagevault.png")).scaled(
+            600, 400, _Qt.KeepAspectRatio, _Qt.SmoothTransformation
+        )
+    _early_splash = _QSplashScreen(_splash_pixmap)
+    _early_splash.show()
+    _early_app.processEvents()  # Pintarlo ya, antes de las importaciones lentas
+    _early_splash_shown_at = time.monotonic()
+
+def _keep_splash_alive():
+    """Atiende los eventos entre importaciones lentas: si no, el sistema puede
+    marcar el splash como "No responde" (Windows, a los 5 s)."""
+    if _early_app is not None:
+        _early_app.processEvents()
+
 from pathlib import Path
 import datetime
 import locale
 import warnings
 import sqlite3
-import time
 
 import threading # Necesario para evitar que la UI se congele
 from drive_auth import DriveAuthenticator, DriveAuthError
@@ -50,7 +82,8 @@ except ImportError:
     APP_VERSION = "dev"
 APP_NAME = "VisageVault (dev)" if APP_VERSION == "dev" else f"VisageVault v{APP_VERSION}"
 import safe_crypto
-import redeye
+import redeye  # Carga face_recognition (lento)
+_keep_splash_alive()
 from safe_crypto import CryptoManager
 
 # --- Silenciar solo el aviso de pkg_resources ---
@@ -62,6 +95,7 @@ warnings.filterwarnings(
 
 import numpy as np
 from sklearn.cluster import DBSCAN
+_keep_splash_alive()
 import sklearn
 import rawpy # Importar rawpy para soporte RAW
 import cv2
@@ -104,6 +138,7 @@ import re
 import db_manager
 from db_manager import VisageVaultDB
 import face_recognition
+_keep_splash_alive()
 from PIL import Image, ImageOps
 from send2trash import send2trash
 import ast
@@ -7725,18 +7760,13 @@ SPLASH_MIN_MS = 2000  # Tiempo mínimo que se ve el splash (incluye lo que tarda
 
 def run_visagevault():
     """Inicia la aplicación con splash. Nunca bloquea la interfaz."""
-    app = QApplication(sys.argv)
-
-    # 1. Splash PRIMERO: se ve mientras se construye la ventana (BD, interfaz...)
-    pixmap = QPixmap(resource_path("AnabasaSoft.png"))
-    if pixmap.isNull():
-        pixmap = QPixmap(resource_path("visagevault.png")).scaled(
-            600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-    splash = QSplashScreen(pixmap)
-    splash.show()
-    app.processEvents()  # Pintarlo ya
-    shown_at = time.monotonic()
+    # Si se ejecuta visagevault.py, el splash ya está en pantalla desde antes de
+    # las importaciones pesadas (ver "SPLASH TEMPRANO" al principio del fichero)
+    app = QApplication.instance() or QApplication(sys.argv)
+    if _early_splash is not None:
+        splash, shown_at = _early_splash, _early_splash_shown_at
+    else:
+        splash, shown_at = _create_splash(app)
 
     # 2. Ventana principal. Los diálogos de arranque esperan a que se cierre
     #    el splash; el escaneo y la carga de datos empiezan ya, detrás.
@@ -7753,6 +7783,18 @@ def run_visagevault():
     QTimer.singleShot(max(0, SPLASH_MIN_MS - elapsed_ms), close_splash)
 
     sys.exit(app.exec())
+
+def _create_splash(app):
+    """Splash para cuando la app se lanza importando el módulo (no como script)."""
+    pixmap = QPixmap(resource_path("AnabasaSoft.png"))
+    if pixmap.isNull():
+        pixmap = QPixmap(resource_path("visagevault.png")).scaled(
+            600, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+    splash = QSplashScreen(pixmap)
+    splash.show()
+    app.processEvents()  # Pintarlo ya
+    return splash, time.monotonic()
 
 if __name__ == "__main__":
     run_visagevault()
