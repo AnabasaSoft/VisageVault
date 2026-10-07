@@ -3109,6 +3109,10 @@ class VisageVaultApp(QMainWindow):
         self.current_drive_folder_id = None
         self.drive_scan_thread = None
         self.drive_scan_worker = None
+        self.drive_login_thread = None
+        self.drive_login_worker = None
+        # Hilos sustituidos por otros que aún pueden estar terminando (ver _retire_thread)
+        self._retired_threads = []
         self.drive_loaded_ids = set()
         self.is_drive_connected = False
         self.active_folder_threads = []
@@ -5852,6 +5856,16 @@ class VisageVaultApp(QMainWindow):
     # Tiempo máximo de espera al cerrar para que las tareas en curso terminen
     SHUTDOWN_TIMEOUT_S = 15
 
+    def _retire_thread(self, thread, worker=None):
+        """
+        Guarda la referencia de un hilo sustituido que aún puede estar en marcha.
+        Si Python la soltara, Qt destruiría el QThread mientras se ejecuta y la
+        app abortaría ("QThread: Destroyed while thread is still running").
+        """
+        self._retired_threads = [(t, w) for t, w in self._retired_threads if self._is_thread_running(t)]
+        if self._is_thread_running(thread):
+            self._retired_threads.append((thread, worker))
+
     def _background_tasks(self):
         """Pares (hilo, worker) de las tareas en segundo plano que pueden estar activas."""
         tasks = [
@@ -5863,7 +5877,7 @@ class VisageVaultApp(QMainWindow):
             (getattr(self, 'dup_thread', None), getattr(self, 'dup_worker', None)),
             (getattr(self, 'drive_login_thread', None), None),
         ]
-        return tasks + list(self.active_folder_threads)
+        return tasks + list(self.active_folder_threads) + list(self._retired_threads)
 
     @staticmethod
     def _is_thread_running(thread):
@@ -6274,6 +6288,9 @@ class VisageVaultApp(QMainWindow):
 
     def _start_drive_login(self, silent):
         """Lanza la autenticación en un hilo (con o sin navegador)."""
+        # Un reintento justo después de un fallo llega cuando el hilo anterior aún termina
+        if self.drive_login_thread is not None:
+            self._retire_thread(self.drive_login_thread, self.drive_login_worker)
         self.drive_login_thread = QThread()
         self.drive_login_worker = DriveLoginWorker(silent=silent)
         self.drive_login_worker.moveToThread(self.drive_login_thread)
@@ -6287,7 +6304,9 @@ class VisageVaultApp(QMainWindow):
 
         self.drive_login_worker.finished.connect(self.drive_login_thread.quit)
         self.drive_login_worker.finished.connect(self.drive_login_worker.deleteLater)
-        self.drive_login_thread.finished.connect(lambda: setattr(self, 'drive_login_thread', None))
+        # Antes: lambda que ponía drive_login_thread a None. Si ya había un reintento en
+        # marcha, borraba la referencia del hilo NUEVO, Python lo destruía y la app abortaba.
+        self.drive_login_thread.finished.connect(self.drive_login_thread.deleteLater)
 
         self.drive_login_thread.start()
 
@@ -6565,6 +6584,8 @@ class VisageVaultApp(QMainWindow):
 
         self._set_status("Iniciando indexación en la nube...")
 
+        if self.drive_scan_thread is not None:
+            self._retire_thread(self.drive_scan_thread, self.drive_scan_worker)
         self.drive_scan_thread = QThread()
         self.drive_scan_worker = DriveScanWorker(folder_id, self.db.db_path)
         self.drive_scan_worker.moveToThread(self.drive_scan_thread)
@@ -6572,9 +6593,6 @@ class VisageVaultApp(QMainWindow):
         self.set_drive_priority_low.connect(self.drive_scan_worker.set_slow_mode)
 
         self.drive_scan_thread.started.connect(self.drive_scan_worker.run)
-
-        # CAMBIO: Ya no conectamos items_found porque lo hemos quitado
-        # self.drive_scan_worker.items_found.connect(...) <--- ELIMINADO
 
         self.drive_scan_worker.progress.connect(self._set_status)
         self.drive_scan_worker.finished.connect(self._on_drive_scan_finished)
@@ -6812,13 +6830,18 @@ class VisageVaultApp(QMainWindow):
                     if self.drive_scan_worker:
                         try:
                             self.drive_scan_worker.is_running = False
-                            # Desconectar señales para evitar actualizaciones fantasma
-                            self.drive_scan_worker.items_found.disconnect()
-                        except Exception:
+                            # Desconectar de la interfaz para evitar actualizaciones fantasma
+                            # (p. ej. "No se encontraron imágenes" tras cerrar sesión). Su
+                            # finished sigue conectado a quit/deleteLater para terminar bien.
+                            self.drive_scan_worker.progress.disconnect(self._set_status)
+                            self.drive_scan_worker.finished.disconnect(self._on_drive_scan_finished)
+                        except (RuntimeError, TypeError):
                             pass # Ya estaba desconectado o borrado
 
                     self.drive_scan_thread.quit()
                     self.drive_scan_thread.wait(1000)
+                    # Si aún no ha terminado (red lenta), conservar la referencia
+                    self._retire_thread(self.drive_scan_thread, self.drive_scan_worker)
 
             except RuntimeError:
                 # El objeto C++ ya fue borrado (deleteLater), pero la variable Python seguía ahí.
