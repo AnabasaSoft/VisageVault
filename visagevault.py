@@ -6614,11 +6614,10 @@ class VisageVaultApp(QMainWindow):
             return
         self._set_status(f"Indexación completada ({total_count} nuevos). Recargando vista...")
 
-        # Volvemos a cargar desde la DB local para refrescar la pantalla con lo nuevo
+        # Volver a cargar desde la BD local (ya redibuja la Nube) para mostrar lo nuevo
+        self.cloud_scroll_area.setUpdatesEnabled(False)
         self._load_drive_from_db(self.current_drive_folder_id)
-
-        # Forzar actualización visual
-        self._display_cloud_photos()
+        self.cloud_scroll_area.setUpdatesEnabled(True)
 
         if self.cloud_photo_count == 0:
              from PySide6.QtWidgets import QMessageBox
@@ -6983,13 +6982,9 @@ class VisageVaultApp(QMainWindow):
         if folder_id == self.current_drive_folder_id:
             self._set_status(f"Mostrando vista completa: {folder_name}")
 
-            # Usamos la función original que carga TODO basado en el root_folder_id
-            # Esto recupera todas las fotos recursivamente
-            self._load_drive_from_db(self.current_drive_folder_id)
-
-            # Forzamos repintado
+            # Carga TODO lo de la carpeta raíz (recursivo) y redibuja la Nube
             self.cloud_scroll_area.setUpdatesEnabled(False)
-            self._display_cloud_photos()
+            self._load_drive_from_db(self.current_drive_folder_id)
             self.cloud_scroll_area.setUpdatesEnabled(True)
             return
 
