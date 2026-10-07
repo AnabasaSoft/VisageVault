@@ -634,20 +634,28 @@ class FaceLoaderSignals(QObject):
 # WORKER PARA LOGIN DE GOOGLE DRIVE
 # =================================================================
 class DriveLoginWorker(QObject):
-    """Worker para manejar la autenticación de Google Drive en segundo plano."""
+    """
+    Autenticación de Google Drive en segundo plano.
+    silent=True (inicio de sesión automático al arrancar): solo usa la sesión
+    guardada, renovándola por red si ha caducado; nunca abre el navegador.
+    """
     login_success = Signal(object)  # Emite el servicio de Drive
     login_failed = Signal(str)      # Emite mensaje de error
     finished = Signal()
 
-    def __init__(self):
+    def __init__(self, silent=False):
         super().__init__()
+        self.silent = silent
 
     @Slot()
     def run(self):
         try:
             from drive_auth import DriveAuthenticator
             auth = DriveAuthenticator()
-            service = auth.get_service()
+            service = auth.get_service(silent=self.silent)
+            if service is None:
+                self.login_failed.emit("La sesión de Google caducó. Por favor, conecta de nuevo.")
+                return
             self.login_success.emit(service)
         except FileNotFoundError as e:
             self.login_failed.emit(str(e))
@@ -6212,13 +6220,20 @@ class VisageVaultApp(QMainWindow):
         self.btn_gdrive.setText("Esperando navegador...")
         self._set_status("Abriendo navegador para inicio de sesión...")
 
+        self._start_drive_login(silent=False)
+
+    def _start_drive_login(self, silent):
+        """Lanza la autenticación en un hilo (con o sin navegador)."""
         self.drive_login_thread = QThread()
-        self.drive_login_worker = DriveLoginWorker()
+        self.drive_login_worker = DriveLoginWorker(silent=silent)
         self.drive_login_worker.moveToThread(self.drive_login_thread)
 
         self.drive_login_thread.started.connect(self.drive_login_worker.run)
         self.drive_login_worker.login_success.connect(self._on_login_success_with_service)
-        self.drive_login_worker.login_failed.connect(self._on_login_failure)
+        if silent:
+            self.drive_login_worker.login_failed.connect(self._on_auto_login_failure)
+        else:
+            self.drive_login_worker.login_failed.connect(self._on_login_failure)
 
         self.drive_login_worker.finished.connect(self.drive_login_thread.quit)
         self.drive_login_worker.finished.connect(self.drive_login_worker.deleteLater)
@@ -6342,7 +6357,11 @@ class VisageVaultApp(QMainWindow):
 
         try:
             self.drive_manager = DriveManager()
-            self.drive_manager.authenticate() # Esto ahora usará el token cargado
+            if getattr(self, 'drive_service', None):
+                # Servicio ya obtenido en el hilo de login: no volver a leer el token aquí
+                self.drive_manager.service = self.drive_service
+            else:
+                self.drive_manager.authenticate()
 
             folder_id = config_manager.get_drive_folder_id()
 
@@ -6764,14 +6783,18 @@ class VisageVaultApp(QMainWindow):
 
         if auth.has_credentials():
             self._set_status("Detectada sesión de Google anterior. Conectando...")
-            # Intentamos obtener el servicio en modo silencioso (sin abrir navegador)
-            service = auth.get_service(silent=True)
+            # En segundo plano: si el token ha caducado se renueva por red y,
+            # sin conexión, la petición puede tardar en fallar
+            self.btn_gdrive.setEnabled(False)
+            self.btn_gdrive.setText("Conectando...")
+            self._start_drive_login(silent=True)
 
-            if service:
-                self.drive_service = service
-                self._on_login_success()
-            else:
-                self._set_status("La sesión de Google caducó. Por favor, conecta de nuevo.")
+    @Slot(str)
+    def _on_auto_login_failure(self, error_message):
+        """El inicio de sesión automático no pudo usar la sesión guardada."""
+        self.btn_gdrive.setEnabled(True)
+        self.btn_gdrive.setText("Iniciar sesión con Google")
+        self._set_status(error_message or "No se pudo restaurar la sesión de Google.")
 
     # --- LÓGICA DEL ÁRBOL DE DIRECTORIOS ---
 
