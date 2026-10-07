@@ -165,7 +165,9 @@ jobs:
   # 3) LINUX BINARY (AppImage / DEB / RPM)
   ##########################################
   build-linux-bin:
-    runs-on: ubuntu-latest
+    # 22.04 como CloudMount Wizard: dpkg-sig ya no existe en Ubuntu 24.04 (ubuntu-latest).
+    # Además, una glibc más antigua hace el binario compatible con más distribuciones.
+    runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
@@ -200,8 +202,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake libopenblas-dev liblapack-dev \
-            ffmpeg qt6-base-dev ruby-dev libarchive-tools
+            ffmpeg qt6-base-dev ruby-dev libarchive-tools rpm dpkg-sig gnupg
           sudo gem install fpm
+
+      # La clave privada de AnabasaSoft vive solo en los secrets del repo, nunca en el código
+      # (misma clave y mismos pasos que CloudMount Wizard)
+      - name: Importar clave GPG de firma
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+          GPG_PRIVATE_KEY_BASE64: ${{ secrets.GPG_PRIVATE_KEY_BASE64 }}
+        run: |
+          if [ -z "$GPG_KEY_ID" ] || [ -z "$GPG_PRIVATE_KEY_BASE64" ]; then
+            echo "::error::Faltan los secrets GPG_KEY_ID y/o GPG_PRIVATE_KEY_BASE64 en Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+          echo "$GPG_PRIVATE_KEY_BASE64" | base64 -d | gpg --batch --import
+          cat > ~/.rpmmacros <<EOF
+          %_signature gpg
+          %_gpg_name $GPG_KEY_ID
+          %__gpg_sign_cmd %{__gpg} gpg --force-v3-sigs --digest-algo sha256 --batch --no-armor --pinentry-mode loopback --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+          EOF
 
       - name: Download linuxdeploy
         run: |
@@ -300,6 +320,18 @@ jobs:
           eval fpm $COMMON -t rpm --architecture x86_64 \
             --rpm-rpmbuild-define "'_build_id_links none'" \
             -p visagevault-${VERSION}-1.x86_64.rpm .
+
+      # Firmar los paquetes con la clave de AnabasaSoft y comprobar las firmas
+      - name: Firmar paquetes DEB y RPM
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          dpkg-sig --sign builder -k "$GPG_KEY_ID" *.deb
+          rpm --addsign *.rpm
+          dpkg-sig --verify *.deb
+          # La clave pública vive en el repo (firma/), igual que en CloudMount Wizard
+          rpm --import firma/anabasasoft_public.asc
+          rpm --checksig *.rpm
 
       - name: Upload Linux Binaries
         uses: softprops/action-gh-release@v1

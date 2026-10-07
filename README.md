@@ -122,6 +122,41 @@ Asegúrate de que tu `requirements.txt` esté actualizado. Las dependencias clav
     python visagevault.py
     ```
 
+### 🔏 Verificar la firma de los paquetes (Linux)
+
+Los paquetes `.deb` y `.rpm` publicados en cada release están firmados con la clave GPG oficial de AnabasaSoft. Para verificarlos antes de instalar:
+
+1. Descarga la clave pública del repositorio ([`firma/anabasasoft_public.asc`](firma/anabasasoft_public.asc)) a un fichero (**no uses `curl | rpm --import -`**, algunas versiones de `rpm` no admiten leer la clave por la entrada estándar y fallan con `falló la lectura para importar`):
+   ```bash
+   curl -sL https://raw.githubusercontent.com/AnabasaSoft/VisageVault/master/firma/anabasasoft_public.asc -o /tmp/anabasasoft_public.asc
+   ```
+
+2. Importa la clave (solo hace falta una vez por equipo):
+   ```bash
+   # Fedora, openSUSE, RHEL... (paquete .rpm)
+   sudo rpm --import /tmp/anabasasoft_public.asc
+
+   # Debian, Ubuntu... (paquete .deb, requiere dpkg-sig)
+   gpg --import /tmp/anabasasoft_public.asc
+   ```
+
+3. Comprueba que la clave se ha importado correctamente:
+   ```bash
+   rpm -qa gpg-pubkey* --qf '%{name}-%{version}-%{release} --> %{summary}\n' | grep -i anabasasoft
+   ```
+
+4. Verifica la firma del paquete descargado:
+   ```bash
+   # RPM
+   rpm --checksig visagevault-*.rpm
+
+   # DEB
+   dpkg-sig --verify visagevault_*.deb
+   ```
+   Una firma correcta muestra `OK` (o `BIEN` con el sistema en español) en la línea de la firma, en vez de `NOKEY`, `MISSING KEYS` o `NO ESTA BIEN`.
+
+Una firma válida confirma que el paquete procede de AnabasaSoft y no ha sido modificado.
+
 ---
 
 ## 📖 Guía de Uso Rápida
