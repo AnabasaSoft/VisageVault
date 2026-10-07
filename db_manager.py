@@ -409,7 +409,25 @@ class VisageVaultDB:
         if not paths_list: return
         with self.conn:
             tuples = [(p,) for p in paths_list]
+            # Primero sus caras: si no, se quedan huérfanas en la tabla faces
+            self.conn.executemany(
+                "DELETE FROM faces WHERE photo_id IN (SELECT id FROM photos WHERE filepath = ?)", tuples)
             self.conn.executemany("DELETE FROM photos WHERE filepath = ?", tuples)
+
+    def delete_orphan_faces(self):
+        """Borra las caras cuya foto ya no existe en la BD. Devuelve cuántas."""
+        with self.conn:
+            cursor = self.conn.execute("DELETE FROM faces WHERE photo_id NOT IN (SELECT id FROM photos)")
+            return cursor.rowcount
+
+    def get_all_face_ids(self):
+        return {row[0] for row in self.conn.execute("SELECT id FROM faces")}
+
+    def get_all_media_paths(self):
+        """Rutas de todas las fotos y vídeos de la BD (incluidos los ocultos)."""
+        paths = {row[0] for row in self.conn.execute("SELECT filepath FROM photos")}
+        paths.update(row[0] for row in self.conn.execute("SELECT filepath FROM videos"))
+        return paths
 
     def get_photo_date(self, filepath):
         cursor = self.conn.execute("SELECT year, month FROM photos WHERE filepath = ?", (filepath,))

@@ -969,6 +969,68 @@ def evict_cached_image(filepath: str):
         if evicted is not None:
             _image_cache_bytes -= evicted.sizeInBytes()
 
+def purge_media_caches(conn, media_path):
+    """
+    Borra la miniatura (disco y RAM) y los recortes de caras de una foto o vídeo.
+    Hay que llamarla ANTES de quitarlo de la BD: los recortes se localizan por sus caras.
+    """
+    thumb_file = get_thumbnail_path(str(media_path))
+    evict_cached_image(thumb_file)
+    leftovers = [str(thumb_file)]
+    row = conn.execute("SELECT id FROM photos WHERE filepath = ?", (media_path,)).fetchone()
+    if row:
+        face_rows = conn.execute("SELECT id FROM faces WHERE photo_id = ?", (row[0],))
+        leftovers += [get_face_cache_path(face_row[0]) for face_row in face_rows]
+    for path in leftovers:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            print(f"No se pudo borrar {path}: {e}")
+
+
+def cleanup_orphan_caches(db_path):
+    """
+    Borra lo que ya no corresponde a nada de la BD: caras de fotos eliminadas,
+    sus recortes y las miniaturas de archivos que ya no están (p. ej. borrados
+    fuera de la app). Se ejecuta en segundo plano al arrancar.
+    """
+    try:
+        # Primero se listan los ficheros y luego se consulta la BD: lo que se cree
+        # entre medias ya estará en la BD y no se borra
+        face_dir = paths.cache_subdir("face_cache")
+        face_files = os.listdir(face_dir)
+        thumb_dir = get_thumbnail_path("").parent
+        thumb_files = os.listdir(thumb_dir)
+
+        local_db = VisageVaultDB(os.path.basename(db_path), is_worker=True)
+        local_db.db_path = db_path
+        local_db.conn = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            orphan_faces = local_db.delete_orphan_faces()
+            face_ids = local_db.get_all_face_ids()
+            valid_thumbs = {get_thumbnail_path(p).name for p in local_db.get_all_media_paths()}
+        finally:
+            local_db.conn.close()
+
+        removed = 0
+        for name in face_files:
+            stem = name[len("face_"):-len(".jpg")] if name.startswith("face_") and name.endswith(".jpg") else None
+            if stem is not None and stem.isdigit() and int(stem) not in face_ids:
+                os.remove(os.path.join(face_dir, name))
+                removed += 1
+        for name in thumb_files:
+            if name.endswith(".jpg") and name not in valid_thumbs:
+                thumb_path = os.path.join(thumb_dir, name)
+                evict_cached_image(thumb_path)
+                os.remove(thumb_path)
+                removed += 1
+        if orphan_faces or removed:
+            print(f"Limpieza: {orphan_faces} caras huérfanas en la BD y {removed} ficheros de caché sin uso.")
+    except Exception as e:
+        print(f"Error limpiando cachés huérfanas: {e}")
+
+
 class FaceLoader(QRunnable):
     def __init__(self, signals: FaceLoaderSignals, face_id: int, photo_path: str, location_str: str):
         super().__init__()
@@ -2046,6 +2108,8 @@ class PhotoFinderWorker(QObject):
                 pending_missing = missing_paths
             elif missing_paths:
                 self.progress.emit(f"Eliminando {len(missing_paths)} fotos de la BD...")
+                for path in missing_paths:
+                    purge_media_caches(local_db.conn, path)
                 local_db.bulk_delete_photos(missing_paths)
 
             if photos_to_upsert_in_db:
@@ -2138,6 +2202,8 @@ class VideoFinderWorker(QObject):
                 pending_missing = missing_paths
             elif missing_paths:
                 self.progress.emit(f"Eliminando {len(missing_paths)} vídeos de la BD...")
+                for path in missing_paths:
+                    purge_media_caches(local_db.conn, path)
                 local_db.bulk_delete_videos(missing_paths)
 
             if videos_to_upsert_in_db:
@@ -2826,7 +2892,8 @@ class DuplicateDialog(QDialog):
                 # 1. Papelera (primero el disco: si falla, la BD queda intacta)
                 if path not in send_files_to_trash(self, [path]):
                     return
-                # 2. Quitar de la BD
+                # 2. Quitar de la BD (y antes, su miniatura y recortes de caras)
+                purge_media_caches(self.db.conn, path)
                 self.db.delete_photo_permanently(path)
 
                 self.deleted_paths.add(path)
@@ -2921,7 +2988,8 @@ class MoveToSafeWorker(QObject):
                 local_db.conn.commit()
 
                 # 5. LIMPIEZA (Borrar original y referencias)
-                face_ids = []
+                # Sin rastros en claro fuera de la caja fuerte: miniatura y recortes de caras
+                purge_media_caches(local_db.conn, original_path)
                 if is_video:
                     local_db.conn.execute("DELETE FROM videos WHERE filepath = ?", (original_path,))
                 else:
@@ -2929,15 +2997,13 @@ class MoveToSafeWorker(QObject):
                     cur = local_db.conn.execute("SELECT id FROM photos WHERE filepath = ?", (original_path,))
                     row = cur.fetchone()
                     if row:
-                        face_ids = [r['id'] for r in local_db.conn.execute(
-                            "SELECT id FROM faces WHERE photo_id = ?", (row['id'],))]
                         local_db.conn.execute("DELETE FROM faces WHERE photo_id = ?", (row['id'],))
                     local_db.conn.execute("DELETE FROM photos WHERE filepath = ?", (original_path,))
 
                 local_db.conn.commit()
 
-                # No dejar rastros en claro fuera de la caja fuerte
-                self._remove_traces(original_path, face_ids)
+                # ... ni la ruta y la fecha en la MetaDB
+                self._remove_meta_entry(original_path)
 
                 # Borrar archivo original del disco
                 os.remove(original_path)
@@ -2951,21 +3017,8 @@ class MoveToSafeWorker(QObject):
         local_db.conn.close()
         self.finished.emit()
 
-    def _remove_traces(self, original_path, face_ids):
-        """
-        Borra lo que quedaría visible del archivo fuera de la caja fuerte:
-        miniatura (disco y RAM), recortes de caras y su entrada en la MetaDB.
-        """
-        thumb_file = get_thumbnail_path(str(original_path))
-        leftovers = [str(thumb_file)] + [get_face_cache_path(fid) for fid in face_ids]
-        evict_cached_image(thumb_file)
-        for path in leftovers:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError as e:
-                print(f"No se pudo borrar {path}: {e}")
-
+    def _remove_meta_entry(self, original_path):
+        """Quita de la MetaDB la ruta y la fecha del archivo (quedarían en claro)."""
         try:
             meta_conn = sqlite3.connect(db_manager.meta_db_path_for(self.db_path))
             try:
@@ -3003,6 +3056,8 @@ class VisageVaultApp(QMainWindow):
 
         self.db = VisageVaultDB(paths.db_path())
         self.db.relocate_safe_files(paths.safe_dir())
+        # Restos de borrados anteriores (caras, recortes y miniaturas sin uso)
+        threading.Thread(target=cleanup_orphan_caches, args=(self.db.db_path,), daemon=True).start()
 
         self.refresh_timer = QTimer()
         self.refresh_timer.setSingleShot(True)
@@ -4228,19 +4283,7 @@ class VisageVaultApp(QMainWindow):
 
     def _invalidate_photo_caches(self, photo_path):
         """Borra la miniatura (disco y RAM) y los recortes de caras de una foto modificada."""
-        thumb_file = get_thumbnail_path(photo_path)
-        evict_cached_image(thumb_file)
-        leftovers = [str(thumb_file)]
-        row = self.db.conn.execute("SELECT id FROM photos WHERE filepath = ?", (photo_path,)).fetchone()
-        if row:
-            face_rows = self.db.conn.execute("SELECT id FROM faces WHERE photo_id = ?", (row['id'],))
-            leftovers += [get_face_cache_path(r['id']) for r in face_rows]
-        for path in leftovers:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError as e:
-                print(f"No se pudo borrar {path}: {e}")
+        purge_media_caches(self.db.conn, photo_path)
 
     def _restore_selected_media(self, items, is_video):
         """Restaura los elementos seleccionados a la vista principal."""
@@ -4437,6 +4480,7 @@ class VisageVaultApp(QMainWindow):
         for path in send_files_to_trash(self, paths_to_delete):
             try:
                 # 2. Quitar de la BD
+                purge_media_caches(self.db.conn, path)
                 if is_video:
                     self.db.delete_video_permanently(path)
                     # Solo borrar de memoria si NO estaba oculta (si estaba oculta, ya no estaba en memoria)
@@ -4792,6 +4836,8 @@ class VisageVaultApp(QMainWindow):
         )
 
         if answer == QMessageBox.StandardButton.Yes:
+            for path in pending:
+                purge_media_caches(self.db.conn, path)
             if is_video:
                 self.db.bulk_delete_videos(pending)
             else:
