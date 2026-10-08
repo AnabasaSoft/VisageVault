@@ -7225,7 +7225,22 @@ def run_visagevault():
     elapsed_ms = int((time.monotonic() - shown_at) * 1000)
     QTimer.singleShot(max(0, SPLASH_MIN_MS - elapsed_ms), close_splash)
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+
+    # Salir sin la limpieza final de PySide: al terminar Python, PySide destruye
+    # uno a uno los widgets que siguen vivos y, según el orden, puede intentar
+    # destruir alguno que ya lo estaba -> fallo de segmentación al cerrar
+    # (visto en openSUSE con el selector de carpetas). closeEvent ya ha guardado
+    # la configuración y parado las tareas; solo queda cerrar la base de datos.
+    for conn in (window.db.conn, window.db.meta_conn):
+        try:
+            if conn:
+                conn.close()  # Cierre ordenado: SQLite vuelca el WAL a la BD
+        except Exception as e:
+            print(f"Error cerrando la base de datos: {e}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)
 
 def _create_splash(app):
     """Splash para cuando la app se lanza importando el módulo (no como script)."""
