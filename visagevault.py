@@ -2488,18 +2488,20 @@ class LoginDialog(QDialog):
 
 class DuplicateFinderWorker(QObject):
     """
-    Busca fotos duplicadas en dos fases:
-    1. Candidatas: misma huella visual (dHash de 64 bits). Es rápida, pero
-       por sí sola agrupa imágenes distintas: fondos lisos, cielos con el
-       mismo degradado o recortes de la misma escena.
+    Busca fotos duplicadas aunque tengan otra extensión, resolución o
+    compresión (p. ej. un .jpg, su .png y una copia reducida), en dos fases:
+    1. Candidatas: huellas visuales (dHash de 64 bits) a pocos bits de
+       distancia. Al cambiar el formato o la resolución la huella cambia unos
+       pocos bits (medido: 0-5), así que no basta con que sean idénticas.
     2. Confirmación de cada pareja: misma proporción y colores casi iguales
        (miniatura 16x16). Las imágenes casi sin detalle solo se consideran
        duplicadas si los archivos son idénticos byte a byte.
-    Detecta la misma foto aunque tenga otra resolución o compresión.
+    Un recorte o una edición fuerte no cuentan como duplicado.
     """
     progress = Signal(str)
     finished = Signal(dict)  # { 'clave_grupo': [ruta1, ruta2], ... }
 
+    MAX_HASH_DISTANCE = 8     # Bits distintos (de 64) para ser candidatas
     ASPECT_TOLERANCE = 0.02   # Diferencia relativa de proporción admitida
     MAX_COLOR_DIFF = 6.0      # Diferencia media por canal (0-255) en la miniatura 16x16
     MIN_DETAIL = 4.0          # Desviación típica (gris 32x32) por debajo = imagen "plana"
@@ -2510,26 +2512,45 @@ class DuplicateFinderWorker(QObject):
         self.is_running = True
         self._file_hashes = {}
 
+    @staticmethod
+    def _open_rgb(image_path):
+        """La foto como imagen RGB reducida, orientada según el EXIF. También los RAW."""
+        try:
+            img = Image.open(image_path)
+            img.draft("RGB", (256, 256))  # JPEG: decodificar ya reducido
+            img = ImageOps.exif_transpose(img)
+        except OSError:  # Incluye UnidentifiedImageError
+            # RAW: PIL no lo abre; rawpy con half_size es suficiente para comparar
+            with rawpy.imread(image_path) as raw:
+                img = Image.fromarray(raw.postprocess(use_camera_wb=True, half_size=True))
+        if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+            # La transparencia sobre blanco, como en las miniaturas de la galería
+            img = img.convert("RGBA")
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            return background
+        return img.convert("RGB")
+
     def _fingerprint(self, image_path):
         """(dhash, proporción, miniatura 16x16 RGB, detalle) o None si no se puede leer."""
         try:
-            with Image.open(image_path) as img:
-                img.draft("RGB", (256, 256))  # JPEG: decodificar ya reducido
-                img = ImageOps.exif_transpose(img).convert("RGB")
-                width, height = img.size
-                if not width or not height:
-                    return None
+            img = self._open_rgb(image_path)
+            width, height = img.size
+            if not width or not height:
+                return None
+            # Reducir primero (más rápido) sin perder lo que se compara
+            img.thumbnail((256, 256), Image.Resampling.BOX)
 
-                gray = img.convert("L")
-                pixels = np.asarray(gray.resize((9, 8), Image.Resampling.BOX), dtype=np.int16)
-                bits = (pixels[:, :-1] > pixels[:, 1:]).flatten()
-                dhash = hex(int("".join("1" if b else "0" for b in bits), 2))
+            gray = img.convert("L")
+            pixels = np.asarray(gray.resize((9, 8), Image.Resampling.BOX), dtype=np.int16)
+            bits = (pixels[:, :-1] > pixels[:, 1:]).flatten()
+            dhash = int("".join("1" if b else "0" for b in bits), 2)
 
-                small = np.asarray(img.resize((16, 16), Image.Resampling.BOX), dtype=np.float32)
-                detail = float(np.asarray(gray.resize((32, 32), Image.Resampling.BOX), dtype=np.float32).std())
-                return dhash, width / height, small, detail
+            small = np.asarray(img.resize((16, 16), Image.Resampling.BOX), dtype=np.float32)
+            detail = float(np.asarray(gray.resize((32, 32), Image.Resampling.BOX), dtype=np.float32).std())
+            return dhash, width / height, small, detail
         except Exception:
-            # Si PIL falla (ej: archivo corrupto o RAW no soportado), lo ignoramos
+            # Archivo dañado o formato no soportado (p. ej. HEIC sin pillow-heif)
             return None
 
     def _file_hash(self, path):
@@ -2554,23 +2575,44 @@ class DuplicateFinderWorker(QObject):
                 return False
         return float(np.abs(small_a - small_b).mean()) <= self.MAX_COLOR_DIFF
 
-    def _confirm_groups(self, candidates):
-        """Divide un grupo de candidatas en grupos de duplicados confirmados."""
-        groups = []
-        for entry in candidates:
-            for group in groups:
-                if self._is_same_photo(group[0], entry):
-                    group.append(entry)
-                    break
-            else:
-                groups.append([entry])
-        return [[path for path, _ in group] for group in groups if len(group) > 1]
+    @staticmethod
+    def _bit_distances(hashes, value):
+        """Bits distintos entre value y cada huella de hashes (array uint64)."""
+        xor = np.bitwise_xor(hashes, np.uint64(value))
+        if hasattr(np, "bitwise_count"):  # numpy >= 2.0
+            return np.bitwise_count(xor)
+        return _POPCOUNT_TABLE[xor.view(np.uint8).reshape(-1, 8)].sum(axis=1)
+
+    def _group_duplicates(self, entries):
+        """Agrupa las fotos confirmadas como iguales: [[ruta, ...], ...]."""
+        hashes = np.array([fp[0] for _, fp in entries], dtype=np.uint64)
+        parent = list(range(len(entries)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(len(entries) - 1):
+            if not self.is_running:
+                return []
+            if i % 500 == 0:
+                self.progress.emit(f"Comparando fotos... ({i}/{len(entries)})")
+            distances = self._bit_distances(hashes[i + 1:], int(hashes[i]))
+            for j in np.nonzero(distances <= self.MAX_HASH_DISTANCE)[0] + i + 1:
+                if find(i) != find(j) and self._is_same_photo(entries[i], entries[j]):
+                    parent[find(j)] = find(i)
+
+        groups = {}
+        for i, (path, _) in enumerate(entries):
+            groups.setdefault(find(i), []).append(path)
+        return [g for g in groups.values() if len(g) > 1]
 
     @Slot()
     def run(self):
         # Conexión DB local para el hilo
         local_db = VisageVaultDB.for_worker(self.db_path)
-
         try:
             self.progress.emit("Cargando lista de fotos...")
             cursor = local_db.conn.execute("SELECT filepath FROM photos WHERE is_hidden = 0")
@@ -2579,28 +2621,22 @@ class DuplicateFinderWorker(QObject):
             total = len(all_photos)
             self.progress.emit(f"Analizando {total} fotos visualmente...")
 
-            candidates = {}
-            processed = 0
-
-            for path in all_photos:
+            entries = []
+            for processed, path in enumerate(all_photos, 1):
                 if not self.is_running: break
                 if not os.path.exists(path): continue
 
                 fingerprint = self._fingerprint(path)
                 if fingerprint:
-                    candidates.setdefault(fingerprint[0], []).append((path, fingerprint))
+                    entries.append((path, fingerprint))
 
-                processed += 1
                 if processed % 20 == 0:
                     self.progress.emit(f"Analizando... ({processed}/{total})")
 
-            # Confirmar cada grupo de candidatas (misma huella)
             duplicates = {}
-            for dhash, entries in candidates.items():
-                if len(entries) < 2 or not self.is_running:
-                    continue
-                for n, group in enumerate(self._confirm_groups(entries)):
-                    duplicates[f"{dhash}-{n}"] = group
+            if self.is_running and len(entries) > 1:
+                for n, group in enumerate(self._group_duplicates(entries)):
+                    duplicates[f"foto-{n}"] = group
 
             self.finished.emit(duplicates)
 
@@ -2609,6 +2645,10 @@ class DuplicateFinderWorker(QObject):
             self.finished.emit({})
         finally:
             local_db.conn.close()
+
+
+# Bits a 1 de cada byte (para contar bits sin numpy.bitwise_count)
+_POPCOUNT_TABLE = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 
 class VideoDuplicateFinderWorker(QObject):
