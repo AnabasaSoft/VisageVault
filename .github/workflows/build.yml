@@ -78,7 +78,9 @@ jobs:
           files: dist/VisageVault.exe
           tag_name: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: false
+          # Tags con sufijo (v1.8.0-beta.1) se publican como pre-release: la
+          # comprobación de actualizaciones de la app las ignora
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   ##########################################
   # 2) MACOS (DMG)
@@ -159,7 +161,9 @@ jobs:
           files: VisageVault-macOS.dmg
           tag_name: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: false
+          # Tags con sufijo (v1.8.0-beta.1) se publican como pre-release: la
+          # comprobación de actualizaciones de la app las ignora
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   ##########################################
   # 3) LINUX BINARY (AppImage / DEB / RPM)
@@ -342,7 +346,9 @@ jobs:
             *.rpm
           tag_name: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: false
+          # Tags con sufijo (v1.8.0-beta.1) se publican como pre-release: la
+          # comprobación de actualizaciones de la app las ignora
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   ##########################################
   # 4) SOURCE TARBALL (Para AUR / Arch Linux)
@@ -400,4 +406,6 @@ jobs:
           files: visagevault-*.tar.gz
           tag_name: ${{ github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
-          prerelease: false
+          # Tags con sufijo (v1.8.0-beta.1) se publican como pre-release: la
+          # comprobación de actualizaciones de la app las ignora
+          prerelease: ${{ contains(github.ref_name, '-') }}
