@@ -708,6 +708,36 @@ class DriveFolderSignals(QObject):
     loaded = Signal(int, list, object)
 
 
+class DriveFolderPhotosSignals(QObject):
+    """Resultado de DriveFolderPhotosLoader: (carpeta raíz, carpeta, fotos o None si falló)."""
+    loaded = Signal(str, str, object)
+
+
+class DriveFolderPhotosLoader(QRunnable):
+    """
+    Lista directamente en Drive las fotos de UNA carpeta (sin subcarpetas), para
+    mostrar al momento la carpeta que pulsa el usuario sin esperar a que la
+    indexación completa llegue hasta ella.
+    """
+    def __init__(self, root_id, folder_id, signals):
+        super().__init__()
+        self.root_id = root_id
+        self.folder_id = folder_id
+        self.signals = signals
+
+    @Slot()
+    def run(self):
+        try:
+            photos = thread_manager().list_images_in_folder(self.folder_id)
+        except Exception as e:
+            print(f"Error listando fotos de la carpeta de Drive: {e}")
+            photos = None
+        try:
+            self.signals.loaded.emit(self.root_id, self.folder_id, photos)
+        except RuntimeError:
+            pass  # App cerrada
+
+
 class DriveFolderLoader(QRunnable):
     """
     Lista en segundo plano las subcarpetas de una o varias carpetas de Drive
@@ -2927,6 +2957,9 @@ class VisageVaultApp(QMainWindow):
         self.drive_login_worker = None
         # Hilos sustituidos por otros que aún pueden estar terminando (ver _retire_thread)
         self._retired_threads = []
+        # True desde que empieza el cierre: los resultados que lleguen de tareas en
+        # segundo plano ya no deben tocar la interfaz (se está destruyendo)
+        self._closing = False
         self.drive_loaded_ids = set()
         self.is_drive_connected = False
         # Árbol de carpetas de Drive: elementos por id de carpeta. La generación
@@ -2936,6 +2969,12 @@ class VisageVaultApp(QMainWindow):
         self._drive_folders_in_flight = set()
         self.drive_folder_signals = DriveFolderSignals()
         self.drive_folder_signals.loaded.connect(self._on_drive_folders_loaded)
+        # Vista de la Nube: None = toda la carpeta elegida (con subcarpetas);
+        # un id = solo las fotos de esa carpeta
+        self._cloud_view_folder = None
+        self._drive_photo_requests = set()
+        self.drive_photos_signals = DriveFolderPhotosSignals()
+        self.drive_photos_signals.loaded.connect(self._on_drive_folder_photos_loaded)
         self.drive_folder_pool = QThreadPool()
         self.drive_folder_pool.setMaxThreadCount(2)
         self.current_drive_folder_name = "Inicio"
@@ -5432,6 +5471,7 @@ class VisageVaultApp(QMainWindow):
         de una escritura en SQLite o con el GIL de Python tomado.
         """
         print("Cerrando aplicación... Por favor, espere.")
+        self._closing = True
         self._set_status("Cerrando: esperando a que terminen las tareas en curso...")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         QApplication.processEvents()
@@ -6174,7 +6214,7 @@ class VisageVaultApp(QMainWindow):
                 self.cloud_container_layout.addWidget(QLabel("Cargando nueva carpeta..."))
 
                 # Guardar configuración
-                config_manager.set_drive_folder_id(folder_id)
+                config_manager.set_drive_folder_id(folder_id, folder_name)
 
                 # Actualizar referencia actual
                 self.current_drive_folder_id = folder_id
@@ -6265,11 +6305,28 @@ class VisageVaultApp(QMainWindow):
             self.cloud_photo_count += 1
 
     def _scan_drive_content(self, folder_id):
-        """Inicia el escaneo de Drive."""
+        """
+        Muestra la carpeta de Drive elegida e inicia su indexación completa.
+        Primero el árbol de carpetas y lo que ya esté en la caché; si aún no hay
+        nada, las fotos de la propia carpeta, pedidas directamente a Drive. La
+        indexación de todas las subcarpetas sigue en segundo plano y cede la
+        red cuando el usuario navega.
+        """
+        if self.current_drive_folder_id != folder_id:
+            self._reset_drive_tree()
         self.current_drive_folder_id = folder_id
+        self.current_drive_folder_name = config_manager.get_drive_folder_name() or "Carpeta de Drive"
+        self._cloud_view_folder = None
 
-        # 1. Carga inicial de lo que ya tengamos (para que no se vea vacío)
+        # 1. El árbol de carpetas, lo primero
+        self.btn_show_tree.setVisible(True)
+        self.btn_show_tree.setChecked(True)
+        self._toggle_drive_folder_tree()
+
+        # 2. Lo que ya tengamos; si no hay nada, las fotos de la carpeta elegida
         self._load_drive_from_db(folder_id)
+        if self.cloud_photo_count == 0:
+            self._show_cloud_folder(folder_id)
 
         self._set_status("Iniciando indexación en la nube...")
 
@@ -6295,15 +6352,23 @@ class VisageVaultApp(QMainWindow):
     @Slot(int)
     def _on_drive_scan_finished(self, total_count):
         """Se llama cuando termina el escaneo."""
+        if self._closing:
+            return  # Detenido por el cierre: no redibujar una ventana que se destruye
         if total_count < 0:
             # Sesión caducada: el worker ya lo ha indicado en la barra de estado
             self.is_drive_connected = False
             self.btn_gdrive.setText("Reconectar con Google")
             self.btn_gdrive.setStyleSheet("")
             return
-        self._set_status(f"Indexación completada ({total_count} nuevos). Recargando vista...")
+        if self._cloud_view_folder not in (None, self.current_drive_folder_id):
+            # El usuario está viendo una subcarpeta: no le cambiamos la vista
+            self._set_status(f"Indexación completada: {total_count} fotos. "
+                             "Pulsa la carpeta raíz del árbol para verlas todas.")
+            return
+        self._set_status(f"Indexación completada ({total_count} fotos). Recargando vista...")
 
         # Volver a cargar desde la BD local (ya redibuja la Nube) para mostrar lo nuevo
+        self._cloud_view_folder = None
         self.cloud_scroll_area.setUpdatesEnabled(False)
         self._load_drive_from_db(self.current_drive_folder_id)
         self.cloud_scroll_area.setUpdatesEnabled(True)
@@ -6689,10 +6754,8 @@ class VisageVaultApp(QMainWindow):
         folder_ids = [f for f in folder_ids if f not in self._drive_folders_in_flight]
         if not folder_ids:
             return
-        if not self._drive_folders_in_flight:
-            # Que el escáner de fotos ceda la red mientras se navega
-            self.set_drive_priority_low.emit(True)
         self._drive_folders_in_flight.update(folder_ids)
+        self._update_drive_scan_priority()
         loader = DriveFolderLoader(self._drive_tree_gen, folder_ids, self.drive_folder_signals)
         self.drive_folder_pool.start(loader, priority)
 
@@ -6700,8 +6763,9 @@ class VisageVaultApp(QMainWindow):
     def _on_drive_folders_loaded(self, generation, folder_ids, listings):
         """Guarda en la caché las subcarpetas recibidas y actualiza el árbol."""
         self._drive_folders_in_flight.difference_update(folder_ids)
-        if not self._drive_folders_in_flight:
-            self.set_drive_priority_low.emit(False)
+        if self._closing:
+            return
+        self._update_drive_scan_priority()
 
         if listings is None:
             if generation == self._drive_tree_gen:
@@ -6761,14 +6825,60 @@ class VisageVaultApp(QMainWindow):
             self._set_status(f"Mostrando vista completa: {folder_name}")
 
             # Carga TODO lo de la carpeta raíz (recursivo) y redibuja la Nube
+            self._cloud_view_folder = None
             self.cloud_scroll_area.setUpdatesEnabled(False)
             self._load_drive_from_db(self.current_drive_folder_id)
             self.cloud_scroll_area.setUpdatesEnabled(True)
             return
 
         # CASO 2: Hemos pulsado una Subcarpeta
-        self._set_status(f"Filtrando carpeta: {folder_name}...")
+        self._set_status(f"Abriendo carpeta: {folder_name}...")
+        self._show_cloud_folder(folder_id)
+
+    def _update_drive_scan_priority(self):
+        """La indexación completa cede la red mientras el usuario navega."""
+        busy = bool(self._drive_folders_in_flight or self._drive_photo_requests)
+        self.set_drive_priority_low.emit(busy)
+
+    def _show_cloud_folder(self, folder_id):
+        """
+        Muestra las fotos de una carpeta: al momento lo que ya esté en la caché
+        y, con prioridad sobre la indexación, lo que diga Drive ahora mismo.
+        """
+        self._cloud_view_folder = folder_id
         self._load_specific_folder_view(folder_id)
+        if folder_id in self._drive_photo_requests:
+            return
+        self._drive_photo_requests.add(folder_id)
+        self._update_drive_scan_priority()
+        loader = DriveFolderPhotosLoader(self.current_drive_folder_id, folder_id, self.drive_photos_signals)
+        self.drive_folder_pool.start(loader, 20)  # Por delante de los listados de carpetas
+
+    @Slot(str, str, object)
+    def _on_drive_folder_photos_loaded(self, root_id, folder_id, photos):
+        """Guarda las fotos recibidas de una carpeta y, si se está viendo, la redibuja."""
+        self._drive_photo_requests.discard(folder_id)
+        if self._closing:
+            return
+        self._update_drive_scan_priority()
+        if not self.is_drive_connected or root_id != self.current_drive_folder_id:
+            return  # Sesión cerrada o carpeta raíz cambiada mientras tanto
+        viewing = self._cloud_view_folder == folder_id
+        if photos is None:
+            if viewing:
+                self._set_status("No se pudieron cargar las fotos de esta carpeta desde Drive.")
+            return
+        try:
+            self.db.bulk_upsert_drive_photos(photos, root_folder_id=root_id)
+        except Exception as e:
+            print(f"Error guardando fotos de Drive: {e}")
+        if not viewing:
+            return
+        if {p['id'] for p in photos} != self.drive_loaded_ids:
+            # Hay cambios respecto a lo mostrado desde la caché
+            self._load_specific_folder_view(folder_id)
+        elif not photos:
+            self._set_status("Esta carpeta no tiene fotos (mira en sus subcarpetas).")
 
     def _load_specific_folder_view(self, target_folder_id):
         """

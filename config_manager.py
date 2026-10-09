@@ -86,10 +86,15 @@ def get_drive_folder_id():
     config = load_config()
     return config.get('drive_folder_id', None)
 
-def set_drive_folder_id(folder_id):
+def set_drive_folder_id(folder_id, folder_name=None):
     config = load_config()
     config['drive_folder_id'] = folder_id
+    config['drive_folder_name'] = folder_name
     save_config(config)
+
+def get_drive_folder_name():
+    """Nombre de la carpeta de Drive elegida (para la raíz del árbol)."""
+    return load_config().get('drive_folder_name') or None
 
 # --- ACTUALIZACIONES ---
 

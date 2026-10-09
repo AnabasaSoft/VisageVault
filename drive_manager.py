@@ -126,6 +126,22 @@ class DriveManager:
             self.authenticate()
         return self.service.files().get(fileId=file_id, fields="thumbnailLink").execute().get('thumbnailLink')
 
+    def list_images_in_folder(self, folder_id):
+        """Imágenes de una carpeta, sin entrar en sus subcarpetas (todas las páginas)."""
+        if not self.service:
+            self.authenticate()
+        images, page_token = [], None
+        while True:
+            results = self.service.files().list(
+                q=f"'{folder_id}' in parents and mimeType contains 'image/' and trashed = false",
+                pageSize=1000, pageToken=page_token,
+                fields="nextPageToken, files(id, name, mimeType, thumbnailLink, webContentLink, createdTime, parents)"
+            ).execute()
+            images.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            if not page_token:
+                return images
+
     def list_images_recursively(self, folder_id, on_folders=None):
         """
         Generador recursivo de imágenes. Si se indica, on_folders(folder_id,

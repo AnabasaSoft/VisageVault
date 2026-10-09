@@ -165,7 +165,7 @@ Todas están en `requirements.txt`. Las principales son:
 
 Ejecutada desde el código fuente, la aplicación se identifica como versión `dev` y no busca actualizaciones.
 
-> **Google Drive (opcional):** las versiones publicadas ya incluyen las credenciales de la aplicación. Desde el código fuente, la pestaña Nube necesita unas propias: crea un cliente OAuth de tipo **"Aplicación de escritorio"** en Google Cloud Console (con la API de Google Drive activada) y sustituye `BUILD_TIME_CLIENT_ID` y `BUILD_TIME_CLIENT_SECRET` en `drive_auth.py` por su ID y su secreto.
+> **Google Drive (opcional):** las versiones publicadas ya incluyen las credenciales de la aplicación. Desde el código fuente, la pestaña Nube necesita unas propias: crea un cliente OAuth de tipo **"Aplicación de escritorio"** en Google Cloud Console (con la API de Google Drive activada), descarga su JSON y guárdalo como `client_secrets.json` junto a `visagevault.py` (git lo ignora). Sin él, Google responde `Error 401: invalid_client`.
 
 ---
 

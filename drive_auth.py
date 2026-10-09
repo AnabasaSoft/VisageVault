@@ -1,3 +1,4 @@
+import json
 import os
 import pickle
 import threading
@@ -91,11 +92,37 @@ class DriveAuthenticator:
             pickle.dump(creds, token)
         os.replace(temp_path, self.token_file)
 
+    # Credenciales propias para ejecutar desde el código fuente (no se suben a git)
+    CLIENT_SECRETS_FILE = "client_secrets.json"
+
+    @classmethod
+    def _client_config(cls):
+        """
+        Credenciales OAuth de la aplicación. Las versiones publicadas las llevan
+        incrustadas (GitHub Actions sustituye los marcadores). Desde el código
+        fuente se leen de client_secrets.json, junto al programa o en la carpeta
+        de configuración. Sin ellas, Google respondería "Error 401: invalid_client".
+        """
+        if "BUILD_TIME_" not in cls.CLIENT_CONFIG["installed"]["client_id"]:
+            return cls.CLIENT_CONFIG
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), cls.CLIENT_SECRETS_FILE),
+            os.path.join(paths.config_dir(), cls.CLIENT_SECRETS_FILE),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+        raise FileNotFoundError(
+            "Faltan las credenciales de Google Drive de la aplicación. Al ejecutar desde el "
+            f"código fuente, guarda el cliente OAuth (tipo «Aplicación de escritorio») como "
+            f"{cls.CLIENT_SECRETS_FILE} junto a visagevault.py.")
+
     def _perform_login(self):
-        """Login usando el diccionario incrustado en lugar de un archivo."""
+        """Inicio de sesión en el navegador con las credenciales de la aplicación."""
 
         flow = InstalledAppFlow.from_client_config(
-            self.CLIENT_CONFIG, self.SCOPES
+            self._client_config(), self.SCOPES
         )
         return flow.run_local_server(port=0)
 
