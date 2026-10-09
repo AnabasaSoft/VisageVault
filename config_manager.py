@@ -72,6 +72,23 @@ def set_photo_directory(path):
     config['photo_directory'] = path
     save_config(config)
 
+def get_video_directory():
+    """Carpeta de vídeos. Si no se ha elegido una propia, es la de fotos."""
+    return load_config().get('video_directory') or get_photo_directory()
+
+def has_own_video_directory():
+    """True si los vídeos tienen una carpeta elegida aparte de la de fotos."""
+    return bool(load_config().get('video_directory'))
+
+def set_video_directory(path):
+    """Carpeta de vídeos; None (o la misma que la de fotos) hace que siga a la de fotos."""
+    config = load_config()
+    if path and path != config.get('photo_directory'):
+        config['video_directory'] = path
+    else:
+        config.pop('video_directory', None)
+    save_config(config)
+
 def get_thumbnail_size():
     config = load_config()
     # Tamaño por defecto 128 si no existe

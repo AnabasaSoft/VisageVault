@@ -176,8 +176,11 @@ Ejecutada desde el código fuente, la aplicación se identifica como versión `d
   * **Árbol de Fechas:** Las secciones de **Años/Meses** muestran solo archivos visibles. La sección
     **Ocultas** muestra los archivos que has archivado y permite restaurarlos o enviarlos a la papelera.
   * **Árbol de Directorios:** El botón **"Ver árbol de directorios"** filtra la galería por carpeta.
-  * **Auto-Refresco:** Si copias fotos nuevas a tu carpeta, aparecerán automáticamente en la
-    aplicación tras unos segundos.
+  * **Carpetas de fotos y de vídeos:** Cada pestaña tiene su botón para elegir carpeta
+    (**"Cambiar carpeta de fotos"** y **"Cambiar carpeta de vídeos"**). Mientras no elijas una
+    carpeta de vídeos, se usa la de fotos.
+  * **Auto-Refresco:** Las fotos y vídeos que copies a tus carpetas, o borres de ellas, se
+    reflejan automáticamente en la aplicación tras unos segundos.
   * **Pestaña Nube:** Inicia sesión con Google para explorar tus copias de seguridad. Usa el botón "Cambiar Carpeta" para seleccionar "Mi Ordenador" u otras carpetas de Drive.
 
 ### Menú Contextual (Clic Derecho)

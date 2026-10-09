@@ -2340,19 +2340,31 @@ class PhotoDirWatcher(QObject):
     """
     Vigila cambios en el directorio de fotos y emite señales para refrescar la UI.
     """
-    directory_changed = Signal()
+    directory_changed = Signal(object)  # Tipos afectados: ("photos",), ("videos",) o ambos
 
-    def __init__(self, path_to_watch):
+    def __init__(self, path_to_watch, kinds=("photos", "videos")):
         super().__init__()
         self.path_to_watch = path_to_watch
+        self.kinds = tuple(kinds)
+        extensions = ()
+        if "photos" in self.kinds:
+            extensions += tuple(IMAGE_EXTENSIONS)
+        if "videos" in self.kinds:
+            extensions += tuple(VIDEO_EXTENSIONS)
         self.observer = Observer()
-        self.handler = self.ChangeHandler(self.directory_changed)
+        self.handler = self.ChangeHandler(lambda: self.directory_changed.emit(self.kinds), extensions)
 
     def start(self):
-        if os.path.isdir(self.path_to_watch):
+        """Empieza a vigilar. Devuelve False si no se pudo (carpeta ausente, límite de inotify...)."""
+        if not os.path.isdir(self.path_to_watch):
+            return False
+        try:
             self.observer.schedule(self.handler, self.path_to_watch, recursive=True)
             self.observer.start()
-            # print(f"Vigilando cambios en: {self.path_to_watch}")
+            return True
+        except OSError as e:
+            print(f"No se pudo vigilar {self.path_to_watch}: {e}")
+            return False
 
     def stop(self):
         if self.observer.is_alive():
@@ -2365,10 +2377,10 @@ class PhotoDirWatcher(QObject):
         # o retocar metadatos no debe lanzar un re-escaneo completo.
         # "closed" (cierre tras escribir) cubre el final de una copia.
         RELEVANT_EVENTS = ("created", "deleted", "moved", "closed")
-        MEDIA_EXTENSIONS = tuple(IMAGE_EXTENSIONS + VIDEO_EXTENSIONS)
 
-        def __init__(self, signal):
-            self.signal = signal
+        def __init__(self, notify, extensions):
+            self.notify = notify
+            self.media_extensions = extensions
             self.ignored_dirs = tuple(
                 os.path.join(os.path.normpath(d), "") for d in (paths.cache_dir(), paths.safe_dir())
             )
@@ -2380,7 +2392,7 @@ class PhotoDirWatcher(QObject):
             if os.path.basename(path).startswith('.') or path.startswith(self.ignored_dirs):
                 return False
             # Mover o borrar una carpeta entera no genera eventos de sus archivos
-            return is_directory or path.lower().endswith(self.MEDIA_EXTENSIONS)
+            return is_directory or path.lower().endswith(self.media_extensions)
 
         def on_any_event(self, event):
             if event.event_type not in self.RELEVANT_EVENTS:
@@ -2391,7 +2403,7 @@ class PhotoDirWatcher(QObject):
             candidate_paths = (event.src_path, getattr(event, "dest_path", ""))
             if any(self._is_relevant_path(p, event.is_directory) for p in candidate_paths):
                 # La app agrupa los eventos con un temporizador (refresh_timer)
-                self.signal.emit()
+                self.notify()
 
 # =================================================================
 # DIÁLOGOS DE SEGURIDAD
@@ -2912,10 +2924,12 @@ class VisageVaultApp(QMainWindow):
         self.refresh_timer.setInterval(2000) # Esperar 2 segundos de inactividad antes de refrescar
         self.refresh_timer.timeout.connect(self._perform_auto_refresh)
 
-        self.file_watcher = None
+        self.file_watchers = []
+        self._pending_refresh = set()  # "photos" / "videos" con cambios sin procesar
 
         self.setMinimumSize(QSize(900, 600))
-        self.current_directory = None
+        self.photo_directory = None
+        self.video_directory = None
 
         # --- Configuración de Zoom de Miniaturas ---
         self.current_thumbnail_size = config_manager.get_thumbnail_size()
@@ -3108,8 +3122,8 @@ class VisageVaultApp(QMainWindow):
         top_controls = QVBoxLayout()
         botones_layout = QHBoxLayout()
 
-        self.select_dir_button = QPushButton("Cambiar Directorio")
-        self.select_dir_button.clicked.connect(self._open_directory_dialog)
+        self.select_dir_button = QPushButton("Cambiar carpeta de fotos")
+        self.select_dir_button.clicked.connect(lambda: self._open_directory_dialog(is_video=False))
         botones_layout.addWidget(self.select_dir_button)
 
         self.btn_duplicates = QPushButton("Buscar Duplicados")
@@ -3126,7 +3140,7 @@ class VisageVaultApp(QMainWindow):
         top_controls.addWidget(self.btn_show_photo_tree)
         # ------------------------------
 
-        self.path_label = QLabel("Ruta: No configurada")
+        self.path_label = QLabel("Carpeta: sin configurar")
         self.path_label.setWordWrap(True)
         top_controls.addWidget(self.path_label)
         photo_right_panel_layout.addLayout(top_controls)
@@ -3190,10 +3204,16 @@ class VisageVaultApp(QMainWindow):
 
         # --- Botonera superior para Vídeos ---
         video_top_controls = QVBoxLayout()
+        self.select_video_dir_button = QPushButton("Cambiar carpeta de vídeos")
+        self.select_video_dir_button.clicked.connect(lambda: self._open_directory_dialog(is_video=True))
+        video_top_controls.addWidget(self.select_video_dir_button)
         self.btn_show_video_tree = QPushButton("Ver árbol de directorios")
         self.btn_show_video_tree.setCheckable(True)
         self.btn_show_video_tree.clicked.connect(self._toggle_video_folder_tree)
         video_top_controls.addWidget(self.btn_show_video_tree)
+        self.video_path_label = QLabel("Carpeta: sin configurar")
+        self.video_path_label.setWordWrap(True)
+        video_top_controls.addWidget(self.video_path_label)
         video_right_panel_layout.addLayout(video_top_controls)
         # --------------------------------------------
 
@@ -3488,94 +3508,130 @@ class VisageVaultApp(QMainWindow):
             ))
         # --------------------------------------------
 
-        directory = config_manager.get_photo_directory()
-        if directory and Path(directory).is_dir():
-            self.current_directory = directory
-            self.path_label.setText(f"Ruta: {Path(directory).name}")
-            self._start_media_scan(directory)
+        photo_dir = config_manager.get_photo_directory()
+        if photo_dir and Path(photo_dir).is_dir():
+            self._set_media_directory(False, photo_dir)
+            video_dir = config_manager.get_video_directory()
+            if Path(video_dir).is_dir():
+                self._set_media_directory(True, video_dir)
+            else:
+                self._set_status(f"No se encuentra la carpeta de vídeos ({video_dir}).")
+            self._start_media_scan()
         else:
-            self._set_status("No se encontró un directorio válido. Por favor, selecciona uno.")
+            self._set_status("No se encontró la carpeta de fotos. Por favor, selecciona una.")
             self._after_splash(lambda: self._open_directory_dialog(force_select=True))
 
-    def _open_directory_dialog(self, force_select=False):
-        """Abre el selector de directorios y gestiona la carga."""
+    def _set_media_directory(self, is_video, directory):
+        """Carpeta de fotos o de vídeos en uso (y su etiqueta)."""
+        label = self.video_path_label if is_video else self.path_label
+        if is_video:
+            self.video_directory = directory
+        else:
+            self.photo_directory = directory
+        label.setText(f"Carpeta: {Path(directory).name}")
+        label.setToolTip(directory)
 
-        # 1. Definir la variable 'directory' abriendo el diálogo
+    def _open_directory_dialog(self, force_select=False, is_video=False):
+        """
+        Elige la carpeta de fotos o la de vídeos. Mientras los vídeos no tengan
+        una carpeta propia, siguen a la de fotos.
+        """
+        kind = "vídeos" if is_video else "fotos"
+        current = self.video_directory if is_video else self.photo_directory
         directory = QFileDialog.getExistingDirectory(
-            self,
-            "Seleccionar Carpeta de Fotos",
-            self.current_directory or ""
-        )
+            self, f"Seleccionar carpeta de {kind}", current or "")
 
-        if directory:
-            self.current_directory = directory
+        if not directory:
+            if force_select:
+                self._set_status("¡Debes seleccionar una carpeta de fotos para comenzar!")
+            return
+
+        kinds = ["videos"] if is_video else ["photos"]
+        if is_video:
+            config_manager.set_video_directory(directory)
+        else:
             config_manager.set_photo_directory(directory)
-            self.path_label.setText(f"Ruta: {Path(directory).name}")
-
-            # Resetear filtros
-            self.current_photo_filter_path = None
-            self.current_video_filter_path = None
-
-            # Recargar árboles si están visibles
-            if self.btn_show_photo_tree.isChecked():
-                self._load_local_tree_root(self.photo_folder_tree, directory)
+            if not config_manager.has_own_video_directory():
+                kinds.append("videos")  # Los vídeos siguen a la carpeta de fotos
+        for k in kinds:
+            k_is_video = k == "videos"
+            self._set_media_directory(k_is_video, directory)
+            g = self._gallery(k_is_video)
+            # Resetear filtro y árbol de carpetas
+            if k_is_video:
+                self.current_video_filter_path = None
             else:
-                self.photo_folder_tree.clear()
-
-            if self.btn_show_video_tree.isChecked():
-                self._load_local_tree_root(self.video_folder_tree, directory)
+                self.current_photo_filter_path = None
+            if g.tree_button.isChecked():
+                self._load_local_tree_root(g.folder_tree, directory)
             else:
-                self.video_folder_tree.clear()
-
-            # Limpiar y escanear
-            self.date_tree_widget.clear()
-            self.video_date_tree_widget.clear()
-            self._start_media_scan(directory)
-
-        elif force_select:
-             self._set_status("¡Debes seleccionar un directorio para comenzar!")
+                g.folder_tree.clear()
+            g.tree.clear()
+        self._start_media_scan(kinds)
 
     # ----------------------------------------------------
     # Lógica de Hilos y Resultados
     # ----------------------------------------------------
 
-    def _start_media_scan(self, directory):
-        """Inicia los escaneos de fotos y vídeos."""
-        if not directory:
-            return
+    def _start_media_scan(self, kinds=("photos", "videos")):
+        """Vigila las carpetas y escanea las indicadas ("photos", "videos")."""
+        self._restart_watchers()
+        self._pending_refresh.update(kinds)
+        self._perform_auto_refresh()
 
-        if self.file_watcher:
-            self.file_watcher.stop()
+    def _restart_watchers(self):
+        """Un observador por carpeta (uno solo si fotos y vídeos comparten carpeta)."""
+        for watcher in self.file_watchers:
+            watcher.stop()
+        self.file_watchers = []
+        by_dir = {}
+        for kind, directory in (("photos", self.photo_directory), ("videos", self.video_directory)):
+            if directory:
+                by_dir.setdefault(os.path.normpath(directory), []).append(kind)
+        for directory, kinds in by_dir.items():
+            watcher = PhotoDirWatcher(directory, kinds)
+            watcher.directory_changed.connect(self._on_directory_changed)
+            if watcher.start():
+                self.file_watchers.append(watcher)
+            else:
+                print(f"Aviso: los cambios en {directory} no se detectarán solos.")
 
-        self.file_watcher = PhotoDirWatcher(directory)
-        self.file_watcher.directory_changed.connect(self._on_directory_changed)
-        self.file_watcher.start()
-
-        scan_id = self._next_scan_id()
-        self._start_photo_search(directory, scan_id)
-        self._start_video_search(directory, scan_id)
-
-    @Slot()
-    def _on_directory_changed(self):
+    @Slot(object)
+    def _on_directory_changed(self, kinds):
         """Se llama cuando watchdog detecta un cambio. Reinicia el temporizador."""
         # Cada vez que hay un cambio, reiniciamos la cuenta atrás.
         # Solo se ejecutará _perform_auto_refresh cuando pasen 2 segundos SIN cambios.
+        self._pending_refresh.update(kinds)
         self.refresh_timer.start()
 
     @Slot()
     def _perform_auto_refresh(self):
-        """Ejecuta el re-escaneo real tras el periodo de calma."""
-        # print("Detectados cambios en el disco. Actualizando galería...")
-        self._set_status("Detectados cambios externos. Actualizando...")
-
-        if self.current_directory:
-            # Relanzamos los escaneos.
-            # Nota: Tus workers actuales son inteligentes (usan fechas de la BD),
-            # pero para detectar archivos NUEVOS o BORRADOS necesitan recorrer el disco.
-            scan_id = self._next_scan_id()
-            self._start_photo_search(self.current_directory, scan_id)
-            self._start_video_search(self.current_directory, scan_id)
-            # El escaneo de caras se lanzará solo al terminar el de fotos
+        """
+        Escanea lo que tenga cambios pendientes. Si ese escaneo ya está en
+        marcha, el cambio no se pierde: se reintenta al cabo de un momento
+        (antes se descartaba y el archivo nuevo no aparecía).
+        """
+        if not self._pending_refresh:
+            return
+        scan_id = self._next_scan_id()  # Fotos y vídeos de la misma carpeta comparten recorrido
+        busy = False
+        for kind in sorted(self._pending_refresh):
+            is_video = kind == "videos"
+            directory = self.video_directory if is_video else self.photo_directory
+            thread = self.video_thread if is_video else self.photo_thread
+            if not directory:
+                self._pending_refresh.discard(kind)
+                continue
+            if self._is_thread_running(thread):
+                busy = True
+                continue
+            self._pending_refresh.discard(kind)
+            if is_video:
+                self._start_video_search(directory, scan_id)
+            else:
+                self._start_photo_search(directory, scan_id)
+        if busy:
+            self.refresh_timer.start()  # Reintentar cuando termine el escaneo en curso
 
     def _next_scan_id(self):
         """Identificador de una tanda de escaneo (fotos + vídeos comparten recorrido)."""
@@ -3621,7 +3677,7 @@ class VisageVaultApp(QMainWindow):
         self.video_worker.finished.connect(self.video_worker.deleteLater)
         self.video_thread.finished.connect(self._on_video_scan_thread_finished)
 
-        self.select_dir_button.setEnabled(False) # Compartido
+        self.select_video_dir_button.setEnabled(False)
         self.video_thread.start()
 
     # ----------------------------------------------------
@@ -3663,7 +3719,7 @@ class VisageVaultApp(QMainWindow):
                 loader=VideoThumbnailLoader, open_item=self._open_video_player,
                 splitter=self.video_splitter, splitter_key="video_splitter_sizes",
                 folder_panel=self.video_folder_panel, folder_tree=self.video_folder_tree,
-                tree_button=self.btn_show_video_tree)
+                tree_button=self.btn_show_video_tree, root=self.video_directory)
         return types.SimpleNamespace(
             kind="fotos", data=self.photos_by_year_month, items=self.photo_list_widget_items,
             groups_attr="photo_group_widgets", container=self.photo_container_layout,
@@ -3674,7 +3730,7 @@ class VisageVaultApp(QMainWindow):
             loader=ThumbnailLoader, open_item=self._open_preview_dialog,
             splitter=self.main_splitter, splitter_key="photo_splitter_sizes",
             folder_panel=self.photo_folder_panel, folder_tree=self.photo_folder_tree,
-            tree_button=self.btn_show_photo_tree)
+            tree_button=self.btn_show_photo_tree, root=self.photo_directory)
 
     def _date_tree(self, is_video):
         return self.video_date_tree_widget if is_video else self.date_tree_widget
@@ -4450,7 +4506,7 @@ class VisageVaultApp(QMainWindow):
     @Slot(object, list)
     def _handle_video_search_finished(self, new_videos_by_year_month, missing_paths):
         """Se llama cuando el VideoFinderWorker termina."""
-        self.select_dir_button.setEnabled(True)
+        self.select_video_dir_button.setEnabled(True)
 
         if new_videos_by_year_month is None:
             self._set_status("La carpeta de vídeos no está disponible (¿disco desconectado?). Biblioteca sin cambios.")
@@ -4498,7 +4554,7 @@ class VisageVaultApp(QMainWindow):
             self,
             "Archivos no encontrados",
             f"{len(pending)} {kind} de la biblioteca ya no están en la carpeta:\n"
-            f"{self.current_directory}\n\n"
+            f"{self.video_directory if is_video else self.photo_directory}\n\n"
             "Si el disco o la unidad de red está desconectado, responde «No»: "
             "se conservarán sus fechas, caras y personas hasta que vuelva a estar disponible.\n\n"
             f"¿Quitar esos {kind} de la biblioteca definitivamente?",
@@ -4703,7 +4759,7 @@ class VisageVaultApp(QMainWindow):
             self.drive_download_signals.failed.emit(str(e))
         except Exception as e:
             print(f"Error descarga preview: {e}")
-            self.drive_download_signals.failed.emit("Error al descargar imagen.")
+            self.drive_download_signals.failed.emit("Error al descargar la foto.")
         finally:
             if os.path.exists(part_path):
                 try: os.remove(part_path)
@@ -4712,7 +4768,7 @@ class VisageVaultApp(QMainWindow):
     @Slot(str)
     def _finish_cloud_preview(self, local_path):
         """Se ejecuta en el hilo principal cuando la descarga termina."""
-        self._set_status("Imagen descargada. Abriendo visor...")
+        self._set_status("Foto descargada. Abriendo visor...")
         self._open_preview_dialog(local_path)
 
     @Slot(str)
@@ -5485,8 +5541,8 @@ class VisageVaultApp(QMainWindow):
             print(f"Error guardando configuración al cerrar: {e}")
 
         # 2. Parar vigilante y descartar miniaturas pendientes
-        if self.file_watcher:
-            self.file_watcher.stop()
+        for watcher in self.file_watchers:
+            watcher.stop()
         self.threadpool.clear()
         self.drive_folder_pool.clear()
 
@@ -5742,11 +5798,12 @@ class VisageVaultApp(QMainWindow):
         ("📷", "Fotos",
          "Tu biblioteca ordenada por <b>años y meses</b>; el árbol de la derecha salta a cada fecha. "
          "<b>Ver árbol de directorios</b> filtra por carpeta y <b>Buscar Duplicados</b> encuentra las "
-         "copias repetidas para que te quedes con la mejor. Las fotos nuevas que copies a tu carpeta "
-         "aparecen solas a los pocos segundos."),
+         "copias repetidas para que te quedes con la mejor. Las fotos que copies a tu carpeta o "
+         "borres de ella se reflejan solas a los pocos segundos."),
         ("🎥", "Vídeos",
-         "Igual que Fotos, pero para tus vídeos, con su miniatura. Con <b>doble clic</b> se "
-         "reproducen en el reproductor de tu sistema."),
+         "Igual que Fotos, pero para tus vídeos, con su miniatura. Pueden estar en su propia carpeta "
+         "(<b>Cambiar carpeta de vídeos</b>); si no eliges una, se usa la de fotos. Con "
+         "<b>doble clic</b> se reproducen en el reproductor de tu sistema."),
         ("👥", "Personas",
          "Las caras se detectan solas en segundo plano. <b>Haz clic en una cara</b> para asignarla a "
          "una persona o crear una nueva, y usa <b>Agrupar caras parecidas</b> para etiquetar muchas de "
@@ -6374,7 +6431,7 @@ class VisageVaultApp(QMainWindow):
         self.cloud_scroll_area.setUpdatesEnabled(True)
 
         if self.cloud_photo_count == 0:
-             QMessageBox.information(self, "Aviso", "No se encontraron imágenes en esa carpeta.")
+             QMessageBox.information(self, "Aviso", "No se encontraron fotos en esa carpeta.")
 
         self._set_status(f"Listo. {self.cloud_photo_count} fotos disponibles.")
 
@@ -7326,7 +7383,7 @@ class VisageVaultApp(QMainWindow):
                     preview.show_with_animation()
                     self._set_status("Visualizando archivo seguro.")
                 else:
-                    self._set_status("Error: Imagen corrupta o formato no soportado.")
+                    self._set_status("Error: foto dañada o formato no soportado.")
         except Exception as e:
             print(f"Error visualización safe: {e}")
 
@@ -7368,6 +7425,7 @@ class VisageVaultApp(QMainWindow):
 
         self._load_safe_content()
         if restored:
+            self._pending_refresh.update(("photos", "videos"))
             self._perform_auto_refresh()
 
         self._set_status(f"{restored} archivo(s) restaurado(s) de la caja fuerte.")
@@ -7491,8 +7549,8 @@ class VisageVaultApp(QMainWindow):
                 target_width = 280
                 g.splitter.setSizes([target_width, max(100, center - target_width), right])
             # Carga perezosa
-            if g.folder_tree.topLevelItemCount() == 0 and self.current_directory:
-                self._load_local_tree_root(g.folder_tree, self.current_directory)
+            if g.folder_tree.topLevelItemCount() == 0 and g.root:
+                self._load_local_tree_root(g.folder_tree, g.root)
         else:
             # El ancho del árbol vuelve a la galería; la derecha no cambia
             g.splitter.setSizes([0, center + left, right])
@@ -7565,7 +7623,7 @@ class VisageVaultApp(QMainWindow):
         path = item.data(0, Qt.UserRole)
         if not path: return
         kind = "vídeos" if is_video else "fotos"
-        filter_path = None if path == self.current_directory else path
+        filter_path = None if path == self._gallery(is_video).root else path
         if is_video:
             self.current_video_filter_path = filter_path
         else:
