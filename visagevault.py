@@ -2299,96 +2299,6 @@ class FaceScanWorker(QObject):
 # =================================================================
 # CLASE: DIÁLOGO DE AYUDA Y ACERCA DE
 # =================================================================
-class HelpDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Ayuda y Acerca de VisageVault")
-        self.setFixedSize(500, 600)
-
-        layout = QVBoxLayout(self)
-
-        # 1. Logo
-        logo_label = QLabel()
-        logo_label.setAlignment(Qt.AlignCenter)
-        # Usamos resource_path para que funcione en el .exe compilado
-        logo_path = resource_path("visagevault.png")
-        if os.path.exists(logo_path):
-            pixmap = QPixmap(logo_path)
-            logo_label.setPixmap(pixmap.scaled(128, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        layout.addWidget(logo_label)
-
-        # 2. Título y Versión
-        title_label = QLabel(f"<h2>{APP_NAME}</h2>")
-        title_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title_label)
-
-        # 3. Texto de Ayuda (HTML)
-        help_text = """
-        <style>
-            p { margin-bottom: 10px; line-height: 1.4; }
-            a { color: #3daee9; text-decoration: none; font-weight: bold; }
-        </style>
-
-        <h3>📖 Guía Rápida</h3>
-        <p><b>📷 Fotos / 🎥 Vídeos:</b> Navega por tus recuerdos organizados por fecha.
-        Haz <b>doble clic</b> para ver en detalle. Usa <b>Rueda</b> para zoom.</p>
-
-        <p><b>👥 Personas:</b> La IA agrupa caras automáticamente.
-        Entra en esta pestaña para etiquetar a tus amigos y familiares.</p>
-
-        <p><b>🖱️ Acciones:</b> Haz <b>Clic Derecho</b> en una foto o vídeo para:
-        <ul>
-            <li>Cambiar su fecha (y actualizar el archivo).</li>
-            <li>Ocultarlo de la vista principal.</li>
-            <li>Moverlo a la papelera.</li>
-        </ul>
-        </p>
-
-        <hr>
-
-        <h3>📬 Contacto y Soporte</h3>
-        <p>Desarrollado por <b>Daniel Serrano Armenta</b>.</p>
-
-        <p>🐙 <b>GitHub:</b><br>
-        <a href="https://github.com/AnabasaSoft/VisageVault">github.com/AnabasaSoft/VisageVault</a></p>
-
-        <p>📧 <b>Email:</b><br>
-        <a href="mailto:anabasasoft@gmail.com">anabasasoft@gmail.com</a></p>
-        """
-
-        info_label = QLabel(help_text)
-        info_label.setWordWrap(True)
-        info_label.setOpenExternalLinks(True) # ¡Importante para que funcionen los links!
-        info_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        info_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
-
-        # Área de scroll por si el texto es largo
-        scroll = QScrollArea()
-        scroll.setWidget(info_label)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        layout.addWidget(scroll)
-
-        # Actualizaciones: botón manual e interruptor de la comprobación al arrancar
-        updates_layout = QHBoxLayout()
-        updates_layout.addStretch(1)
-        btn_updates = QPushButton("🔄 Buscar actualizaciones")
-        main_window = parent if isinstance(parent, VisageVaultApp) else None
-        btn_updates.clicked.connect(lambda: main_window and main_window.check_updates_manual(btn_updates, self))
-        btn_updates.setEnabled(main_window is not None)
-        updates_layout.addWidget(btn_updates)
-        auto_check = QCheckBox("Buscar al iniciar")
-        auto_check.setChecked(config_manager.get_check_updates())
-        auto_check.toggled.connect(config_manager.set_check_updates)
-        updates_layout.addWidget(auto_check)
-        updates_layout.addStretch(1)
-        layout.addLayout(updates_layout)
-
-        # 4. Botón Cerrar
-        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
-        btn_box.rejected.connect(self.accept)
-        layout.addWidget(btn_box)
-
 # =================================================================
 # CLASE: VIGILANTE DEL SISTEMA DE ARCHIVOS (AUTO-REFRESH)
 # =================================================================
@@ -3323,53 +3233,7 @@ class VisageVaultApp(QMainWindow):
         # ==========================================================
         # 5. Pestaña "Ayuda"
         # ==========================================================
-        help_tab_widget = QWidget()
-        help_layout = QVBoxLayout(help_tab_widget)
-        help_layout.setAlignment(Qt.AlignCenter)
-
-        # Logo grande en la pestaña
-        tab_logo = QLabel()
-        logo_path = resource_path("visagevault.png")
-        if os.path.exists(logo_path):
-            pixmap = QPixmap(logo_path)
-            tab_logo.setPixmap(pixmap.scaled(256, 256, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        # Ajuste fino para centrar ópticamente si la imagen tiene márgenes desiguales
-        tab_logo.setStyleSheet("margin-left: 100px;") # Prueba valores pequeños
-        help_layout.addWidget(tab_logo)
-
-        help_layout.addSpacing(20)
-
-        # Texto de bienvenida
-        welcome_label = QLabel("<h1>Bienvenido a VisageVault</h1>")
-        welcome_label.setAlignment(Qt.AlignCenter)
-        help_layout.addWidget(welcome_label)
-
-        subtitle_label = QLabel("Tu gestor de recuerdos inteligente, privado y local.")
-        subtitle_label.setStyleSheet("font-size: 14pt; color: gray;")
-        subtitle_label.setAlignment(Qt.AlignCenter)
-        help_layout.addWidget(subtitle_label)
-
-        help_layout.addSpacing(40)
-
-        # Botón para abrir el diálogo
-        btn_open_help = QPushButton("  Ver Ayuda / Acerca de / Contacto  ")
-        btn_open_help.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
-        btn_open_help.setStyleSheet("""
-            QPushButton {
-                font-size: 14pt;
-                padding: 15px;
-                border-radius: 8px;
-                background-color: #3daee9;
-                color: white;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #4dbef9; }
-        """)
-        btn_open_help.setCursor(Qt.PointingHandCursor)
-        btn_open_help.clicked.connect(self._open_help_dialog) # Conectamos a la función
-
-        help_layout.addWidget(btn_open_help)
-        help_layout.addStretch(1)
+        help_tab_widget = self._build_help_tab()
 
         # ==========================================================
         # PESTAÑA NUBE (Google Drive) - MODIFICADA
@@ -3547,7 +3411,7 @@ class VisageVaultApp(QMainWindow):
             button.setEnabled(True)
             button.setText("🔄 Buscar actualizaciones")
             if not parent.isVisible():
-                return  # Se cerró la Ayuda mientras se buscaba
+                return  # Se cerró la ventana mientras se buscaba
         except RuntimeError:
             return
         if error:
@@ -5826,11 +5690,236 @@ class VisageVaultApp(QMainWindow):
         g.container.addStretch(1)
         QTimer.singleShot(100, lambda: self._load_visible_gallery_thumbnails(is_video))
 
-    @Slot()
-    def _open_help_dialog(self):
-        """Abre la ventana de ayuda."""
-        dialog = HelpDialog(self)
-        dialog.exec()
+    # ==========================================================
+    # PESTAÑA AYUDA
+    # ==========================================================
+
+    HELP_ACCENT = "#3daee9"
+
+    # (icono, pestaña, descripción en HTML)
+    HELP_TABS = [
+        ("📷", "Fotos",
+         "Tu biblioteca ordenada por <b>años y meses</b>; el árbol de la derecha salta a cada fecha. "
+         "<b>Ver árbol de directorios</b> filtra por carpeta y <b>Buscar Duplicados</b> encuentra las "
+         "copias repetidas para que te quedes con la mejor. Las fotos nuevas que copies a tu carpeta "
+         "aparecen solas a los pocos segundos."),
+        ("🎥", "Vídeos",
+         "Igual que Fotos, pero para tus vídeos, con su miniatura. Con <b>doble clic</b> se "
+         "reproducen en el reproductor de tu sistema."),
+        ("👥", "Personas",
+         "Las caras se detectan solas en segundo plano. <b>Haz clic en una cara</b> para asignarla a "
+         "una persona o crear una nueva, y usa <b>Agrupar caras parecidas</b> para etiquetar muchas de "
+         "una vez. Las caras mal detectadas se eliminan con clic derecho y se recuperan desde "
+         "<b>Caras Eliminadas</b>."),
+        ("🔒", "Caja Fuerte",
+         "Guarda fotos y vídeos <b>cifrados con AES-256</b> y los quita de la galería. Añádelos con "
+         "clic derecho → <b>Añadir a Caja Fuerte</b>; para verlos, <b>Desbloquear</b>. "
+         "<b>La contraseña no se puede recuperar</b>: si la olvidas, su contenido se pierde."),
+        ("☁️", "Nube",
+         "Explora las fotos de tu <b>Google Drive</b> por fechas y por carpetas sin descargarlas: "
+         "solo se bajan las miniaturas que ves y la foto que abres. VisageVault solo tiene "
+         "<b>permiso de lectura</b>: nunca modifica ni borra nada de tu Drive."),
+    ]
+
+    HELP_SHORTCUTS = [
+        ("Ver una foto o reproducir un vídeo", "Doble clic"),
+        ("Opciones de los elementos seleccionados", "Clic derecho"),
+        ("Tamaño de las miniaturas", "Ctrl + / Ctrl −"),
+        ("Zoom en el visor", "Rueda del ratón · doble clic para ajustar"),
+        ("Mover la foto ampliada", "Arrastrar"),
+        ("Cerrar el visor", "Esc · clic fuera de la foto"),
+        ("Selección múltiple", "Ctrl + clic"),
+        ("Selección de un rango", "Mayús + clic"),
+        ("Selección por arrastre", "Arrastrar sobre el fondo"),
+    ]
+
+    HELP_CONTEXT_MENU = [
+        ("Cambiar Fecha", "Reasigna la fecha; actualiza la biblioteca y los metadatos del archivo."),
+        ("Corregir Ojos Rojos", "Los detecta y corrige en las fotos seleccionadas (modifica el original)."),
+        ("Añadir a Caja Fuerte", "Cifra los archivos y los quita de la galería."),
+        ("Ocultar de la vista", "Los archiva en «Ocultas» sin borrarlos del disco."),
+        ("Mover a la papelera", "Los envía a la papelera del sistema, desde donde se pueden recuperar."),
+    ]
+
+    def _help_label(self, html, selectable=False):
+        """Texto enriquecido de la Ayuda; los enlaces se abren con el navegador del sistema."""
+        label = QLabel(html)
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.RichText)
+        label.setOpenExternalLinks(False)
+        label.linkActivated.connect(updater.open_url)
+        flags = Qt.LinksAccessibleByMouse
+        if selectable:
+            flags |= Qt.TextSelectableByMouse
+        label.setTextInteractionFlags(flags)
+        return label
+
+    def _help_section_title(self, text):
+        label = QLabel(text)
+        label.setStyleSheet(f"font-size: 14pt; font-weight: bold; color: {self.HELP_ACCENT};"
+                            " padding-top: 14px;")
+        return label
+
+    def _help_card(self):
+        """Recuadro con el color de fondo alternativo del tema (claro u oscuro)."""
+        card = QFrame()
+        card.setObjectName("helpCard")
+        card.setStyleSheet("#helpCard { background: palette(alternate-base);"
+                           " border: 1px solid palette(mid); border-radius: 8px; }")
+        return card
+
+    def _help_table(self, rows):
+        """Tabla de dos columnas (acción, descripción) en HTML."""
+        html = "<table width='100%' cellspacing='0' cellpadding='5'>"
+        for i, (left, right) in enumerate(rows):
+            border = "" if i == len(rows) - 1 else "border-bottom: 1px solid palette(mid);"
+            html += (f"<tr><td width='34%' style='{border}'><b>{left}</b></td>"
+                     f"<td style='{border}'>{right}</td></tr>")
+        return html + "</table>"
+
+    def _build_help_tab(self):
+        """Pestaña Ayuda: qué hace cada pestaña, controles, datos, autor y versión."""
+        page = QWidget()
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(24, 20, 24, 24)
+        column = QWidget()
+        column.setMaximumWidth(920)
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        outer.addStretch(1)
+        outer.addWidget(column, 100)
+        outer.addStretch(1)
+
+        # --- Cabecera: logo, nombre, versión y actualizaciones ---
+        header = QHBoxLayout()
+        header.setSpacing(18)
+        logo = QLabel()
+        logo_path = resource_path("visagevault.png")
+        if os.path.exists(logo_path):
+            logo.setPixmap(QPixmap(logo_path).scaled(88, 88, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        header.addWidget(logo, 0, Qt.AlignTop)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+        title = QLabel("VisageVault")
+        title.setStyleSheet("font-size: 24pt; font-weight: bold;")
+        title_box.addWidget(title)
+        version_text = "Compilación de desarrollo" if APP_VERSION == "dev" else f"Versión {APP_VERSION}"
+        subtitle = QLabel(f"Tu gestor de recuerdos inteligente, privado y local · {version_text}")
+        subtitle.setStyleSheet("color: gray;")
+        subtitle.setWordWrap(True)
+        title_box.addWidget(subtitle)
+
+        updates_row = QHBoxLayout()
+        updates_row.setContentsMargins(0, 8, 0, 0)
+        btn_updates = QPushButton("🔄 Buscar actualizaciones")
+        btn_updates.setCursor(Qt.PointingHandCursor)
+        btn_updates.clicked.connect(lambda: self.check_updates_manual(btn_updates, self))
+        updates_row.addWidget(btn_updates)
+        auto_check = QCheckBox("Buscar al iniciar")
+        auto_check.setChecked(config_manager.get_check_updates())
+        auto_check.toggled.connect(config_manager.set_check_updates)
+        updates_row.addWidget(auto_check)
+        updates_row.addStretch(1)
+        title_box.addLayout(updates_row)
+        header.addLayout(title_box, 1)
+        layout.addLayout(header)
+
+        privacy = self._help_label(
+            "🛡️ <b>Todo se procesa en tu ordenador.</b> El reconocimiento facial, las fechas y la caja "
+            "fuerte no envían nada a internet. Solo la pestaña Nube se conecta, y únicamente a tu "
+            "propio Google Drive.")
+        privacy.setStyleSheet(f"padding: 10px; border-left: 4px solid {self.HELP_ACCENT};"
+                              " background: palette(alternate-base);")
+        layout.addSpacing(6)
+        layout.addWidget(privacy)
+
+        # --- Qué hay en cada pestaña ---
+        layout.addWidget(self._help_section_title("Qué hay en cada pestaña"))
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for i, (icon, name, text) in enumerate(self.HELP_TABS):
+            card = self._help_card()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(14, 12, 14, 12)
+            heading = QLabel(f"{icon}  {name}")
+            heading.setStyleSheet("font-size: 12pt; font-weight: bold; background: transparent;")
+            card_layout.addWidget(heading)
+            body = self._help_label(text)
+            body.setStyleSheet("background: transparent;")
+            card_layout.addWidget(body)
+            card_layout.addStretch(1)
+            # La última, si queda sola en su fila, ocupa todo el ancho
+            span = 2 if i == len(self.HELP_TABS) - 1 and i % 2 == 0 else 1
+            grid.addWidget(card, i // 2, i % 2, 1, span)
+        layout.addLayout(grid)
+
+        # --- Menú contextual y controles ---
+        layout.addWidget(self._help_section_title("Clic derecho sobre fotos y vídeos"))
+        layout.addWidget(self._help_label(self._help_table(self.HELP_CONTEXT_MENU)))
+        layout.addWidget(self._help_section_title("Controles"))
+        layout.addWidget(self._help_label(self._help_table(self.HELP_SHORTCUTS)))
+
+        # --- Tus datos ---
+        layout.addWidget(self._help_section_title("Tus datos"))
+        data_html = (
+            "Haz copia de seguridad de la carpeta de <b>datos</b>: contiene tus fechas, personas y la "
+            "caja fuerte. Las demás se pueden borrar sin perder nada.<br>"
+            + self._help_table([
+                ("Datos", paths.data_dir()),
+                ("Configuración", paths.config_dir()),
+                ("Caché (miniaturas y caras)", paths.cache_dir()),
+            ]))
+        layout.addWidget(self._help_label(data_html, selectable=True))
+        btn_data = QPushButton("📂 Abrir la carpeta de datos")
+        btn_data.setCursor(Qt.PointingHandCursor)
+        btn_data.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(paths.data_dir())))
+        data_row = QHBoxLayout()
+        data_row.addWidget(btn_data)
+        data_row.addStretch(1)
+        layout.addLayout(data_row)
+
+        # --- Autor y contacto ---
+        layout.addWidget(self._help_section_title("Autor y contacto"))
+        author_card = self._help_card()
+        author_layout = QHBoxLayout(author_card)
+        author_layout.setContentsMargins(16, 14, 16, 14)
+        author_layout.setSpacing(16)
+        brand = QLabel()
+        brand_path = resource_path("AnabasaSoft.png")
+        if os.path.exists(brand_path):
+            brand.setPixmap(QPixmap(brand_path).scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        brand.setStyleSheet("background: transparent;")
+        author_layout.addWidget(brand, 0, Qt.AlignTop)
+        a = f"style='color: {self.HELP_ACCENT}; text-decoration: none;'"
+        author = self._help_label(
+            "Desarrollado con ❤️ y mucho café por<br>"
+            "<span style='font-size: 13pt;'><b>Daniel Serrano Armenta</b> (AnabasaSoft)</span><br><br>"
+            f"📧 <a {a} href='mailto:anabasasoft@gmail.com'>anabasasoft@gmail.com</a><br>"
+            f"🐙 <a {a} href='https://github.com/AnabasaSoft/VisageVault'>github.com/AnabasaSoft/VisageVault</a><br>"
+            f"🌐 <a {a} href='https://danitxu79.github.io/'>danitxu79.github.io</a><br>"
+            f"🐛 <a {a} href='https://github.com/AnabasaSoft/VisageVault/issues'>Informar de un error o "
+            "proponer una mejora</a><br><br>"
+            f"Si VisageVault te resulta útil, puedes darle una ⭐ en GitHub o "
+            f"<a {a} href='https://www.buymeacoffee.com/danitxu'>invitarme a un café</a> ☕")
+        author.setStyleSheet("background: transparent;")
+        author_layout.addWidget(author, 1)
+        layout.addWidget(author_card)
+
+        # --- Licencia ---
+        license_label = self._help_label(
+            "VisageVault se distribuye con <b>doble licencia</b>: LGPLv3 para proyectos de código "
+            "abierto y licencia comercial para software privativo (consulta al autor).")
+        license_label.setStyleSheet("color: gray; font-size: 9pt; padding-top: 12px;")
+        layout.addWidget(license_label)
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidget(page)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        return scroll
 
     def _remove_red_eyes_for_selected(self, items):
         """Aplica la corrección de ojos rojos a los elementos seleccionados."""
