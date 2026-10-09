@@ -15,6 +15,7 @@ import os
 
 import cv2
 import numpy as np
+import fr_compat  # noqa: F401  Antes de face_recognition (ver fr_compat.py)
 import face_recognition
 from PIL import Image, ImageOps, JpegImagePlugin
 

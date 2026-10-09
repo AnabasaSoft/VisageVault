@@ -138,6 +138,7 @@ import piexif.helper
 import re
 import db_manager
 from db_manager import VisageVaultDB
+import fr_compat  # noqa: F401  Antes de face_recognition (ver fr_compat.py)
 import face_recognition
 _keep_splash_alive()
 from PIL import Image, ImageOps
