@@ -52,20 +52,38 @@ def ssl_context():
     except ImportError:
         return ssl.create_default_context()
 
-def system_env():
-    """Entorno para lanzar programas del sistema (navegador).
-    En el ejecutable de PyInstaller, LD_LIBRARY_PATH apunta a las bibliotecas
-    empaquetadas y el navegador cargaría versiones incompatibles. PyInstaller
-    guarda el valor original en LD_LIBRARY_PATH_ORIG: lo restauramos (o quitamos
-    la variable si no existía). Fuera de PyInstaller no se toca nada."""
-    env = os.environ.copy()
-    if getattr(sys, 'frozen', False):
-        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
-        if orig is not None:
-            env["LD_LIBRARY_PATH"] = orig
-        else:
+def _clean_library_path(env):
+    """
+    Quita de env el LD_LIBRARY_PATH que pone el ejecutable de PyInstaller (sus
+    bibliotecas empaquetadas) y restaura el original si lo había. Fuera de
+    PyInstaller no toca nada.
+    """
+    if not getattr(sys, 'frozen', False):
+        return env
+    orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+    if orig is not None:
+        env["LD_LIBRARY_PATH"] = orig
+    else:
+        # Solo si apunta a las bibliotecas del ejecutable (si no, es del usuario)
+        bundle = getattr(sys, "_MEIPASS", None)
+        current = env.get("LD_LIBRARY_PATH", "")
+        if bundle and bundle in current.split(os.pathsep):
             env.pop("LD_LIBRARY_PATH", None)
     return env
+
+def restore_system_library_path():
+    """
+    Restaura LD_LIBRARY_PATH en el entorno de TODO el proceso, para que los
+    programas que se lancen (xdg-open desde el login de Google, el reproductor
+    de vídeo, enlaces...) usen las bibliotecas del sistema y no las empaquetadas
+    ("/bin/sh: symbol lookup error ... rl_full_quoting_desired"). No afecta a
+    las bibliotecas de este proceso: el cargador ya leyó la variable al arrancar.
+    """
+    _clean_library_path(os.environ)
+
+def system_env():
+    """Entorno para lanzar programas del sistema (navegador)."""
+    return _clean_library_path(os.environ.copy())
 
 def open_url(url):
     """Abre una URL en el navegador o el cliente de correo del sistema.

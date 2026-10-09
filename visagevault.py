@@ -27,6 +27,14 @@ import sys
 import os
 import time
 
+# --- PROGRAMAS EXTERNOS CON EL ENTORNO DEL SISTEMA ---
+# El ejecutable de PyInstaller arranca con LD_LIBRARY_PATH apuntando a sus
+# bibliotecas. Sin esto, xdg-open (navegador del login de Google, reproductor
+# de vídeo, enlaces) las heredaría y fallaría:
+# "/bin/sh: symbol lookup error: ... rl_full_quoting_desired".
+import updater
+updater.restore_system_library_path()
+
 # --- SPLASH TEMPRANO ---
 # Las importaciones de abajo (sklearn, face_recognition, cv2...) tardan varios
 # segundos. Al ejecutar la app, el splash se muestra ANTES de importarlas, con
@@ -69,7 +77,6 @@ from drive_auth import DriveAuthenticator, DriveAuthError
 import requests # Para bajar thumbnails
 from drive_manager import DriveManager
 import config_manager # Para guardar la carpeta elegida
-import updater
 
 # La versión la genera el workflow de release a partir del tag
 # (visagevault_version.py, que no está en git). Ejecutando desde el código
