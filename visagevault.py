@@ -150,6 +150,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
 import shutil
 import hashlib
+import cv2
 from collections import OrderedDict
 
 # =================================================================
@@ -2610,11 +2611,217 @@ class DuplicateFinderWorker(QObject):
             local_db.conn.close()
 
 
+class VideoDuplicateFinderWorker(QObject):
+    """
+    Busca vídeos duplicados en dos niveles:
+    1. Copias exactas: mismo tamaño y mismo contenido (SHA-256). Solo se leen
+       enteros los archivos que coinciden en tamaño y en el principio y el final.
+    2. El mismo vídeo en otra calidad o formato (p. ej. un .mp4 y su .webm):
+       duración y proporción parecidas y los mismos fotogramas en varios
+       puntos del vídeo (huella dHash de cada fotograma). Es más lento y,
+       aunque es estricto, puede dar algún falso positivo (p. ej. dos tomas
+       casi idénticas): por eso se muestran aparte para revisarlos.
+    Emite {clave: [rutas]}; las claves empiezan por "exact-" o "similar-".
+    """
+    progress = Signal(str)
+    finished = Signal(dict)
+
+    SAMPLE_POINTS = (0.1, 0.25, 0.4, 0.55, 0.7, 0.85)  # Posiciones relativas de los fotogramas
+    DURATION_TOLERANCE_S = 1.5   # Diferencia de duración admitida (y además un 2 %)
+    ASPECT_TOLERANCE = 0.03
+    MAX_FRAME_DISTANCE = 10      # Bits distintos (de 64) para considerar iguales dos fotogramas
+    MAX_COLOR_DIFF = 10.0        # Y diferencia media por canal (0-255) de la miniatura 16x16
+    MIN_MATCHING_FRAMES = 5      # De SAMPLE_POINTS
+    MIN_FRAME_DETAIL = 6.0       # Fotogramas casi lisos (negro, fundidos) no cuentan
+
+    def __init__(self, db_path):
+        super().__init__()
+        self.db_path = db_path
+        self.is_running = True
+
+    @staticmethod
+    def _hash_file(path, partial=False):
+        """SHA-256 del archivo; con partial, solo del primer y último MB (filtro rápido)."""
+        digest = hashlib.sha256()
+        chunk = 1024 * 1024
+        with open(path, "rb") as f:
+            if partial:
+                digest.update(f.read(chunk))
+                f.seek(max(0, os.path.getsize(path) - chunk))
+                digest.update(f.read(chunk))
+            else:
+                for block in iter(lambda: f.read(chunk), b""):
+                    digest.update(block)
+        return digest.hexdigest()
+
+    def _find_exact(self, videos):
+        """Grupos de archivos idénticos byte a byte."""
+        by_size = {}
+        for path in videos:
+            try:
+                by_size.setdefault(os.path.getsize(path), []).append(path)
+            except OSError:
+                pass
+        groups = []
+        for size, same_size in by_size.items():
+            if len(same_size) < 2 or size == 0 or not self.is_running:
+                continue
+            for hash_partial in (True, False):  # Primero el filtro rápido, luego el contenido completo
+                buckets = {}
+                for path in same_size:
+                    try:
+                        buckets.setdefault(self._hash_file(path, hash_partial), []).append(path)
+                    except OSError:
+                        pass
+                same_size = [p for bucket in buckets.values() if len(bucket) > 1 for p in bucket]
+                if not hash_partial:
+                    groups.extend(b for b in buckets.values() if len(b) > 1)
+        return groups
+
+    def _fingerprint(self, path):
+        """(duración s, proporción, [(dhash, miniatura 16x16) o None por fotograma]) o None si no se puede leer."""
+        cap = cv2.VideoCapture(path)
+        try:
+            if not cap.isOpened():
+                return None
+            fps = cap.get(cv2.CAP_PROP_FPS) or 0
+            frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            width = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0
+            height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0
+            if fps <= 0 or frames <= 0 or not width or not height:
+                return None  # Sin duración fiable no se puede comparar
+            duration = frames / fps
+            hashes = []
+            for point in self.SAMPLE_POINTS:
+                frame = self._frame_at(cap, duration * point * 1000)
+                if frame is None:
+                    hashes.append(None)
+                    continue
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if float(cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).std()) < self.MIN_FRAME_DETAIL:
+                    hashes.append(None)
+                    continue
+                small = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA).astype(np.int16)
+                bits = (small[:, :-1] > small[:, 1:]).flatten()
+                colors = cv2.resize(frame, (16, 16), interpolation=cv2.INTER_AREA).astype(np.float32)
+                hashes.append((int("".join("1" if b else "0" for b in bits), 2), colors))
+            return duration, width / height, hashes
+        except Exception:
+            return None
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _frame_at(cap, target_ms):
+        """
+        Fotograma en el instante target_ms. Saltar directamente a un instante no
+        es exacto (sobre todo con velocidad de fotogramas variable, típica del
+        .webm): se salta un poco antes y se avanza leyendo la marca de tiempo
+        real de cada fotograma.
+        """
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, target_ms - 2000))
+        for _ in range(600):  # Como mucho ~10 s de vídeo a 60 fps
+            if not cap.grab():
+                return None
+            if cap.get(cv2.CAP_PROP_POS_MSEC) >= target_ms:
+                ok, frame = cap.retrieve()
+                return frame if ok else None
+        return None
+
+    def _is_same_video(self, a, b):
+        dur_a, aspect_a, hashes_a = a
+        dur_b, aspect_b, hashes_b = b
+        if abs(dur_a - dur_b) > max(self.DURATION_TOLERANCE_S, 0.02 * max(dur_a, dur_b)):
+            return False
+        if abs(aspect_a - aspect_b) > self.ASPECT_TOLERANCE * max(aspect_a, aspect_b):
+            return False
+        # El mismo fotograma: misma estructura (dHash) y mismos colores (miniatura)
+        matches = sum(1 for fa, fb in zip(hashes_a, hashes_b)
+                      if fa is not None and fb is not None
+                      and bin(fa[0] ^ fb[0]).count("1") <= self.MAX_FRAME_DISTANCE
+                      and float(np.abs(fa[1] - fb[1]).mean()) <= self.MAX_COLOR_DIFF)
+        return matches >= self.MIN_MATCHING_FRAMES
+
+    def _find_similar(self, videos, exact_groups):
+        """Grupos del mismo vídeo con otra calidad o formato (sin repetir los exactos)."""
+        # De cada grupo exacto basta con analizar un archivo
+        representative = {}
+        for group in exact_groups:
+            for path in group[1:]:
+                representative[path] = group[0]
+        to_analyze = [p for p in videos if p not in representative]
+
+        fingerprints = []
+        for i, path in enumerate(to_analyze, 1):
+            if not self.is_running:
+                return []
+            self.progress.emit(f"Comparando fotogramas de los vídeos... ({i}/{len(to_analyze)})")
+            fp = self._fingerprint(path)
+            if fp:
+                fingerprints.append((path, fp))
+
+        # Solo se comparan vídeos de duración parecida (ordenados por duración)
+        fingerprints.sort(key=lambda e: e[1][0])
+        parent = {path: path for path, _ in fingerprints}
+        def find(p):
+            while parent[p] != p:
+                parent[p] = parent[parent[p]]
+                p = parent[p]
+            return p
+        for i, (path_a, fp_a) in enumerate(fingerprints):
+            for path_b, fp_b in fingerprints[i + 1:]:
+                if fp_b[0] - fp_a[0] > max(self.DURATION_TOLERANCE_S, 0.02 * fp_b[0]):
+                    break
+                if self._is_same_video(fp_a, fp_b):
+                    parent[find(path_b)] = find(path_a)
+
+        clusters = {}
+        for path, _ in fingerprints:
+            clusters.setdefault(find(path), []).append(path)
+        exact_of = {}
+        for group in exact_groups:
+            exact_of[group[0]] = group
+        groups = []
+        for cluster in clusters.values():
+            if len(cluster) < 2:
+                continue
+            # Añadir las copias exactas de cada representante
+            groups.append([p for rep_path in cluster for p in exact_of.get(rep_path, [rep_path])])
+        return groups
+
+    @Slot()
+    def run(self):
+        local_db = VisageVaultDB.for_worker(self.db_path)
+        try:
+            self.progress.emit("Cargando lista de vídeos...")
+            cursor = local_db.conn.execute("SELECT filepath FROM videos WHERE is_hidden = 0")
+            videos = [row['filepath'] for row in cursor.fetchall() if os.path.isfile(row['filepath'])]
+
+            self.progress.emit(f"Buscando copias exactas entre {len(videos)} vídeos...")
+            exact = self._find_exact(videos)
+            similar = self._find_similar(videos, exact) if self.is_running else []
+
+            in_similar = {p for group in similar for p in group}
+            duplicates = {}
+            for n, group in enumerate(exact):
+                if not set(group) <= in_similar:  # Ya incluido en un grupo "mismo vídeo"
+                    duplicates[f"exact-{n}"] = group
+            for n, group in enumerate(similar):
+                duplicates[f"similar-{n}"] = group
+            self.finished.emit(duplicates)
+        except Exception as e:
+            print(f"Error en búsqueda de vídeos duplicados: {e}")
+            self.finished.emit({})
+        finally:
+            local_db.conn.close()
+
+
 class DuplicateDialog(QDialog):
-    """Diálogo para ver y gestionar los duplicados encontrados."""
-    def __init__(self, duplicates_dict, db_manager, parent=None):
+    """Diálogo para ver y gestionar los duplicados encontrados (fotos o vídeos)."""
+    def __init__(self, duplicates_dict, db_manager, parent=None, is_video=False):
         super().__init__(parent)
-        self.setWindowTitle("Gestor de Fotos Duplicadas")
+        self.is_video = is_video
+        self.setWindowTitle("Gestor de Vídeos Duplicados" if is_video else "Gestor de Fotos Duplicadas")
         self.resize(1000, 700)
         self.duplicates = duplicates_dict
         self.db = db_manager
@@ -2664,7 +2871,16 @@ class DuplicateDialog(QDialog):
             valid_paths = [p for p in group_paths if p not in self.deleted_paths and os.path.exists(p)]
             if len(valid_paths) > 1:
                 name = Path(valid_paths[0]).name
-                item = QListWidgetItem(f"{name} ({len(valid_paths)} copias)")
+                if h.startswith("exact-"):
+                    label = f"{name} ({len(valid_paths)} copias exactas)"
+                elif h.startswith("similar-"):
+                    label = f"{name} ({len(valid_paths)} versiones; revísalo)"
+                else:
+                    label = f"{name} ({len(valid_paths)} copias)"
+                item = QListWidgetItem(label)
+                if h.startswith("similar-"):
+                    item.setToolTip("Mismos fotogramas con otra calidad o formato. "
+                                    "Comprueba que de verdad es el mismo vídeo antes de borrar.")
                 item.setData(Qt.UserRole, valid_paths)
                 self.list_widget.addItem(item)
 
@@ -2687,6 +2903,9 @@ class DuplicateDialog(QDialog):
             self._add_preview_card(path)
 
     def _add_preview_card(self, path):
+        if self.is_video:
+            self._add_video_card(path)
+            return
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         card.setStyleSheet("background-color: #2b2b2b; border-radius: 8px; margin: 5px;")
@@ -2748,6 +2967,65 @@ class DuplicateDialog(QDialog):
 
         self.preview_layout.addWidget(card)
 
+    def _add_video_card(self, path):
+        """Ficha de un vídeo: fotograma, resolución, duración, tamaño y reproducir."""
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setStyleSheet("background-color: #2b2b2b; border-radius: 8px; margin: 5px;")
+        layout = QVBoxLayout(card)
+
+        thumb = QLabel("Sin vista previa")
+        thumb.setFixedSize(280, 200)
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb_path = generate_video_thumbnail(path)
+        if thumb_path:
+            pix = QPixmap(thumb_path)
+            if not pix.isNull():
+                thumb.setPixmap(pix.scaled(thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        layout.addWidget(thumb)
+
+        w = h = 0
+        duration = 0.0
+        cap = cv2.VideoCapture(path)
+        try:
+            if cap.isOpened():
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                duration = frames / fps if fps > 0 and frames > 0 else 0.0
+        finally:
+            cap.release()
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+        except OSError:
+            size_mb = 0
+        minutes, seconds = divmod(int(round(duration)), 60)
+
+        for text, style in ((f"📏 {w} x {h} px", "color: #4dbef9; font-weight: bold;"),
+                            (f"⏱️ {minutes}:{seconds:02d}" if duration else "⏱️ duración desconocida", "color: #aaaaaa;"),
+                            (f"💾 {size_mb:.2f} MB · {Path(path).suffix.lstrip('.').upper()}", "color: #aaaaaa;")):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(style)
+            lbl.setAlignment(Qt.AlignCenter)
+            layout.addWidget(lbl)
+        name_lbl = QLabel(Path(path).name)
+        name_lbl.setWordWrap(True)
+        name_lbl.setAlignment(Qt.AlignCenter)
+        name_lbl.setToolTip(path)
+        name_lbl.setStyleSheet("font-size: 10px;")
+        layout.addWidget(name_lbl)
+
+        btn_play = QPushButton("▶ Reproducir")
+        btn_play.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+        layout.addWidget(btn_play)
+        btn_del = QPushButton("🗑️ A la papelera")
+        btn_del.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
+        btn_del.clicked.connect(lambda: self._delete_file(path, card))
+        layout.addWidget(btn_del)
+
+        self.preview_layout.addWidget(card)
+
     def _delete_file(self, path, card_widget):
         reply = QMessageBox.question(self, "Confirmar", f"¿Mover a la papelera?\n{Path(path).name}", QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
@@ -2757,7 +3035,10 @@ class DuplicateDialog(QDialog):
                     return
                 # 2. Quitar de la BD (y antes, su miniatura y recortes de caras)
                 purge_media_caches(self.db.conn, path)
-                self.db.delete_photo_permanently(path)
+                if self.is_video:
+                    self.db.delete_video_permanently(path)
+                else:
+                    self.db.delete_photo_permanently(path)
 
                 self.deleted_paths.add(path)
                 card_widget.deleteLater()
@@ -3127,7 +3408,7 @@ class VisageVaultApp(QMainWindow):
 
         self.btn_duplicates = QPushButton("Buscar Duplicados")
         self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        self.btn_duplicates.clicked.connect(self._start_duplicate_search)
+        self.btn_duplicates.clicked.connect(lambda: self._start_duplicate_search(is_video=False))
         top_controls.addWidget(self.btn_duplicates)
 
 
@@ -3205,6 +3486,10 @@ class VisageVaultApp(QMainWindow):
         self.select_video_dir_button = QPushButton("Cambiar carpeta de vídeos")
         self.select_video_dir_button.clicked.connect(lambda: self._open_directory_dialog(is_video=True))
         video_top_controls.addWidget(self.select_video_dir_button)
+        self.btn_video_duplicates = QPushButton("Buscar Duplicados")
+        self.btn_video_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_video_duplicates.clicked.connect(lambda: self._start_duplicate_search(is_video=True))
+        video_top_controls.addWidget(self.btn_video_duplicates)
         self.btn_show_video_tree = QPushButton("Ver árbol de directorios")
         self.btn_show_video_tree.setCheckable(True)
         self.btn_show_video_tree.clicked.connect(self._toggle_video_folder_tree)
@@ -5801,7 +6086,8 @@ class VisageVaultApp(QMainWindow):
         ("🎥", "Vídeos",
          "Igual que Fotos, pero para tus vídeos, con su miniatura. Pueden estar en su propia carpeta "
          "(<b>Cambiar carpeta de vídeos</b>); si no eliges una, se usa la de fotos. Con "
-         "<b>doble clic</b> se reproducen en el reproductor de tu sistema."),
+         "<b>doble clic</b> se reproducen en el reproductor de tu sistema. <b>Buscar Duplicados</b> "
+         "encuentra copias exactas y el mismo vídeo guardado en otra calidad o formato."),
         ("👥", "Personas",
          "Las caras se detectan solas en segundo plano. <b>Haz clic en una cara</b> para asignarla a "
          "una persona o crear una nueva, y usa <b>Agrupar caras parecidas</b> para etiquetar muchas de "
@@ -6976,25 +7262,32 @@ class VisageVaultApp(QMainWindow):
     # ========================================================
     # GESTIÓN DE DUPLICADOS
     # ========================================================
-    @Slot()
-    def _start_duplicate_search(self):
-        """Inicia el worker de búsqueda."""
-        if not self.photos_by_year_month:
-            QMessageBox.information(self, "Aviso", "Primero carga una carpeta con fotos.")
+    def _start_duplicate_search(self, is_video=False):
+        """Inicia la búsqueda de fotos o de vídeos duplicados en segundo plano."""
+        data = self.videos_by_year_month if is_video else self.photos_by_year_month
+        kind = "vídeos" if is_video else "fotos"
+        if not data:
+            QMessageBox.information(self, "Aviso", f"Primero carga una carpeta con {kind}.")
+            return
+        if self._is_thread_running(getattr(self, 'dup_thread', None)):
+            self._set_status("Ya hay una búsqueda de duplicados en curso.")
             return
 
-        self.btn_duplicates.setEnabled(False)
-        self.btn_duplicates.setText("Analizando...")
-        self._set_status("Iniciando búsqueda visual de duplicados...")
+        button = self.btn_video_duplicates if is_video else self.btn_duplicates
+        button.setEnabled(False)
+        button.setText("Analizando...")
+        self._set_status(f"Iniciando búsqueda de {kind} duplicados...")
 
         # Crear hilo y worker
         self.dup_thread = QThread()
-        self.dup_worker = DuplicateFinderWorker(self.db.db_path)
+        worker_class = VideoDuplicateFinderWorker if is_video else DuplicateFinderWorker
+        self.dup_worker = worker_class(self.db.db_path)
         self.dup_worker.moveToThread(self.dup_thread)
 
         self.dup_thread.started.connect(self.dup_worker.run)
         self.dup_worker.progress.connect(self._set_status)
-        self.dup_worker.finished.connect(self._on_duplicate_search_finished)
+        self.dup_worker.finished.connect(
+            lambda duplicates: self._on_duplicate_search_finished(duplicates, is_video))
 
         # Limpieza automática
         self.dup_worker.finished.connect(self.dup_thread.quit)
@@ -7003,36 +7296,38 @@ class VisageVaultApp(QMainWindow):
 
         self.dup_thread.start()
 
-    @Slot(dict)
-    def _on_duplicate_search_finished(self, duplicates):
+    def _on_duplicate_search_finished(self, duplicates, is_video=False):
         """Recibe los resultados y abre el diálogo."""
-        self.btn_duplicates.setEnabled(True)
-        self.btn_duplicates.setText("Buscar Duplicados")
+        if self._closing:
+            return
+        button = self.btn_video_duplicates if is_video else self.btn_duplicates
+        button.setEnabled(True)
+        button.setText("Buscar Duplicados")
+        kind = "vídeos" if is_video else "fotos"
         self._set_status("Búsqueda finalizada.")
 
         if not duplicates:
-            QMessageBox.information(self, "Resultado", "¡Genial! No se encontraron duplicados visuales.")
+            QMessageBox.information(self, "Resultado", f"¡Genial! No se encontraron {kind} duplicados.")
             return
 
-        # Calcular total de fotos duplicadas
         total_dupes = sum(len(v) for v in duplicates.values())
-        self._set_status(f"Encontrados {len(duplicates)} grupos ({total_dupes} fotos).")
+        self._set_status(f"Encontrados {len(duplicates)} grupos ({total_dupes} {kind}).")
 
         # Abrir diálogo
-        dialog = DuplicateDialog(duplicates, self.db, self)
+        dialog = DuplicateDialog(duplicates, self.db, self, is_video=is_video)
         dialog.exec()
 
         # Al cerrar, verificar si se borró algo para refrescar la galería
         deleted_files = dialog.get_deleted_items()
         if deleted_files:
-            self._set_status(f"Se eliminaron {len(deleted_files)} fotos. Actualizando vista...")
-
-            # Eliminamos las fotos borradas de la memoria de la app
+            self._set_status(f"Se eliminaron {len(deleted_files)} {kind}. Actualizando vista...")
+            target = self.videos_by_year_month if is_video else self.photos_by_year_month
             for path in deleted_files:
-                self._remove_from_memory_struct(path, self.photos_by_year_month)
-
-            # Redibujamos la pantalla de fotos
-            self._display_photos()
+                self._remove_from_memory_struct(path, target)
+            if is_video:
+                self._display_videos()
+            else:
+                self._display_photos()
 
     def _setup_safe_tab(self):
         layout = QVBoxLayout(self.safe_tab)

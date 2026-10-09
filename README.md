@@ -213,6 +213,9 @@ Selecciona uno o varios elementos y haz clic derecho para acceder a las opciones
 ### Duplicados
 
   * En la pestaña **Fotos**, el botón **"Buscar Duplicados"** compara visualmente todas las fotos y muestra los grupos de copias con su resolución y tamaño, para que envíes a la papelera las que sobran.
+  * En la pestaña **Vídeos**, **"Buscar Duplicados"** encuentra dos tipos de duplicados:
+    * **Copias exactas:** el mismo archivo repetido (mismo contenido byte a byte).
+    * **El mismo vídeo en otra calidad o formato** (p. ej. un `.mp4` y su `.webm`): compara fotogramas en varios puntos del vídeo. Revísalos antes de borrar; cada ficha muestra resolución, duración, tamaño y formato, y tiene un botón para reproducirlo.
 
 ### Controles
 
