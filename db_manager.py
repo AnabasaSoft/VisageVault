@@ -312,6 +312,21 @@ class VisageVaultDB:
                     root_folder_id TEXT
                 )
             """)
+            # Caché del árbol de carpetas de Drive (solo nombres e ids, no archivos)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS drive_folders (
+                    parent_id TEXT,
+                    id TEXT,
+                    name TEXT,
+                    PRIMARY KEY (parent_id, id)
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS drive_folder_listings (
+                    parent_id TEXT PRIMARY KEY,
+                    fetched_at REAL
+                )
+            """)
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS safe_files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -626,6 +641,51 @@ class VisageVaultDB:
     def clear_drive_data(self):
         with self.conn:
             self.conn.execute("DELETE FROM drive_photos")
+            self.conn.execute("DELETE FROM drive_folders")
+            self.conn.execute("DELETE FROM drive_folder_listings")
+
+    def get_drive_subfolders(self, parent_id):
+        """(subcarpetas, momento en que se listaron) o (None, None) si no se conocen."""
+        row = self.conn.execute("SELECT fetched_at FROM drive_folder_listings WHERE parent_id = ?",
+                                (parent_id,)).fetchone()
+        if row is None:
+            return None, None
+        cursor = self.conn.execute(
+            "SELECT id, name FROM drive_folders WHERE parent_id = ? ORDER BY name COLLATE NOCASE",
+            (parent_id,))
+        return [{'id': r['id'], 'name': r['name']} for r in cursor.fetchall()], row['fetched_at']
+
+    def get_drive_subfolder_counts(self, parent_ids):
+        """{parent_id: nº de subcarpetas} de los de parent_ids que están en caché."""
+        ids = list(parent_ids)
+        counts = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            cursor = self.conn.execute(f"""
+                SELECT l.parent_id, COUNT(f.id) AS n FROM drive_folder_listings l
+                LEFT JOIN drive_folders f ON f.parent_id = l.parent_id
+                WHERE l.parent_id IN ({','.join('?' * len(chunk))})
+                GROUP BY l.parent_id
+            """, chunk)
+            counts.update((r['parent_id'], r['n']) for r in cursor.fetchall())
+        return counts
+
+    def save_drive_subfolders(self, listings, fetched_at):
+        """Guarda {parent_id: [carpetas]} sustituyendo lo anterior de cada carpeta."""
+        with self.conn:
+            for parent_id, folders in listings.items():
+                self.conn.execute("DELETE FROM drive_folders WHERE parent_id = ?", (parent_id,))
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO drive_folders (parent_id, id, name) VALUES (?, ?, ?)",
+                    [(parent_id, f['id'], f.get('name', '')) for f in folders])
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO drive_folder_listings (parent_id, fetched_at) VALUES (?, ?)",
+                    (parent_id, fetched_at))
+
+    def update_drive_thumbnail_links(self, links):
+        """Sustituye enlaces de miniatura caducados: [(enlace, file_id), ...]."""
+        with self.conn:
+            self.conn.executemany("UPDATE drive_photos SET thumbnail_link = ? WHERE id = ?", links)
 
     def get_drive_photos_by_parent(self, parent_id):
         cursor = self.conn.execute("SELECT * FROM drive_photos WHERE parent_id = ?", (parent_id,))

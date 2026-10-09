@@ -75,7 +75,7 @@ import sqlite3
 import threading # Necesario para evitar que la UI se congele
 from drive_auth import DriveAuthenticator, DriveAuthError
 import requests # Para bajar thumbnails
-from drive_manager import DriveManager
+from drive_manager import DriveManager, thread_manager
 import config_manager # Para guardar la carpeta elegida
 
 # La versión la genera el workflow de release a partir del tag
@@ -262,6 +262,7 @@ class ThumbnailLoaderSignals(QObject):
     """Contenedor de señales para la clase QRunnable."""
     thumbnail_loaded = Signal(str, QImage) # original_path, imagen (se convierte a QPixmap en la UI)
     load_failed = Signal(str)
+    drive_link_refreshed = Signal(str, str)  # file_id, enlace de miniatura nuevo
 
 # =================================================================
 # CLASE PARA CARGAR MINIATURAS DE IMAGEN (QRunnable)
@@ -318,6 +319,16 @@ class VideoThumbnailLoader(QRunnable):
 # =================================================================
 # CLASE: NetworkThumbnailLoader (CON CACHÉ EN DISCO)
 # =================================================================
+_http_local = threading.local()
+
+def _http_session():
+    """Sesión HTTP del hilo actual: reutiliza la conexión TLS entre miniaturas."""
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = _http_local.session = requests.Session()
+    return session
+
+
 class NetworkThumbnailLoader(QRunnable):
     def __init__(self, url, file_id, signals):
         super().__init__()
@@ -335,19 +346,26 @@ class NetworkThumbnailLoader(QRunnable):
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
             image = get_cached_image(cache_path)
             if not image.isNull():
+                touch_cache_file(cache_path)
                 self.signals.thumbnail_loaded.emit(self.file_id, image)
                 return
 
         # 2. DESCARGA
-        if not self.url:
-            self.signals.load_failed.emit(self.file_id)
-            return
-
         try:
-            response = requests.get(self.url, timeout=10)
-            if response.status_code == 200:
-                with open(cache_path, 'wb') as f:
-                    f.write(response.content)
+            content = self._download(self.url) if self.url else None
+            if content is None:
+                # Los enlaces de miniatura guardados caducan a las pocas horas:
+                # se pide uno nuevo a Drive y se reintenta una vez
+                new_url = thread_manager().get_thumbnail_link(self.file_id)
+                if new_url and new_url != self.url:
+                    self.signals.drive_link_refreshed.emit(self.file_id, new_url)
+                    content = self._download(new_url)
+            if content:
+                # A un temporal: una escritura a medias no debe quedar como caché
+                part_path = cache_path + ".part"
+                with open(part_path, 'wb') as f:
+                    f.write(content)
+                os.replace(part_path, cache_path)
 
                 # Cargar en memoria y cachear
                 image = get_cached_image(cache_path)
@@ -357,6 +375,14 @@ class NetworkThumbnailLoader(QRunnable):
         except Exception as e:
             print(f"Error descargando miniatura de Drive {self.file_id}: {e}")
         self.signals.load_failed.emit(self.file_id)
+
+    @staticmethod
+    def _download(url):
+        """Contenido de la miniatura, o None si el enlace ya no vale."""
+        response = _http_session().get(url, timeout=10)
+        if response.status_code == 200 and response.content:
+            return response.content
+        return None
 
 # =================================================================
 # ACTUALIZACIONES
@@ -478,11 +504,12 @@ class SafeThumbnailLoader(QRunnable):
 
 
 class DriveFolderDialog(QDialog):
-    def __init__(self, drive_manager, parent=None):
+    def __init__(self, drive_manager, parent=None, db=None):
         super().__init__(parent)
         self.setWindowTitle("Navegador de Google Drive")
         self.resize(600, 450)
         self.drive = drive_manager
+        self.db = db  # Caché de carpetas (opcional)
 
         # Estado de navegación
         self.current_folder_id = None
@@ -574,9 +601,17 @@ class DriveFolderDialog(QDialog):
         self.list_widget.addItem(back_item)
 
         try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            folders = self.drive.list_folders(folder_id)
-            QApplication.restoreOverrideCursor()
+            folders = None
+            if self.db is not None:
+                cached, fetched_at = self.db.get_drive_subfolders(folder_id)
+                if cached is not None and time.time() - fetched_at < VisageVaultApp.DRIVE_FOLDER_TTL_S:
+                    folders = cached
+            if folders is None:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                folders = self.drive.list_folders(folder_id)
+                QApplication.restoreOverrideCursor()
+                if self.db is not None:
+                    self.db.save_drive_subfolders({folder_id: folders}, time.time())
 
             # Si no hay carpetas, avisamos pero permitimos seleccionar
             if not folders:
@@ -666,29 +701,36 @@ class DriveLoginWorker(QObject):
         finally:
             self.finished.emit()
 
-class FolderLoaderWorker(QObject):
-    """
-    Descarga la lista de subcarpetas de un directorio específico en segundo plano.
-    """
-    finished = Signal(list, QTreeWidgetItem) # Emite: (lista_carpetas, item_del_arbol_que_se_expande)
+class DriveFolderSignals(QObject):
+    """Resultado de DriveFolderLoader: (generación del árbol, ids pedidos,
+    {parent_id: [carpetas]} o None si falló)."""
+    loaded = Signal(int, list, object)
 
-    def __init__(self, folder_id, parent_item):
+
+class DriveFolderLoader(QRunnable):
+    """
+    Lista en segundo plano las subcarpetas de una o varias carpetas de Drive
+    con una sola consulta. No toca la interfaz: el resultado vuelve por señal
+    y el hilo de la interfaz busca los elementos del árbol por su id (pueden
+    haberse borrado mientras tanto).
+    """
+    def __init__(self, generation, folder_ids, signals):
         super().__init__()
-        self.folder_id = folder_id
-        self.parent_item = parent_item
+        self.generation = generation
+        self.folder_ids = list(folder_ids)
+        self.signals = signals
 
+    @Slot()
     def run(self):
         try:
-            # Instanciamos un manager independiente para este hilo
-            manager = DriveManager()
-
-            # Obtenemos carpetas (esto puede tardar 1-2 segundos)
-            folders = manager.list_folders(self.folder_id)
-
-            self.finished.emit(folders, self.parent_item)
+            listings = thread_manager().list_subfolders_of_many(self.folder_ids)
         except Exception as e:
-            print(f"Error cargando carpetas: {e}")
-            self.finished.emit([], self.parent_item)
+            print(f"Error cargando carpetas de Drive: {e}")
+            listings = None
+        try:
+            self.signals.loaded.emit(self.generation, self.folder_ids, listings)
+        except RuntimeError:
+            pass  # App cerrada
 
 class DriveScanWorker(QObject):
     """
@@ -725,7 +767,13 @@ class DriveScanWorker(QObject):
             BATCH_SIZE = 100
             last_update_time = time.time()
 
-            for batch_of_images in local_manager.list_images_recursively(self.folder_id):
+            def save_folders(folder_id, subfolders):
+                try:
+                    local_db.save_drive_subfolders({folder_id: subfolders}, time.time())
+                except Exception as e:
+                    print(f"Error guardando carpetas de Drive: {e}")
+
+            for batch_of_images in local_manager.list_images_recursively(self.folder_id, save_folders):
                 if not self.is_running: break
 
                 buffer.extend(batch_of_images)
@@ -872,6 +920,49 @@ def purge_media_caches(conn, media_path):
             print(f"No se pudo borrar {path}: {e}")
 
 
+# Tamaño máximo de lo descargado de Drive: es una caché, no una copia de la nube.
+# Al pasarse se borra lo usado hace más tiempo hasta quedar en el 90 %.
+DRIVE_CACHE_LIMITS = {
+    "drive_cache": 1024 * 1024 * 1024,           # Fotos completas (vista previa)
+    "drive_snapshot_cache": 300 * 1024 * 1024,   # Miniaturas
+}
+
+def touch_cache_file(path):
+    """Marca un archivo de caché como usado ahora (para trim_drive_caches)."""
+    try:
+        os.utime(path)
+    except OSError:
+        pass
+
+def trim_drive_caches():
+    """Recorta las cachés de Drive a DRIVE_CACHE_LIMITS, empezando por lo más antiguo."""
+    for subdir, limit in DRIVE_CACHE_LIMITS.items():
+        try:
+            entries, total = [], 0
+            now = time.time()
+            with os.scandir(paths.cache_subdir(subdir)) as it:
+                for entry in it:
+                    if not entry.is_file():
+                        continue
+                    st = entry.stat()
+                    if entry.name.endswith(".part"):
+                        if now - st.st_mtime > 3600:  # Descarga interrumpida
+                            os.remove(entry.path)
+                        continue
+                    entries.append((st.st_mtime, st.st_size, entry.path))
+                    total += st.st_size
+            if total <= limit:
+                continue
+            entries.sort()
+            for _, size, path in entries:
+                if total <= limit * 0.9:
+                    break
+                evict_cached_image(path)
+                os.remove(path)
+                total -= size
+        except OSError as e:
+            print(f"Error recortando la caché {subdir}: {e}")
+
 def cleanup_orphan_caches(db_path):
     """
     Borra lo que ya no corresponde a nada de la BD: caras de fotos eliminadas,
@@ -910,6 +1001,7 @@ def cleanup_orphan_caches(db_path):
             print(f"Limpieza: {orphan_faces} caras huérfanas en la BD y {removed} ficheros de caché sin uso.")
     except Exception as e:
         print(f"Error limpiando cachés huérfanas: {e}")
+    trim_drive_caches()
 
 
 class FaceLoader(QRunnable):
@@ -2926,7 +3018,15 @@ class VisageVaultApp(QMainWindow):
         self._retired_threads = []
         self.drive_loaded_ids = set()
         self.is_drive_connected = False
-        self.active_folder_threads = []
+        # Árbol de carpetas de Drive: elementos por id de carpeta. La generación
+        # cambia al vaciar el árbol, para ignorar respuestas de un árbol anterior.
+        self._drive_tree_gen = 0
+        self._drive_tree_items = {}
+        self._drive_folders_in_flight = set()
+        self.drive_folder_signals = DriveFolderSignals()
+        self.drive_folder_signals.loaded.connect(self._on_drive_folders_loaded)
+        self.drive_folder_pool = QThreadPool()
+        self.drive_folder_pool.setMaxThreadCount(2)
         self.current_drive_folder_name = "Inicio"
 
         # Archivos desaparecidos que el usuario decidió conservar en esta sesión
@@ -2961,6 +3061,7 @@ class VisageVaultApp(QMainWindow):
         self.thumb_signals = ThumbnailLoaderSignals()
         self.thumb_signals.thumbnail_loaded.connect(self._update_thumbnail)
         self.thumb_signals.load_failed.connect(self._handle_thumbnail_failed)
+        self.thumb_signals.drive_link_refreshed.connect(self._on_drive_link_refreshed)
 
         self.face_loader_signals = FaceLoaderSignals()
         self.face_loader_signals.face_loaded.connect(self._handle_face_loaded)
@@ -4673,6 +4774,7 @@ class VisageVaultApp(QMainWindow):
                 try: os.remove(local_path)
                 except: pass
             else:
+                touch_cache_file(local_path)
                 self._open_preview_dialog(local_path)
                 self._set_status("Vista previa (desde caché).")
                 return
@@ -4692,6 +4794,7 @@ class VisageVaultApp(QMainWindow):
 
             # Volver al hilo principal para abrir la ventana
             self.drive_download_signals.finished.emit(local_path)
+            trim_drive_caches()
         except DriveAuthError as e:
             self.drive_download_signals.failed.emit(str(e))
         except Exception as e:
@@ -5448,7 +5551,7 @@ class VisageVaultApp(QMainWindow):
             (getattr(self, 'dup_thread', None), getattr(self, 'dup_worker', None)),
             (getattr(self, 'drive_login_thread', None), None),
         ]
-        return tasks + list(self.active_folder_threads) + list(self._retired_threads)
+        return tasks + list(self._retired_threads)
 
     @staticmethod
     def _is_thread_running(thread):
@@ -5480,6 +5583,7 @@ class VisageVaultApp(QMainWindow):
         if self.file_watcher:
             self.file_watcher.stop()
         self.threadpool.clear()
+        self.drive_folder_pool.clear()
 
         # 3. Pedir a todas las tareas que se detengan (parada cooperativa)
         running = []
@@ -5512,7 +5616,7 @@ class VisageVaultApp(QMainWindow):
             except RuntimeError:
                 pass
         pool_done = True
-        for pool in (self.threadpool, self.cluster_pool, self.safe_pool):
+        for pool in (self.threadpool, self.cluster_pool, self.safe_pool, self.drive_folder_pool):
             remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             pool_done = pool.waitForDone(remaining_ms) and pool_done
 
@@ -5879,7 +5983,7 @@ class VisageVaultApp(QMainWindow):
         self.btn_show_tree.setVisible(False)
         self.btn_show_tree.setChecked(False)
         self.cloud_folder_panel.hide()
-        self.cloud_folder_tree.clear()
+        self._reset_drive_tree()
 
         # 7. RESTAURAR ESTADO INICIAL DEL BOTÓN
         self.btn_gdrive.setText("Iniciar sesión con Google")
@@ -5956,7 +6060,7 @@ class VisageVaultApp(QMainWindow):
     def _select_drive_folder(self):
         """Abre el navegador de carpetas de Drive."""
         try:
-            dialog = DriveFolderDialog(self.drive_manager, self)
+            dialog = DriveFolderDialog(self.drive_manager, self, db=self.db)
             result = dialog.exec()
 
             if result == QDialog.Accepted:
@@ -5992,7 +6096,7 @@ class VisageVaultApp(QMainWindow):
                 self._set_status(f"Cambiando a carpeta: {folder_name}...")
 
                 # --- ACTUALIZAR EL ÁRBOL DE CARPETAS ---
-                self.cloud_folder_tree.clear() # Borrar árbol viejo
+                self._reset_drive_tree() # Borrar árbol viejo
 
                 # Si el panel está visible, cargamos la nueva raíz inmediatamente
                 if self.btn_show_tree.isChecked():
@@ -6374,6 +6478,16 @@ class VisageVaultApp(QMainWindow):
             if self.cloud_folder_tree.topLevelItemCount() == 0:
                 self._load_folder_tree_root()
 
+    # Antigüedad a partir de la cual un listado de carpetas en caché se
+    # comprueba de nuevo con Drive (se muestra igualmente al momento)
+    DRIVE_FOLDER_TTL_S = 600
+
+    def _reset_drive_tree(self):
+        """Vacía el árbol de carpetas; las respuestas pendientes se ignorarán."""
+        self._drive_tree_gen += 1
+        self._drive_tree_items = {}
+        self.cloud_folder_tree.clear()
+
     def _load_folder_tree_root(self):
         """
         Carga la Carpeta Raíz como primer elemento del árbol.
@@ -6381,82 +6495,163 @@ class VisageVaultApp(QMainWindow):
         if not self.current_drive_folder_id:
             return
 
-        self.cloud_folder_tree.clear()
+        self._reset_drive_tree()
 
         # 1. Crear el elemento RAÍZ manualmente
         root_name = getattr(self, 'current_drive_folder_name', 'Carpeta Raíz')
         root_item = QTreeWidgetItem(self.cloud_folder_tree, [root_name])
         root_item.setData(0, Qt.UserRole, self.current_drive_folder_id)
         root_item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon))
+        self._drive_tree_items[self.current_drive_folder_id] = root_item
+
+        # 2. Sus subcarpetas: de la caché al momento, o de Drive
+        self._show_drive_subfolders(root_item)
         root_item.setExpanded(True) # Lo mostramos abierto
 
-        # 2. Lanzar worker para cargar SUS hijos (las subcarpetas) dentro de este item
-        self._launch_folder_loader(self.current_drive_folder_id, root_item)
+    @staticmethod
+    def _is_drive_placeholder(item):
+        return item.childCount() == 1 and item.child(0).data(0, Qt.UserRole + 1) == "placeholder"
 
-    def _launch_folder_loader(self, folder_id, parent_item):
-        """Crea y lanza el hilo para buscar carpetas."""
+    @staticmethod
+    def _add_drive_placeholder(item, text="Cargando..."):
+        """Hijo provisional: hace que aparezca la flecha de expansión."""
+        placeholder = QTreeWidgetItem(item, [text])
+        placeholder.setData(0, Qt.UserRole + 1, "placeholder")
+        placeholder.setFlags(Qt.NoItemFlags)
+        return placeholder
 
-        # 1. ¡SEMÁFORO ROJO! Decimos al descargador de fotos que se calme
-        self.set_drive_priority_low.emit(True)
-
-        thread = QThread()
-        worker = FolderLoaderWorker(folder_id, parent_item)
-        worker.moveToThread(thread)
-
-        self.active_folder_threads.append((thread, worker))
-
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_folders_loaded)
-
-        def cleanup():
-            if (thread, worker) in self.active_folder_threads:
-                self.active_folder_threads.remove((thread, worker))
-            thread.quit()
-            worker.deleteLater()
-            thread.deleteLater()
-
-        worker.finished.connect(cleanup)
-        thread.start()
-
-    @Slot(list, QTreeWidgetItem)
-    def _on_folders_loaded(self, folders, parent_item):
-        """Recibe la lista de carpetas y actualiza el árbol."""
-
-        self.set_drive_priority_low.emit(False)
-
-        # Si parent_item es Root (invisible), limpiamos el mensaje de "Cargando..." si lo hubiera
-        if parent_item == self.cloud_folder_tree.invisibleRootItem():
-             self.cloud_folder_tree.clear()
+    def _show_drive_subfolders(self, item):
+        """
+        Muestra las subcarpetas de item: al momento si están en la caché (y,
+        si son antiguas, las comprueba con Drive en segundo plano); si no, las
+        pide a Drive dejando "Cargando..." mientras tanto.
+        """
+        folder_id = item.data(0, Qt.UserRole)
+        if not folder_id:
+            return
+        folders, fetched_at = self.db.get_drive_subfolders(folder_id)
+        if folders is not None:
+            self._fill_drive_tree_item(item, folders)
+            if time.time() - fetched_at > self.DRIVE_FOLDER_TTL_S:
+                self._request_drive_folders([folder_id], priority=5)
         else:
-            # Quitar el item dummy "Cargando..."
-            if parent_item.childCount() > 0:
-                parent_item.removeChild(parent_item.child(0))
+            if item.childCount() == 0:
+                self._add_drive_placeholder(item)
+            self._request_drive_folders([folder_id], priority=10)
 
-        if not folders:
-            if parent_item == self.cloud_folder_tree.invisibleRootItem():
-                 no_item = QTreeWidgetItem(self.cloud_folder_tree, ["(Sin subcarpetas)"])
-                 no_item.setFlags(Qt.NoItemFlags)
+    def _fill_drive_tree_item(self, item, folders):
+        """
+        Pone folders como hijos de item. Las carpetas que ya estaban se
+        conservan (con lo que tuvieran desplegado); de las nuevas se adelanta,
+        en una sola consulta, el listado de sus subcarpetas para que abrirlas
+        sea inmediato.
+        """
+        old = {}
+        for child in item.takeChildren():
+            child_id = child.data(0, Qt.UserRole)
+            if child_id:
+                old[child_id] = child
+
+        new_children = []
+        for f in folders:
+            child = old.pop(f['id'], None)
+            if child is None:
+                child = QTreeWidgetItem([f['name']])
+                child.setData(0, Qt.UserRole, f['id'])
+                child.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                new_children.append(child)
+            else:
+                child.setText(0, f['name'])
+            item.addChild(child)
+            self._drive_tree_items[f['id']] = child
+        for gone in old.values():
+            self._forget_drive_tree_item(gone)
+
+        if not folders and item.parent() is None:
+            info = QTreeWidgetItem(item, ["(Sin subcarpetas)"])
+            info.setFlags(Qt.NoItemFlags)
+
+        if not new_children:
+            return
+        # Flecha solo en las que tienen subcarpetas (si ya se sabe)
+        counts = self.db.get_drive_subfolder_counts([c.data(0, Qt.UserRole) for c in new_children])
+        unknown = []
+        for child in new_children:
+            child_id = child.data(0, Qt.UserRole)
+            if child_id not in counts:
+                unknown.append(child_id)
+                self._add_drive_placeholder(child)
+            elif counts[child_id]:
+                self._add_drive_placeholder(child)
+        if unknown:
+            self._request_drive_folders(unknown, priority=0)  # Adelantar el siguiente nivel
+
+    def _forget_drive_tree_item(self, item):
+        """Quita item y sus descendientes del índice por id."""
+        item_id = item.data(0, Qt.UserRole)
+        if item_id and self._drive_tree_items.get(item_id) is item:
+            del self._drive_tree_items[item_id]
+        for i in range(item.childCount()):
+            self._forget_drive_tree_item(item.child(i))
+
+    def _request_drive_folders(self, folder_ids, priority=0):
+        """Pide a Drive, en segundo plano, las subcarpetas de folder_ids."""
+        folder_ids = [f for f in folder_ids if f not in self._drive_folders_in_flight]
+        if not folder_ids:
+            return
+        if not self._drive_folders_in_flight:
+            # Que el escáner de fotos ceda la red mientras se navega
+            self.set_drive_priority_low.emit(True)
+        self._drive_folders_in_flight.update(folder_ids)
+        loader = DriveFolderLoader(self._drive_tree_gen, folder_ids, self.drive_folder_signals)
+        self.drive_folder_pool.start(loader, priority)
+
+    @Slot(int, list, object)
+    def _on_drive_folders_loaded(self, generation, folder_ids, listings):
+        """Guarda en la caché las subcarpetas recibidas y actualiza el árbol."""
+        self._drive_folders_in_flight.difference_update(folder_ids)
+        if not self._drive_folders_in_flight:
+            self.set_drive_priority_low.emit(False)
+
+        if listings is None:
+            if generation == self._drive_tree_gen:
+                for folder_id in folder_ids:
+                    item = self._drive_tree_items.get(folder_id)
+                    if item is not None and self._is_drive_placeholder(item):
+                        item.child(0).setText(0, "(No se pudo cargar; pliega y vuelve a desplegar)")
+                self._set_status("No se pudieron cargar las carpetas de Drive.")
             return
 
-        for f in folders:
-            item = QTreeWidgetItem(parent_item, [f['name']])
-            item.setData(0, Qt.UserRole, f['id'])
-            item.setIcon(0, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+        try:
+            self.db.save_drive_subfolders(listings, time.time())
+        except Exception as e:
+            print(f"Error guardando carpetas de Drive: {e}")
+        if generation != self._drive_tree_gen or not self.is_drive_connected:
+            return  # El árbol ha cambiado; la caché sí sirve
 
-            # TRUCO: Añadimos un hijo dummy para que aparezca la flechita de expansión
-            # (Lazy Loading: solo cargaremos sus hijos reales si el usuario expande)
-            QTreeWidgetItem(item, ["Cargando..."])
-
-        self.cloud_folder_tree.expandItem(parent_item)
+        for folder_id, folders in listings.items():
+            item = self._drive_tree_items.get(folder_id)
+            if item is None:
+                continue
+            if item.isExpanded() or not self._is_drive_placeholder(item):
+                self._fill_drive_tree_item(item, folders)
+            elif not folders:
+                item.takeChildren()  # Plegada y sin subcarpetas: sin flecha
 
     @Slot(QTreeWidgetItem)
     def _on_folder_tree_item_expanded(self, item):
         """Se llama al hacer clic en la flechita de expansión."""
-        # Si tiene un solo hijo y es el dummy "Cargando...", procedemos a cargar
-        if item.childCount() == 1 and item.child(0).text(0) == "Cargando...":
-            folder_id = item.data(0, Qt.UserRole)
-            if folder_id:
-                self._launch_folder_loader(folder_id, item)
+        if self._is_drive_placeholder(item):
+            item.child(0).setText(0, "Cargando...")
+        self._show_drive_subfolders(item)
+
+    @Slot(str, str)
+    def _on_drive_link_refreshed(self, file_id, link):
+        """Guarda el enlace de miniatura renovado para no volver a pedirlo."""
+        try:
+            self.db.update_drive_thumbnail_links([(link, file_id)])
+        except Exception as e:
+            print(f"Error guardando enlace de miniatura: {e}")
 
     @Slot(QTreeWidgetItem, int)
     def _on_folder_tree_item_clicked(self, item, column):
