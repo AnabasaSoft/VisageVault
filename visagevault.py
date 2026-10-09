@@ -3120,18 +3120,16 @@ class VisageVaultApp(QMainWindow):
 
         # Controles superiores
         top_controls = QVBoxLayout()
-        botones_layout = QHBoxLayout()
 
         self.select_dir_button = QPushButton("Cambiar carpeta de fotos")
         self.select_dir_button.clicked.connect(lambda: self._open_directory_dialog(is_video=False))
-        botones_layout.addWidget(self.select_dir_button)
+        top_controls.addWidget(self.select_dir_button)
 
         self.btn_duplicates = QPushButton("Buscar Duplicados")
         self.btn_duplicates.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.btn_duplicates.clicked.connect(self._start_duplicate_search)
-        botones_layout.addWidget(self.btn_duplicates)
+        top_controls.addWidget(self.btn_duplicates)
 
-        top_controls.addLayout(botones_layout)
 
         # --- Botón Ver Árbol ---
         self.btn_show_photo_tree = QPushButton("Ver árbol de directorios")
